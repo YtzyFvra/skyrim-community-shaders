@@ -8,9 +8,18 @@
 
 #include <d3d11_4.h>
 #include <d3d12.h>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <memory>
+#include <mutex>
 #include <string>
 
 #include <directx/d3dx12.h>
+
+#include "NeuralRendering/Runtime.h"
+#include "NeuralRendering/AriseReconstructionGraph.h"
 
 class WrappedResource
 {
@@ -81,6 +90,33 @@ public:
 class DX12SwapChain
 {
 public:
+	struct AriseSceneCapture
+	{
+		std::uint64_t frameId = 0;
+		std::uint32_t guideWidth = 0;
+		std::uint32_t guideHeight = 0;
+		NeuralRendering::AriseReconstructionGraph::Plan plan{};
+	};
+
+	struct AriseStatistics
+	{
+		std::uint64_t logicalPresents = 0;
+		std::uint64_t physicalPresents = 0;
+		std::uint64_t captured = 0;
+		std::uint64_t reconstructed = 0;
+		std::uint64_t fallback = 0;
+		std::uint64_t uiComposites = 0;
+		std::uint64_t backpressure = 0;
+		std::uint64_t failures = 0;
+		HRESULT lastPresentResult = S_OK;
+		bool tailNrAvailable = false;
+		bool dlssAvailable = false;
+		bool renderDocCompatibility = false;
+		bool asyncTail = false;
+		NeuralRendering::AriseReconstructionGraph::Statistics graph{};
+		std::string graphPath;
+	};
+
 	winrt::com_ptr<ID3D12Device> d3d12Device;
 	winrt::com_ptr<ID3D12CommandQueue> commandQueue;
 
@@ -94,6 +130,7 @@ public:
 	IDXGISwapChain4* swapChain;
 
 	DXGI_SWAP_CHAIN_DESC1 swapChainDesc;
+	DXGI_SWAP_CHAIN_DESC1 logicalSwapChainDesc;
 
 	WrappedResource* swapChainBufferWrapped;
 	WrappedResource* uiBufferWrapped;
@@ -120,6 +157,7 @@ public:
 	DXGISwapChainProxy* swapChainProxy = nullptr;
 
 	bool useDLSSG = false;
+	bool useArise = false;
 
 	// Actual buffer count the live swap chain was created/resized with (<= kMaxBackBuffers).
 	UINT backBufferCount = 2;
@@ -130,6 +168,8 @@ public:
 	void CreateD3D12Device(IDXGIAdapter* a_adapter);
 	void CreateSwapChain(IDXGIAdapter* adapter, DXGI_SWAP_CHAIN_DESC swapChainDesc);
 	void CreateSwapChainDirect(IDXGIAdapter* adapter, DXGI_SWAP_CHAIN_DESC swapChainDesc);
+	void CreateSwapChainArise(IDXGIAdapter* adapter, DXGI_SWAP_CHAIN_DESC swapChainDesc,
+		bool asyncTail, bool enableDLSSG);
 
 	void CreateInterop();
 	/** @brief (Re)creates the D3D11/D3D12-shared swap-chain and UI buffer textures at (re)size time. */
@@ -144,6 +184,13 @@ public:
 	/** @brief IDXGISwapChain::ResizeBuffers equivalent; rejects any bufferCount differing from the chain's own backBufferCount. */
 	HRESULT ResizeBuffers(UINT bufferCount, UINT width, UINT height, DXGI_FORMAT format, UINT flags);
 	HRESULT Present(UINT SyncInterval, UINT Flags);
+	/** @brief Publishes post-LDR guides for the current Model 3 frame before UI rendering begins. */
+	void CaptureAriseScene(ID3D11Resource* depth, ID3D11Resource* motionVectors,
+		const AriseSceneCapture& capture);
+	/** @brief Drains the old Model 3 plan and rebuilds temporal runtime state before a new capture is published. */
+	bool PrepareAriseGraphPlanChange();
+	void ClearAriseSceneCapture();
+	[[nodiscard]] AriseStatistics GetAriseStatistics() const;
 	HRESULT GetDevice(_In_ REFIID riid, _COM_Outptr_ void** ppDevice);
 	HANDLE GetFrameLatencyWaitableObject();
 
@@ -164,4 +211,94 @@ public:
 
 	// D3D12 interop resource management
 	void CreateSharedResources();
+	/** @brief Waits until Model 3 tail workers and submitted GPU work are idle. */
+	bool DrainModel3Tail();
+	[[nodiscard]] UINT PhysicalWidth() const { return swapChainDesc.Width; }
+	[[nodiscard]] UINT PhysicalHeight() const { return swapChainDesc.Height; }
+	[[nodiscard]] UINT LogicalWidth() const { return logicalSwapChainDesc.Width; }
+	[[nodiscard]] UINT LogicalHeight() const { return logicalSwapChainDesc.Height; }
+	[[nodiscard]] bool IsRenderDocCompatibility() const { return ariseRenderDocCompatibility; }
+	[[nodiscard]] bool IsAriseAsyncTail() const { return ariseAsyncTail; }
+
+private:
+	enum class AriseSlotState : std::uint8_t
+	{
+		kWritable,
+		kQueued,
+		kConsuming,
+		kSubmitted,
+	};
+
+	struct ArisePresentSlot
+	{
+		AriseSlotState state = AriseSlotState::kWritable;
+		std::unique_ptr<WrappedResource> sealedScene;
+		std::unique_ptr<WrappedResource> sealedUI;
+		std::unique_ptr<WrappedResource> displayUI;
+		std::unique_ptr<WrappedResource> sealedDepth;
+		std::unique_ptr<WrappedResource> sealedMotionVectors;
+		AriseSceneCapture capture{};
+		bool captureValid = false;
+		winrt::com_ptr<ID3D12CommandAllocator> allocator;
+		winrt::com_ptr<ID3D12GraphicsCommandList4> commandList;
+		UINT64 engineReady = 0;
+		UINT64 tailDone = 0;
+		UINT syncInterval = 0;
+		UINT flags = 0;
+		std::uint32_t frameId = 0;
+	};
+
+	void CreateArisePresentResources();
+	HRESULT CreateAriseCompositeResources();
+	bool ReleaseArisePresentResources();
+	HRESULT PresentArise(UINT syncInterval, UINT flags);
+	HRESULT ExecuteArisePresent(std::size_t slotIndex);
+	bool RecordAriseComposite(ArisePresentSlot& slot, ID3D12Resource* scene,
+		ID3D12Resource* physicalBuffer, UINT backBufferIndex);
+	bool SealAriseCapture(ArisePresentSlot& slot, std::uint64_t presentFrameId);
+	bool WaitForAriseTail(UINT64 value);
+	bool WaitForAriseIdle();
+	void ReapAriseSlotsLocked();
+	void LatchAriseFailure(HRESULT result, const char* operation);
+	void EnterAriseSynchronousFallback(HRESULT result, const char* operation);
+	void UpdateLogicalSwapChainDesc();
+
+	static constexpr std::size_t kAriseSlotCount = 3;
+	static constexpr std::chrono::milliseconds kAriseWaitTimeout{ 2000 };
+	std::array<ArisePresentSlot, kAriseSlotCount> ariseSlots;
+	NeuralRendering::AriseReconstructionGraph ariseReconstructionGraph;
+	winrt::com_ptr<ID3D12RootSignature> ariseCompositeRootSignature;
+	winrt::com_ptr<ID3D12PipelineState> ariseCompositePipelineState;
+	winrt::com_ptr<ID3D12PipelineState> ariseUiScalePipelineState;
+	winrt::com_ptr<ID3D12DescriptorHeap> ariseCompositeSrvHeap;
+	winrt::com_ptr<ID3D12DescriptorHeap> ariseCompositeRtvHeap;
+	winrt::com_ptr<ID3D11Fence> ariseEngineFence11;
+	winrt::com_ptr<ID3D12Fence> ariseEngineFence12;
+	winrt::com_ptr<ID3D12Fence> ariseTailFence12;
+	mutable std::mutex ariseMutex;
+	std::condition_variable ariseCondition;
+	std::timed_mutex arisePhysicalPresentMutex;
+	std::size_t ariseProducerCursor = 0;
+	UINT64 ariseEngineValue = 0;
+	UINT64 ariseTailValue = 0;
+	std::atomic_bool ariseFatalFailure = false;
+	std::atomic_bool ariseSynchronousFallback = false;
+	std::atomic_bool ariseTailNrAvailable = false;
+	std::atomic_bool ariseGraphAvailable = false;
+	bool ariseRenderDocCompatibility = false;
+	bool ariseAsyncTail = true;
+	std::atomic_uint64_t ariseLogicalPresents = 0;
+	std::atomic_uint64_t arisePhysicalPresents = 0;
+	std::atomic_uint64_t ariseCaptured = 0;
+	std::atomic_uint64_t ariseReconstructed = 0;
+	std::atomic_uint64_t ariseFallback = 0;
+	std::atomic_uint64_t ariseUiComposites = 0;
+	std::atomic_uint64_t ariseBackpressure = 0;
+	std::atomic_uint64_t ariseFailures = 0;
+	std::atomic_long ariseLastPresentResult = S_OK;
+	std::unique_ptr<WrappedResource> arisePendingDepth;
+	std::unique_ptr<WrappedResource> arisePendingMotionVectors;
+	AriseSceneCapture arisePendingCapture{};
+	std::uint64_t arisePendingPresentSequence = 0;
+	bool arisePendingCaptureValid = false;
 };

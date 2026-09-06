@@ -246,6 +246,7 @@ target_link_libraries(
         Tracy::TracyClient
         Streamline
         d3d12.lib
+        d3dcompiler.lib
         Microsoft::DirectX-Headers
         ${DETOURS_LIBRARY}
         windowsapp

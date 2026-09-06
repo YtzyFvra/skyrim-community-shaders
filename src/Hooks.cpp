@@ -629,9 +629,11 @@ struct BSInputDeviceManager_PollInputDevices
 	{
 		// Reflex sleep/cap runs here by design: this executes before rendering work for the frame.
 		// UpdateReflex() enforces "once per frame" internally in case this hook is hit multiple times.
-		// When using DLSS-G, Reflex must run via the DX12 Streamline instance.
+		// Logical-R modes own the physical DX12 present path, so Reflex acquires the
+		// frame token and sleeps on the game thread through the DX12 SL instance.
 		auto& upscaling = globals::features::upscaling;
-		if (upscaling.UsesDLSSGFrameGen() && upscaling.streamlineDX12.featureReflex)
+		if ((upscaling.dx12SwapChain.useArise || upscaling.UsesDLSSGFrameGen()) &&
+			upscaling.streamlineDX12.featureReflex)
 			upscaling.streamlineDX12.UpdateReflex();
 		else
 			upscaling.streamline.UpdateReflex();

@@ -13,6 +13,7 @@
 #include "Upscaling/FoveatedRender/Core.h"
 #include "Upscaling/FoveatedRender/Postprocess.h"
 #include "Upscaling/FoveatedRender/Preprocess.h"
+#include "Upscaling/NeuralRendering/ArisePipeline.h"
 #include "Upscaling/NeuralRendering/Integration.h"
 #include "Upscaling/PerfMode.h"
 #include "Upscaling/Streamline.h"
@@ -118,7 +119,16 @@ HRESULT WINAPI hk_D3D11CreateDeviceAndSwapChainUpscaling(
 		ApplyLegacyFsr4RuntimeSelectionMigration(upscaling.settings, FidelityFX::GetFsr4AdapterSupport(adapterDesc));
 	}
 
-	upscaling.LoadUpscalingSDKs();
+	const bool hdrConfiguredAtCreate = globals::features::hdrDisplay.loaded &&
+		globals::features::hdrDisplay.settings.enableHDR;
+	const bool logicalPerfModeRequested = upscaling.foveatedRender.WantsLogicalPerfMode();
+	const bool skipUpscalingSdksForRenderDoc = logicalPerfModeRequested &&
+		!globals::game::isVR && !hdrConfiguredAtCreate && pSwapChainDesc && pSwapChainDesc->Windowed &&
+		adapterDesc.VendorId == Streamline::kNvidiaVendorId && GetModuleHandleW(L"renderdoc.dll") != nullptr;
+	if (skipUpscalingSdksForRenderDoc)
+		logger::info("[ARISE] RenderDoc detected at startup: skipping Streamline and FidelityFX SDK loading");
+	else
+		upscaling.LoadUpscalingSDKs();
 
 	// FLIP_DISCARD requires BufferCount >= 2 and a flip-model-compatible (non-sRGB) format.
 	pSwapChainDesc->SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
@@ -136,14 +146,30 @@ HRESULT WINAPI hk_D3D11CreateDeviceAndSwapChainUpscaling(
 
 	bool shouldProxy = !globals::game::isVR;
 	if (shouldProxy)
-		if (!pSwapChainDesc->Windowed)
+		if (!pSwapChainDesc->Windowed) {
+			if (logicalPerfModeRequested)
+				logger::error("[PerfMode] Logical R proxy requires windowed or borderless mode; exclusive fullscreen is not supported");
 			shouldProxy = false;
+		}
 
 	auto refreshRate = Upscaling::GetRefreshRate(pSwapChainDesc->OutputWindow);
 	upscaling.refreshRate = refreshRate;
 
+	const bool logicalPerfModeEligible = logicalPerfModeRequested;
+	const bool ariseAsyncTailRequested = upscaling.foveatedRender.settings.ariseModel3;
+	const bool hdrConfigured = globals::features::hdrDisplay.loaded &&
+		globals::features::hdrDisplay.settings.enableHDR;
+	const bool ariseNvidia = adapterDesc.VendorId == Streamline::kNvidiaVendorId;
+	const bool logicalPerfMode = logicalPerfModeEligible && !globals::game::isVR && !hdrConfigured && ariseNvidia;
+	const bool ariseRenderDocCompatibility = logicalPerfMode && shouldProxy && skipUpscalingSdksForRenderDoc;
+	if (logicalPerfModeEligible && !logicalPerfMode) {
+		logger::error("[PerfMode] Logical R mode disabled for this session: {} is not supported",
+			globals::game::isVR ? "VR" : (hdrConfigured ? "HDR" : "non-NVIDIA adapter"));
+	}
 	if (shouldProxy) {
-		if (upscaling.settings.frameGenerationMode)
+		if (logicalPerfMode)
+			shouldProxy = true;
+		else if (upscaling.settings.frameGenerationMode)
 			if (refreshRate >= 120)
 				shouldProxy = true;
 			else if (upscaling.settings.frameGenerationForceEnable)
@@ -167,14 +193,24 @@ HRESULT WINAPI hk_D3D11CreateDeviceAndSwapChainUpscaling(
 	const D3D_FEATURE_LEVEL featureLevel = D3D_FEATURE_LEVEL_11_1;
 
 	if (shouldProxy) {
-		logger::info("[Frame Generation] Frame Generation enabled, using D3D12 proxy");
+		*ppSwapChain = nullptr;
+		*ppDevice = nullptr;
+		*ppImmediateContext = nullptr;
+		try {
+		if (logicalPerfMode)
+			logger::info("[PerfMode] {} enabled, using logical R D3D12 proxy",
+				ariseAsyncTailRequested ? "ARISE asynchronous mode" : "single-thread mode");
+		else
+			logger::info("[Frame Generation] Frame Generation enabled, using D3D12 proxy");
 
 		// DLSS-G availability is only trustworthy once a real D3D12 device is bound to
 		// the Streamline instance, so create and bind it before probing.
 		bool dlssgAvailable = false;
+		bool logicalDlssgEnabled = false;
 		// NVIDIA only: on other vendors the probe would still SL-proxy the device and
 		// queue that the FSR path then runs on.
-		if (upscaling.streamlineDX12.initialized && adapterDesc.VendorId == Streamline::kNvidiaVendorId) {
+		if (!ariseRenderDocCompatibility && upscaling.streamlineDX12.initialized &&
+			adapterDesc.VendorId == Streamline::kNvidiaVendorId) {
 			auto& sc = upscaling.dx12SwapChain;
 			sc.CreateD3D12Device(pAdapter);
 
@@ -187,11 +223,15 @@ HRESULT WINAPI hk_D3D11CreateDeviceAndSwapChainUpscaling(
 			// Only suppress DLSS-G when FSR3 is actually reachable to fall back to.
 			const bool userPrefersReachableFsr = upscaling.settings.preferFSRFrameGen && upscaling.fidelityFX.featureFSR3FG;
 			dlssgAvailable = upscaling.streamlineDX12.featureDLSSG && !userPrefersReachableFsr;
+			const bool frameGenerationAtBoot = upscaling.bootSnapshot.IsLatched() ?
+				upscaling.bootSnapshot.Boot(&Upscaling::Settings::frameGenerationMode) != 0 :
+				upscaling.settings.frameGenerationMode != 0;
+			logicalDlssgEnabled = logicalPerfMode && frameGenerationAtBoot && dlssgAvailable;
 
 			// Gating on dlssgAvailable (any cause, not just preference) keeps the FSR
 			// path on a clean device -- upgrading unconditionally corrupted FSR3's
 			// FrameGeneration DLL state and crashed on first Present.
-			if (dlssgAvailable && upscaling.streamlineDX12.slUpgradeInterface) {
+			if (dlssgAvailable && (!logicalPerfMode || logicalDlssgEnabled) && upscaling.streamlineDX12.slUpgradeInterface) {
 				// Upgrade in place -- a local copy leaves later queue/swap-chain
 				// creation SL-invisible and silently breaks FG.
 				upscaling.streamlineDX12.slUpgradeInterface((void**)&sc.d3d12Device);
@@ -208,7 +248,7 @@ HRESULT WINAPI hk_D3D11CreateDeviceAndSwapChainUpscaling(
 			}
 		}
 
-		if (dlssgAvailable || upscaling.HasFrameGenModule()) {
+		if (logicalPerfMode || dlssgAvailable || upscaling.HasFrameGenModule()) {
 			DX::ThrowIfFailed(D3D11CreateDevice(
 				pAdapter,
 				DriverType,
@@ -224,7 +264,18 @@ HRESULT WINAPI hk_D3D11CreateDeviceAndSwapChainUpscaling(
 			upscaling.SetProxyD3D11Device(*ppDevice);
 			upscaling.SetProxyD3D11DeviceContext(*ppImmediateContext);
 
-			if (dlssgAvailable) {
+			if (logicalPerfMode) {
+				logger::info("[PerfMode] Creating provider-independent physical swap chain");
+				if (ariseRenderDocCompatibility)
+					logger::info("[ARISE] RenderDoc compatibility active: skipping all DLSS/NR graph initialization");
+				upscaling.CreateProxySwapChainArise(
+					pAdapter, *pSwapChainDesc, ariseAsyncTailRequested, logicalDlssgEnabled);
+				pSwapChainDesc->BufferDesc.Width = upscaling.dx12SwapChain.LogicalWidth();
+				pSwapChainDesc->BufferDesc.Height = upscaling.dx12SwapChain.LogicalHeight();
+				logger::info("[ARISE] Returned logical creation extent {}x{} while retaining physical swap chain {}x{}",
+					pSwapChainDesc->BufferDesc.Width, pSwapChainDesc->BufferDesc.Height,
+					upscaling.dx12SwapChain.PhysicalWidth(), upscaling.dx12SwapChain.PhysicalHeight());
+			} else if (dlssgAvailable) {
 				logger::info("[Frame Generation] DLSS-G available, creating direct swap chain");
 				upscaling.CreateProxySwapChainDirect(pAdapter, *pSwapChainDesc);
 				if (upscaling.streamlineDX12.slUpgradeInterface)
@@ -254,6 +305,59 @@ HRESULT WINAPI hk_D3D11CreateDeviceAndSwapChainUpscaling(
 		} else {
 			logger::warn("[Frame Generation] No frame generation module available, skipping proxy");
 			upscaling.fidelityFXMissing = true;
+		}
+		} catch (const DX::com_exception& error) {
+			logger::error("[ARISE] D3D12 proxy initialization failed: {}", error.what());
+			NeuralRendering::ARISE::Pipeline::Instance().SetModel3Enabled(false);
+			upscaling.d3d12SwapChainActive = false;
+			if (ppSwapChain && *ppSwapChain) {
+				(*ppSwapChain)->Release();
+				*ppSwapChain = nullptr;
+			}
+			if (ppImmediateContext && *ppImmediateContext) {
+				(*ppImmediateContext)->Release();
+				*ppImmediateContext = nullptr;
+			}
+			if (ppDevice && *ppDevice) {
+				(*ppDevice)->Release();
+				*ppDevice = nullptr;
+			}
+			return error.code();
+		} catch (const winrt::hresult_error& error) {
+			logger::error("[ARISE] D3D12 proxy initialization failed: HRESULT 0x{:08X}",
+				static_cast<std::uint32_t>(error.code()));
+			NeuralRendering::ARISE::Pipeline::Instance().SetModel3Enabled(false);
+			upscaling.d3d12SwapChainActive = false;
+			if (ppSwapChain && *ppSwapChain) {
+				(*ppSwapChain)->Release();
+				*ppSwapChain = nullptr;
+			}
+			if (ppImmediateContext && *ppImmediateContext) {
+				(*ppImmediateContext)->Release();
+				*ppImmediateContext = nullptr;
+			}
+			if (ppDevice && *ppDevice) {
+				(*ppDevice)->Release();
+				*ppDevice = nullptr;
+			}
+			return error.code();
+		} catch (...) {
+			logger::error("[ARISE] D3D12 proxy initialization failed with an unknown error");
+			NeuralRendering::ARISE::Pipeline::Instance().SetModel3Enabled(false);
+			upscaling.d3d12SwapChainActive = false;
+			if (ppSwapChain && *ppSwapChain) {
+				(*ppSwapChain)->Release();
+				*ppSwapChain = nullptr;
+			}
+			if (ppImmediateContext && *ppImmediateContext) {
+				(*ppImmediateContext)->Release();
+				*ppImmediateContext = nullptr;
+			}
+			if (ppDevice && *ppDevice) {
+				(*ppDevice)->Release();
+				*ppDevice = nullptr;
+			}
+			return E_FAIL;
 		}
 	}
 
@@ -869,13 +973,15 @@ void Upscaling::DrawFrameGenerationSettings()
 
 void Upscaling::DrawReflexSettings()
 {
-	const bool usingDX12Reflex = UsesDLSSGFrameGen();
+	const bool usingDX12Reflex = dx12SwapChain.useArise || UsesDLSSGFrameGen();
 	auto& activeReflex = usingDX12Reflex ? streamlineDX12 : streamline;
 	const bool reflexAvailable = activeReflex.initialized && activeReflex.featureReflex;
 	const bool markerOptimizationAvailable = reflexAvailable && activeReflex.featurePCL;
 
 	if (usingDX12Reflex) {
-		ImGui::Text("%s", T(TKEY("reflex_via_dx12"), "Reflex is running via DX12 (DLSS Frame Generation active)."));
+		ImGui::Text("%s", T(TKEY("reflex_via_dx12"),
+			dx12SwapChain.useArise ? "Reflex sleeps on the logical-render thread via DX12; physical Present markers complete in the Tail."
+				: "Reflex is running via DX12 (DLSS Frame Generation active)."));
 	}
 
 	if (!reflexAvailable) {
@@ -1981,6 +2087,29 @@ void Upscaling::ConfigureUpscaling(RE::BSGraphics::State* a_viewport)
 	auto screenHeight = static_cast<int>(screenSize.y);
 
 	if (upscaleMethod != UpscaleMethod::kNONE && upscaleMethod != UpscaleMethod::kTAA) {
+		const bool model3LogicalRenderPath = !globals::game::isVR && dx12SwapChain.useArise;
+		if (model3LogicalRenderPath) {
+			const int renderWidth = static_cast<int>(dx12SwapChain.LogicalWidth());
+			const int renderHeight = static_cast<int>(dx12SwapChain.LogicalHeight());
+			const int displayWidth = static_cast<int>(dx12SwapChain.PhysicalWidth());
+			a_viewport->screenWidth = static_cast<std::uint32_t>(renderWidth);
+			a_viewport->screenHeight = static_cast<std::uint32_t>(renderHeight);
+			a_viewport->frameBufferViewport[0] = static_cast<std::uint32_t>(renderWidth);
+			a_viewport->frameBufferViewport[1] = static_cast<std::uint32_t>(renderHeight);
+			const auto plan = foveatedRender.BuildFlatPipelinePlan(
+				displayWidth, dx12SwapChain.PhysicalHeight(), renderWidth, renderHeight);
+			resolutionScale = { 1.0f, 1.0f };
+			lastDlssRenderWidth = renderWidth;
+			lastDlssRenderHeight = renderHeight;
+			int phaseCount = GetJitterPhaseCount(renderWidth, displayWidth);
+			if (plan.act2Backend == FoveatedRender::FlatAct2Backend::kDLSS)
+				phaseCount = std::max(phaseCount, GetJitterPhaseCount(plan.nrWidth, plan.displayWidth));
+			GetJitterOffset(&jitter.x, &jitter.y, state->frameCount, phaseCount);
+			if (state->isLoadingMenuOpen)
+				jitter = { 0.0f, 0.0f };
+			a_viewport->projectionPosScaleX = -2.0f * jitter.x / renderWidth;
+			a_viewport->projectionPosScaleY = 2.0f * jitter.y / renderHeight;
+		} else {
 		// PerfMode: when the BSOpenVR size hook is live, every engine RT was
 		// already allocated at RenderRes — so the DRS-style scale is identity.
 		// Jitter is still computed at the real DisplayRes phase ratio so the
@@ -2050,6 +2179,7 @@ void Upscaling::ConfigureUpscaling(RE::BSGraphics::State* a_viewport)
 				a_viewport->projectionPosScaleX = -2.0f * jitter.x / renderWidth;
 
 			a_viewport->projectionPosScaleY = 2.0f * jitter.y / renderHeight;
+		}
 		}
 	} else {
 		resolutionScale = float2{ 1.0f, 1.0f };
@@ -2197,6 +2327,7 @@ bool Upscaling::CopySharedD3D12Resources()
 
 	auto renderer = globals::game::renderer;
 	auto context = globals::d3d::context;
+	Util::FullscreenPassScope stateScope(context);
 
 	auto& motionVector = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMOTION_VECTOR];
 	context->CopyResource(dx12SwapChain.motionVectorBufferShared12->resource11, Util::AsReal(motionVector.texture));
@@ -2261,6 +2392,12 @@ void UpdateCameraData()
 void Upscaling::PostDisplay()
 {
 	auto viewport = globals::game::graphicsState;
+	if (!globals::game::isVR && dx12SwapChain.useArise) {
+		viewport->screenWidth = dx12SwapChain.LogicalWidth();
+		viewport->screenHeight = dx12SwapChain.LogicalHeight();
+		viewport->frameBufferViewport[0] = dx12SwapChain.LogicalWidth();
+		viewport->frameBufferViewport[1] = dx12SwapChain.LogicalHeight();
+	}
 
 	viewport->projectionPosScaleX = projectionPosScaleX;
 	viewport->projectionPosScaleY = projectionPosScaleY;
@@ -2393,7 +2530,7 @@ bool Upscaling::IsFrameGenerationDx12PathActive() const
 
 bool Upscaling::IsFrameGenerationActive() const
 {
-	if (!IsFrameGenerationDx12PathActive() || !settings.frameGenerationMode)
+	if (!IsFrameGenerationConfiguredForSession())
 		return false;
 	if (dx12SwapChain.useDLSSG)
 		// featureDLSSG is a one-time boot flag; lastDLSSGStatus is live per-session.
@@ -2405,7 +2542,7 @@ bool Upscaling::ShouldPrepareFrameGeneration() const
 {
 	auto* state = globals::state;
 	const bool menuOpen = state && state->IsPausedOrMenuOpen(globals::game::ui);
-	return IsFrameGenerationDx12PathActive() && settings.frameGenerationMode && (settings.frameGenerationAllowInMenus || !menuOpen);
+	return IsFrameGenerationConfiguredForSession() && (settings.frameGenerationAllowInMenus || !menuOpen);
 }
 
 bool Upscaling::ShouldUseFrameGenerationThisFrame() const
@@ -2508,7 +2645,9 @@ Upscaling::FrameGenMethod Upscaling::GetFrameGenMethod() const
 		return FrameGenMethod::kNone;
 	if (dx12SwapChain.useDLSSG)
 		return FrameGenMethod::kDLSSG;
-	return FrameGenMethod::kFSR;
+	if (fidelityFX.featureFSR3FG)
+		return FrameGenMethod::kFSR;
+	return FrameGenMethod::kNone;
 }
 
 bool Upscaling::UsesDLSSGFrameGen() const
@@ -2552,9 +2691,13 @@ json Upscaling::GetDiagnostics()
 	diagnostics["frameGenMultiplier"] = GetFrameGenerationMultiplier();
 	if (!globals::game::isVR) {
 		const auto& nr = foveatedRender.settings;
-		const uint32_t displayWidth = globals::state ? static_cast<uint32_t>(globals::state->screenSize.x) : 0u;
-		const uint32_t displayHeight = globals::state ? static_cast<uint32_t>(globals::state->screenSize.y) : 0u;
-		const auto plan = foveatedRender.BuildFlatPipelinePlan(displayWidth, displayHeight);
+		const bool model3 = dx12SwapChain.useArise;
+		const uint32_t displayWidth = model3 ? dx12SwapChain.PhysicalWidth() :
+			(globals::state ? static_cast<uint32_t>(globals::state->screenSize.x) : 0u);
+		const uint32_t displayHeight = model3 ? dx12SwapChain.PhysicalHeight() :
+			(globals::state ? static_cast<uint32_t>(globals::state->screenSize.y) : 0u);
+		const auto plan = foveatedRender.BuildFlatPipelinePlan(displayWidth, displayHeight,
+			model3 ? dx12SwapChain.LogicalWidth() : 0u, model3 ? dx12SwapChain.LogicalHeight() : 0u);
 		const auto act1Mode = std::string(magic_enum::enum_name(plan.act1Backend));
 		const auto act2Mode = std::string(magic_enum::enum_name(plan.act2Backend));
 		diagnostics["flatPipeline"] = {
@@ -2568,6 +2711,8 @@ json Upscaling::GetDiagnostics()
 			{ "nrHeight", plan.nrHeight },
 			{ "renderWidth", lastDlssRenderWidth },
 			{ "renderHeight", lastDlssRenderHeight },
+			{ "logicalWidth", model3 ? dx12SwapChain.LogicalWidth() : plan.engineWidth },
+			{ "logicalHeight", model3 ? dx12SwapChain.LogicalHeight() : plan.engineHeight },
 			{ "displayWidth", displayWidth },
 			{ "displayHeight", displayHeight },
 		};
@@ -2598,6 +2743,12 @@ void Upscaling::CreateProxySwapChain(IDXGIAdapter* adapter, DXGI_SWAP_CHAIN_DESC
 void Upscaling::CreateProxySwapChainDirect(IDXGIAdapter* adapter, DXGI_SWAP_CHAIN_DESC swapChainDesc)
 {
 	dx12SwapChain.CreateSwapChainDirect(adapter, swapChainDesc);
+}
+
+void Upscaling::CreateProxySwapChainArise(IDXGIAdapter* adapter, DXGI_SWAP_CHAIN_DESC swapChainDesc,
+	bool asyncTail, bool enableDLSSG)
+{
+	dx12SwapChain.CreateSwapChainArise(adapter, swapChainDesc, asyncTail, enableDLSSG);
 }
 
 void Upscaling::CreateProxyInterop()
@@ -2717,8 +2868,8 @@ void Upscaling::Upscale()
 
 		auto renderSize = Util::ConvertToDynamic(globals::state->screenSize);
 		if (!globals::game::isVR) {
-			lastDlssRenderWidth = static_cast<uint32_t>(std::lround(renderSize.x));
-			lastDlssRenderHeight = static_cast<uint32_t>(std::lround(renderSize.y));
+			lastDlssRenderWidth = dx12SwapChain.useArise ? dx12SwapChain.LogicalWidth() : static_cast<uint32_t>(std::lround(renderSize.x));
+			lastDlssRenderHeight = dx12SwapChain.useArise ? dx12SwapChain.LogicalHeight() : static_cast<uint32_t>(std::lround(renderSize.y));
 		}
 		uint32_t numEyes = globals::game::isVR ? 2 : 1;
 		uint32_t eyeRenderWidth = (uint32_t)(renderSize.x / numEyes);
@@ -2855,8 +3006,10 @@ void Upscaling::Upscale()
 void Upscaling::PerformUpscaling()
 {
 	CS_GPU_PASS("Upscaling::PerformUpscaling");
-	Upscale();
-	if (!IsFlatDlssPostInjectActive() && !IsFlatAct1BypassActive())
+	const bool renderDocCompatibility = dx12SwapChain.IsRenderDocCompatibility();
+	if (!renderDocCompatibility)
+		Upscale();
+	if (!renderDocCompatibility && !IsFlatDlssPostInjectActive() && !IsFlatAct1BypassActive())
 		UpscaleDepth();
 
 	auto& runtimeData = globals::game::graphicsState->GetRuntimeData();
@@ -2936,6 +3089,7 @@ void Upscaling::UpscaleDepth()
 	if (!fullscreenVS || !underwaterMaskPS || (depthUpscaleActive && !depthUpscalePS)) {
 		return;
 	}
+	Util::FullscreenPassScope stateScope(context);
 
 	// Unbind any prior render targets before issuing CopyResource on depth/
 	// depthCopy. Upscale() does this for the standard upscale path, but
@@ -3261,7 +3415,8 @@ void Upscaling::Main_PostProcessing::thunk(RE::ImageSpaceManager* a_this, uint32
 		upscaling.UpscaleDepth();
 	}
 
-	if (upscaleMethod == UpscaleMethod::kDLSS && !upscaling.IsFlatDlssPostInjectActive() &&
+	if (!upscaling.dx12SwapChain.IsRenderDocCompatibility() &&
+		upscaleMethod == UpscaleMethod::kDLSS && !upscaling.IsFlatDlssPostInjectActive() &&
 		!upscaling.IsFlatAct1BypassActive() &&
 		(globals::game::isVR || !upscaling.foveatedRender.settings.neuralRenderingEnabled)) {
 		// FoveatedRender's DLSS output doesn't land in sharpenerTexture the

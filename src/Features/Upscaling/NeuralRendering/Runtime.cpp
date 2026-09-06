@@ -163,12 +163,6 @@ namespace NeuralRendering
 		}
 	}
 
-	Runtime& Runtime::Instance()
-	{
-		static Runtime instance;
-		return instance;
-	}
-
 	Runtime::~Runtime() { Shutdown(); }
 
 	bool Runtime::Probe(const std::filesystem::path& explicitPath)

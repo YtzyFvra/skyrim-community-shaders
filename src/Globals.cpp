@@ -444,6 +444,7 @@ namespace globals
 		// size hook (ShouldEngagePerfMode), evaluated here at D3D init before IsHookActive() flips.
 		if (globals::features::upscaling.ShouldEngagePerfMode())
 			globals::features::upscaling.perfMode.InstallFadeOverlayHook(a_context);
+		globals::features::upscaling.foveatedRender.InstallD3DHook(a_context);
 
 		UnderwaterDepthOfField::InstallD3DHooks(a_context);
 	}

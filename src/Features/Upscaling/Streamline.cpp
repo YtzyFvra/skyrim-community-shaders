@@ -106,9 +106,9 @@ void Streamline::LoadInterposer()
 	sl::Preferences pref;
 
 	// DX11 instance: DLSS upscaling + low-latency (Reflex/PCL).
-	// DX12 instance: DLSS-G frame generation + Reflex/PCL (DLSS-G requires Reflex).
+	// DX12 instance: DLSS reconstruction + optional DLSS-G and Reflex/PCL.
 	sl::Feature featuresDX11[] = { sl::kFeatureDLSS, sl::kFeatureReflex, sl::kFeaturePCL };
-	sl::Feature featuresDX12[] = { sl::kFeatureDLSS_G, sl::kFeatureReflex, sl::kFeaturePCL };
+	sl::Feature featuresDX12[] = { sl::kFeatureDLSS, sl::kFeatureDLSS_G, sl::kFeatureReflex, sl::kFeaturePCL };
 	if (renderAPI == sl::RenderAPI::eD3D11) {
 		pref.featuresToLoad = featuresDX11;
 		pref.numFeaturesToLoad = _countof(featuresDX11);
@@ -230,7 +230,9 @@ void Streamline::CheckFeatures(IDXGIAdapter* a_adapter)
 		checkFeatureAvailability(sl::kFeatureDLSS, "DLSS", featureDLSS);
 		logger::info("[Streamline DX11] DLSS {} available", featureDLSS ? "is" : "is not");
 	} else {
+		checkFeatureAvailability(sl::kFeatureDLSS, "DLSS", featureDLSS);
 		checkFeatureAvailability(sl::kFeatureDLSS_G, "DLSS-G", featureDLSSG);
+		logger::info("[Streamline DX12] DLSS {} available", featureDLSS ? "is" : "is not");
 		logger::info("[Streamline DX12] DLSS-G {} available", featureDLSSG ? "is" : "is not");
 	}
 
@@ -300,19 +302,35 @@ void Streamline::PostDevice()
 	// Hook up all of the feature functions using the sl function slGetFeatureFunction
 
 	if (renderAPI == sl::RenderAPI::eD3D12) {
+		slDLSSGetOptimalSettings = nullptr;
+		slDLSSGetState = nullptr;
+		slDLSSSetOptions = nullptr;
 		slDLSSGGetState = nullptr;
 		slDLSSGSetOptions = nullptr;
-		featureDLSSG = false;
 		slReflexGetState = nullptr;
 		slReflexSleep = nullptr;
 		slReflexSetOptions = nullptr;
 		slPCLSetMarker = nullptr;
+		const bool dlssSupported = featureDLSS;
+		const bool dlssgSupported = featureDLSSG;
+		featureDLSS = false;
+		featureDLSSG = false;
 
 		if (slGetFeatureFunction) {
+			bool dlssFnsBound = true;
+			dlssFnsBound &= BindFeatureFunction(sl::kFeatureDLSS, "slDLSSGetOptimalSettings", (void*&)slDLSSGetOptimalSettings);
+			dlssFnsBound &= BindFeatureFunction(sl::kFeatureDLSS, "slDLSSGetState", (void*&)slDLSSGetState);
+			dlssFnsBound &= BindFeatureFunction(sl::kFeatureDLSS, "slDLSSSetOptions", (void*&)slDLSSSetOptions);
+			featureDLSS = dlssSupported && dlssFnsBound && slDLSSGetOptimalSettings && slDLSSGetState && slDLSSSetOptions;
+			if (featureDLSS)
+				logger::info("[Streamline DX12] DLSS runtime controls are available");
+			else
+				logger::warn("[Streamline DX12] DLSS runtime controls are unavailable");
+
 			bool dlssgFnsBound = true;
 			dlssgFnsBound &= BindFeatureFunction(sl::kFeatureDLSS_G, "slDLSSGGetState", (void*&)slDLSSGGetState);
 			dlssgFnsBound &= BindFeatureFunction(sl::kFeatureDLSS_G, "slDLSSGSetOptions", (void*&)slDLSSGSetOptions);
-			featureDLSSG = dlssgFnsBound && slDLSSGGetState && slDLSSGSetOptions;
+			featureDLSSG = dlssgSupported && dlssgFnsBound && slDLSSGGetState && slDLSSGSetOptions;
 
 			if (!featureDLSSG) {
 				logger::warn("[Streamline DX12] DLSS-G functions missing; DLSS-G runtime controls will be disabled");
@@ -428,6 +446,19 @@ bool Streamline::EnsureFrameToken()
 	}
 
 	return frameToken != nullptr;
+}
+
+bool Streamline::AcquireFrameToken(uint32_t frameId, sl::FrameToken*& token)
+{
+	token = nullptr;
+	return initialized && slGetNewFrameToken &&
+		slGetNewFrameToken(token, &frameId) == sl::Result::eOk && token;
+}
+
+bool Streamline::SetConstants(const sl::FrameToken& token, const sl::Constants& constants,
+	sl::ViewportHandle viewportHandle)
+{
+	return initialized && slSetConstants && slSetConstants(constants, token, viewportHandle) == sl::Result::eOk;
 }
 
 bool Streamline::CheckFrameConstants(sl::ViewportHandle p_viewport, uint32_t eyeIndex,
@@ -1191,9 +1222,6 @@ void Streamline::UpdateReflex()
 	if (!slReflexSleep)
 		return;
 
-	if (options.mode == sl::ReflexMode::eOff && options.frameLimitUs == 0)
-		return;
-
 	const uint32_t currentFrame = globals::state ? globals::state->frameCount : 0;
 	if (lastReflexSleepFrame == currentFrame)
 		return;
@@ -1229,7 +1257,19 @@ void Streamline::EmitPCLMarker(sl::PCLMarker a_marker)
 	}
 }
 
-void Streamline::ConfigureDLSSG(bool enabled)
+void Streamline::EmitPCLMarker(sl::PCLMarker marker, const sl::FrameToken& token)
+{
+	if (!initialized || !featurePCL || !slPCLSetMarker)
+		return;
+	const sl::Result markerResult = slPCLSetMarker(marker, token);
+	if (markerResult != sl::Result::eOk)
+		logger::warn("[Streamline {}] slPCLSetMarker({}) failed: {}", instanceTag,
+			magic_enum::enum_name(marker), magic_enum::enum_name(markerResult));
+}
+
+void Streamline::ConfigureDLSSG(bool enabled, uint32_t guideWidth, uint32_t guideHeight,
+	uint32_t colorWidth, uint32_t colorHeight, DXGI_FORMAT depthFormat, DXGI_FORMAT motionFormat,
+	DXGI_FORMAT hudLessFormat, DXGI_FORMAT uiFormat, uint32_t backBufferCount)
 {
 	if (!initialized || !slDLSSGSetOptions)
 		return;
@@ -1238,6 +1278,20 @@ void Streamline::ConfigureDLSSG(bool enabled)
 	options.mode = enabled ? sl::DLSSGMode::eOn : sl::DLSSGMode::eOff;
 	options.numFramesToGenerate = std::clamp<uint32_t>(
 		globals::features::upscaling.settings.dlssgFramesToGenerate, 1, dlssgMaxFramesToGenerate);
+	if (guideWidth && guideHeight && colorWidth && colorHeight) {
+		options.flags |= sl::DLSSGFlags::eDynamicResolutionEnabled;
+		options.dynamicResWidth = guideWidth;
+		options.dynamicResHeight = guideHeight;
+		options.mvecDepthWidth = guideWidth;
+		options.mvecDepthHeight = guideHeight;
+		options.colorWidth = colorWidth;
+		options.colorHeight = colorHeight;
+		options.numBackBuffers = backBufferCount;
+		options.depthBufferFormat = static_cast<uint32_t>(depthFormat);
+		options.mvecBufferFormat = static_cast<uint32_t>(motionFormat);
+		options.hudLessBufferFormat = static_cast<uint32_t>(hudLessFormat);
+		options.uiBufferFormat = static_cast<uint32_t>(uiFormat);
+	}
 
 	if (SL_FAILED(result, slDLSSGSetOptions(viewport, options))) {
 		static bool errorLogged = false;
@@ -1311,6 +1365,32 @@ void Streamline::TagDX12Resources(ID3D12GraphicsCommandList* cmdList,
 	const uint32_t numTags = uiColorAndAlpha ? _countof(tags) : _countof(tags) - 1;
 
 	slSetTagForFrame(*frameToken, viewport, tags, numTags, cmdList);
+}
+
+void Streamline::TagDX12Resources(const sl::FrameToken& token, ID3D12GraphicsCommandList* cmdList,
+	ID3D12Resource* depth, ID3D12Resource* mvec, ID3D12Resource* hudLessColor,
+	ID3D12Resource* uiColorAndAlpha, uint32_t guideWidth, uint32_t guideHeight,
+	uint32_t displayWidth, uint32_t displayHeight)
+{
+	if (!initialized || !slSetTagForFrame || !cmdList || !depth || !mvec || !hudLessColor)
+		return;
+	sl::Extent guideExtent{ 0, 0, guideWidth, guideHeight };
+	sl::Extent displayExtent{ 0, 0, displayWidth, displayHeight };
+	sl::Resource depthRes{ sl::ResourceType::eTex2d, depth, D3D12_RESOURCE_STATE_COMMON };
+	sl::Resource mvecRes{ sl::ResourceType::eTex2d, mvec, D3D12_RESOURCE_STATE_COMMON };
+	sl::Resource hudLessRes{ sl::ResourceType::eTex2d, hudLessColor, D3D12_RESOURCE_STATE_COMMON };
+	sl::Resource uiRes{ sl::ResourceType::eTex2d, uiColorAndAlpha, D3D12_RESOURCE_STATE_COMMON };
+	sl::ResourceTag tags[]{
+		{ &depthRes, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent, &guideExtent },
+		{ &mvecRes, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent, &guideExtent },
+		{ &hudLessRes, sl::kBufferTypeHUDLessColor, sl::ResourceLifecycle::eValidUntilPresent, &displayExtent },
+		{ &uiRes, sl::kBufferTypeUIColorAndAlpha, sl::ResourceLifecycle::eValidUntilPresent, &displayExtent },
+	};
+	const uint32_t count = uiColorAndAlpha ? static_cast<uint32_t>(std::size(tags)) :
+		static_cast<uint32_t>(std::size(tags) - 1);
+	const sl::Result tagResult = slSetTagForFrame(token, viewport, tags, count, cmdList);
+	if (tagResult != sl::Result::eOk)
+		logger::error("[Streamline DX12] ARISE frame resource tagging failed: {}", magic_enum::enum_name(tagResult));
 }
 
 /**

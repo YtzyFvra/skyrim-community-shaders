@@ -18,6 +18,7 @@
 #endif
 #include "Features/RenderDoc.h"
 #include "Features/SceneSelector.h"
+#include "Features/Upscaling.h"
 #include "Features/VR.h"
 #include "Globals.h"
 #include "I18n/I18n.h"
@@ -207,8 +208,11 @@ void OverlayRenderer::InitializeImGuiFrame(Menu& menu)
 	if (!vrPanel) {
 		DXGI_SWAP_CHAIN_DESC desc{};
 		globals::d3d::swapChain->GetDesc(&desc);
-		const float displayW = static_cast<float>(desc.BufferDesc.Width);
-		const float displayH = static_cast<float>(desc.BufferDesc.Height);
+		auto& dx12SwapChain = globals::features::upscaling.dx12SwapChain;
+		const float displayW = static_cast<float>(dx12SwapChain.useArise ?
+			dx12SwapChain.PhysicalWidth() : desc.BufferDesc.Width);
+		const float displayH = static_cast<float>(dx12SwapChain.useArise ?
+			dx12SwapChain.PhysicalHeight() : desc.BufferDesc.Height);
 		Util::UpdateImGuiInput(desc.OutputWindow, displayW, displayH);
 	}
 	// The wand drives the cursor in VR (PumpInput), so skip the desktop

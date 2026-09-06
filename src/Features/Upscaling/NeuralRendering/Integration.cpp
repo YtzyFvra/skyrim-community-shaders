@@ -62,6 +62,13 @@ namespace NeuralRendering
 		std::uint32_t lastFlatAct1JitterMode = UINT32_MAX;
 		std::uint32_t lastFlatAct2JitterMode = UINT32_MAX;
 		std::uint64_t lastFlatPlanSignature = 0;
+		std::uint64_t lastModel3PlanSignature = 0;
+		bool hasModel3Plan = false;
+		std::uint64_t lastModel3Frame = UINT64_MAX;
+		std::uint64_t lastModel3CaptureFrame = UINT64_MAX;
+		bool lastModel3Eligible = false;
+		bool model3RestrictionLogged = false;
+		bool model3CaptureFailureLogged = false;
 		Act2BackendStats act2BackendStats;
 
 		struct DownsampleConstants
@@ -76,8 +83,8 @@ namespace NeuralRendering
 		{
 			std::uint32_t fullWidth;
 			std::uint32_t fullHeight;
-			std::uint32_t lowWidth;
-			std::uint32_t lowHeight;
+			std::uint32_t guidanceWidth;
+			std::uint32_t guidanceHeight;
 			float lumaStrength;
 			float chromaStrength;
 			float edgeProtection;
@@ -278,9 +285,8 @@ namespace NeuralRendering
 			if (!matches(halfResolutionColor.get(), plan.nrWidth, plan.nrHeight, sourceDesc.Format))
 				halfResolutionColor = Upscaling::CreateTextureFromSource(source, plan.nrWidth, plan.nrHeight,
 					false, true, true, "NeuralRendering::NrInputColor");
-			const bool needsDisplayIntermediate = plan.act2Backend == FoveatedRender::FlatAct2Backend::kNIS ||
-				plan.act2Backend == FoveatedRender::FlatAct2Backend::kFusion ||
-				plan.act2Backend == FoveatedRender::FlatAct2Backend::kLanczos;
+			const bool needsDisplayIntermediate = plan.act2SrBackend == FoveatedRender::FlatAct2SrBackend::kNIS ||
+				plan.act2SrBackend == FoveatedRender::FlatAct2SrBackend::kLanczos;
 			if (needsDisplayIntermediate &&
 				!matches(upscaledNeuralColor.get(), plan.displayWidth, plan.displayHeight, sourceDesc.Format))
 				upscaledNeuralColor = Upscaling::CreateTextureFromSource(source, plan.displayWidth, plan.displayHeight,
@@ -288,7 +294,7 @@ namespace NeuralRendering
 			if (!needsDisplayIntermediate)
 				upscaledNeuralColor.reset();
 
-			const bool needsFusion = plan.act2Backend == FoveatedRender::FlatAct2Backend::kFusion;
+			const bool needsFusion = plan.fusion;
 			if (needsFusion && !matches(fusionOutput.get(), plan.displayWidth, plan.displayHeight, sourceDesc.Format))
 				fusionOutput = Upscaling::CreateTextureFromSource(source, plan.displayWidth, plan.displayHeight,
 					false, true, true, "NeuralRendering::FusionOutput");
@@ -298,8 +304,8 @@ namespace NeuralRendering
 			}
 			if (plan.act1Backend == FoveatedRender::FlatAct1Backend::kBypass)
 				flatAct1Output.reset();
-			const bool needsTemporalAct2 = plan.act2Backend == FoveatedRender::FlatAct2Backend::kDLSS ||
-				plan.act2Backend == FoveatedRender::FlatAct2Backend::kFSR3;
+			const bool needsTemporalAct2 = plan.act2SrBackend == FoveatedRender::FlatAct2SrBackend::kDLSS ||
+				plan.act2SrBackend == FoveatedRender::FlatAct2SrBackend::kFSR3;
 			if (!needsTemporalAct2) {
 				flatAct2Output.reset();
 				act2ReactiveMask.reset();
@@ -527,18 +533,19 @@ namespace NeuralRendering
 		}
 
 		bool ResolveNeuralRendering(ID3D11DeviceContext* context, ID3D11ShaderResourceView* referenceColor,
-			ID3D11ShaderResourceView* depthGuide, std::uint32_t width, std::uint32_t height,
+			ID3D11ShaderResourceView* neuralColor, ID3D11ShaderResourceView* depthGuide,
+			std::uint32_t width, std::uint32_t height, std::uint32_t guidanceWidth, std::uint32_t guidanceHeight,
 			std::uint32_t depthWidth, std::uint32_t depthHeight, const FoveatedRender::Settings& settings)
 		{
 			CS_GPU_PASS("FlatPipeline::Fusion");
 			auto* shader = fusionCS.Get(
 				L"Data\\Shaders\\Upscaling\\NeuralRendering\\ResolveFusionCS.hlsl", {}, "cs_5_0",
 				"main", "NeuralRendering::ResolveFusionCS");
-			if (!shader || !referenceColor || !upscaledNeuralColor || !fusionOutput ||
+			if (!shader || !referenceColor || !neuralColor || !fusionOutput ||
 				(settings.flatPipelineFusionEnhancedGuidance && !depthGuide))
 				return false;
 			const FusionConstants constants{
-				width, height, width, height,
+				width, height, guidanceWidth, guidanceHeight,
 				settings.neuralRenderingFusionLuma,
 				settings.neuralRenderingFusionChroma,
 				settings.neuralRenderingFusionEdgeProtection,
@@ -561,7 +568,7 @@ namespace NeuralRendering
 			context->CSSetShader(shader, nullptr, 0);
 			ID3D11Buffer* buffers[]{ fusionCB.get() };
 			context->CSSetConstantBuffers(0, 1, buffers);
-			ID3D11ShaderResourceView* srvs[]{ referenceColor, upscaledNeuralColor->srv.get(),
+			ID3D11ShaderResourceView* srvs[]{ referenceColor, neuralColor,
 				settings.flatPipelineFusionEnhancedGuidance ? depthGuide : nullptr };
 			context->CSSetShaderResources(0, 3, srvs);
 			ID3D11UnorderedAccessView* uavs[]{ fusionOutput->uav.get() };
@@ -671,7 +678,7 @@ namespace NeuralRendering
 		bool ApplyFlatPipeline(Upscaling& upscaling, FoveatedRender& foveated)
 		{
 			using Act1 = FoveatedRender::FlatAct1Backend;
-			using Act2 = FoveatedRender::FlatAct2Backend;
+			using Act2 = FoveatedRender::FlatAct2SrBackend;
 
 			const bool hdrConfigured = globals::features::hdrDisplay.loaded && globals::features::hdrDisplay.settings.enableHDR;
 			const bool routeActive = foveated.settings.neuralRenderingEnabled &&
@@ -721,9 +728,12 @@ namespace NeuralRendering
 				static_cast<std::uint64_t>(plan.nrWidth), static_cast<std::uint64_t>(plan.nrHeight),
 				static_cast<std::uint64_t>(plan.nrOutputWidth), static_cast<std::uint64_t>(plan.nrOutputHeight),
 				static_cast<std::uint64_t>(plan.act2OutputWidth), static_cast<std::uint64_t>(plan.act2OutputHeight),
-				static_cast<std::uint64_t>(plan.act1Backend), static_cast<std::uint64_t>(plan.act2Backend),
+				static_cast<std::uint64_t>(plan.act1Backend), static_cast<std::uint64_t>(plan.act2SrBackend),
+				static_cast<std::uint64_t>(plan.fusion),
+				static_cast<std::uint64_t>(plan.act1Quality),
 				static_cast<std::uint64_t>(plan.act2Quality),
-				static_cast<std::uint64_t>(plan.act1Dsr), static_cast<std::uint64_t>(foveated.settings.flatPipelineAct1Preset),
+				static_cast<std::uint64_t>(plan.act1Dsr),
+				static_cast<std::uint64_t>(plan.act1Preset),
 				static_cast<std::uint64_t>(foveated.settings.flatPipelineAct1Jitter),
 				static_cast<std::uint64_t>(foveated.settings.flatPipelineAct2Preset),
 				static_cast<std::uint64_t>(foveated.settings.flatPipelineAct2Jitter),
@@ -740,14 +750,14 @@ namespace NeuralRendering
 				Upscaling::streamline.DestroyDLSSResources();
 				act1FsrScaler.Reset();
 				act2FsrScaler.Reset();
-				if (plan.act2Backend != Act2::kNIS && plan.act2Backend != Act2::kFusion)
+				if (plan.act2SrBackend != Act2::kNIS)
 					nisScaler.Reset();
 				lastFlatPlanSignature = planSignature;
 				logger::info("[FlatPipeline] Plan signature=0x{:016X} D={}x{} R={}x{} ACT1={} {}x{} N={}x{} ({:.2f}) ACT2={} {}x{} RCAS={}",
 					planSignature, plan.displayWidth, plan.displayHeight, plan.engineWidth, plan.engineHeight,
 					static_cast<uint>(plan.act1Backend), plan.act1OutputWidth, plan.act1OutputHeight,
 					plan.nrWidth, plan.nrHeight, foveated.settings.flatPipelineNrScale,
-					static_cast<uint>(plan.act2Backend), plan.act2OutputWidth, plan.act2OutputHeight,
+					static_cast<uint>(plan.act2SrBackend), plan.act2OutputWidth, plan.act2OutputHeight,
 					foveated.settings.flatPipelineSharpen);
 			}
 
@@ -812,7 +822,8 @@ namespace NeuralRendering
 				if (plan.act1Backend == Act1::kDLSS) {
 					const sl::Extent inputExtent{ 0, 0, plan.engineWidth, plan.engineHeight };
 					const sl::Extent outputExtent{ 0, 0, plan.act1OutputWidth, plan.act1OutputHeight };
-					const uint quality = plan.act1Dsr ? 4u : foveated.settings.flatPipelineAct1Quality;
+					const uint quality = plan.act1Quality;
+					const uint preset = plan.act1Preset;
 					succeeded = streamline.EvaluateDLSS(streamline.flatPostInjectViewport, 0,
 						streamline.flatIsolatedColor->resource.get(), flatAct1Output->resource.get(),
 						streamline.flatIsolatedDepth->resource.get(), streamline.flatIsolatedMotionVectors->resource.get(),
@@ -820,7 +831,7 @@ namespace NeuralRendering
 						inputExtent, outputExtent, plan.act1OutputWidth, plan.act1OutputHeight,
 						Streamline::DLSSModeForQualityMode(quality), false, planChanged,
 						foveated.settings.flatPipelineAct1Jitter == 1, 1.0f, 1.0f,
-						foveated.settings.flatPipelineAct1Preset, 0.0f);
+						preset, 0.0f);
 				} else {
 					succeeded = act1FsrScaler.Apply(globals::d3d::device, context,
 						streamline.flatIsolatedColor->resource.get(), streamline.flatIsolatedDepth->resource.get(),
@@ -868,13 +879,13 @@ namespace NeuralRendering
 			fallbackWidth = plan.nrWidth;
 			fallbackHeight = plan.nrHeight;
 
-			if (plan.act2Backend == Act2::kDLSS || plan.act2Backend == Act2::kFSR3) {
+			if (plan.act2SrBackend == Act2::kDLSS || plan.act2SrBackend == Act2::kFSR3) {
 				if (!EnsurePipelineTexture(flatAct2Output, framebuffer, plan.act2OutputWidth, plan.act2OutputHeight,
 						"NeuralRendering::FlatPipelineAct2Output") ||
 					!EnsureAct2MaskResources(upscaling.reactiveMaskTexture->resource.get(),
 						upscaling.transparencyCompositionMaskTexture->resource.get(), plan.nrWidth, plan.nrHeight))
 					return false;
-				if (plan.act2Backend == Act2::kDLSS) {
+				if (plan.act2SrBackend == Act2::kDLSS) {
 					const sl::Extent inputExtent{ 0, 0, plan.nrWidth, plan.nrHeight };
 					const sl::Extent outputExtent{ 0, 0, plan.act2OutputWidth, plan.act2OutputHeight };
 					succeeded = Upscaling::streamline.EvaluateDLSS(Upscaling::streamline.flatAct2Viewport, 0,
@@ -899,7 +910,7 @@ namespace NeuralRendering
 				}
 				if (!succeeded)
 					return false;
-				if (plan.act2Backend == Act2::kDLSS)
+				if (plan.act2SrBackend == Act2::kDLSS)
 					++act2BackendStats.dlssSucceeded;
 				else
 					++act2BackendStats.fsrSucceeded;
@@ -913,23 +924,7 @@ namespace NeuralRendering
 					finalResource = flatAct2Output->resource.get();
 					finalSRV = flatAct2Output->srv.get();
 				}
-			} else if (plan.act2Backend == Act2::kFusion) {
-				ID3D11ShaderResourceView* fusionReferenceSRV = act1SourceSRV;
-				if (act1SourceWidth != plan.displayWidth || act1SourceHeight != plan.displayHeight) {
-					if (!EnsurePipelineTexture(flatFusionReference, framebuffer, plan.displayWidth, plan.displayHeight,
-							"NeuralRendering::FlatPipelineFusionReference") ||
-						!ResampleLanczos(context, act1SourceSRV, flatFusionReference->uav.get(),
-							act1SourceWidth, act1SourceHeight, plan.displayWidth, plan.displayHeight))
-						return false;
-					fusionReferenceSRV = flatFusionReference->srv.get();
-				}
-				if (!UpscaleNeuralToDisplay(context, plan.nrWidth, plan.nrHeight, plan.displayWidth, plan.displayHeight) ||
-					!ResolveNeuralRendering(context, fusionReferenceSRV, resizedDepthGuide->srv.get(),
-						plan.displayWidth, plan.displayHeight, plan.nrWidth, plan.nrHeight, foveated.settings))
-					return false;
-				finalResource = fusionOutput->resource.get();
-				finalSRV = fusionOutput->srv.get();
-			} else if (plan.act2Backend == Act2::kNIS) {
+			} else if (plan.act2SrBackend == Act2::kNIS) {
 				bool usedNis = false;
 				if (!UpscaleNeuralToDisplay(context, plan.nrWidth, plan.nrHeight,
 						plan.displayWidth, plan.displayHeight, &usedNis))
@@ -946,6 +941,15 @@ namespace NeuralRendering
 					return false;
 				finalResource = upscaledNeuralColor->resource.get();
 				finalSRV = upscaledNeuralColor->srv.get();
+			}
+
+			if (plan.fusion) {
+				if (!ResolveNeuralRendering(context, act1SourceSRV, finalSRV, resizedDepthGuide->srv.get(),
+						plan.displayWidth, plan.displayHeight, act1SourceWidth, act1SourceHeight,
+						plan.nrWidth, plan.nrHeight, foveated.settings))
+					return false;
+				finalResource = fusionOutput->resource.get();
+				finalSRV = fusionOutput->srv.get();
 			}
 
 			if (foveated.settings.flatPipelineSharpen) {
@@ -1200,12 +1204,281 @@ namespace NeuralRendering
 
 			return succeeded;
 		}
+
+		bool CaptureModel3Tail(Upscaling& upscaling)
+		{
+			using Act1 = FoveatedRender::FlatAct1Backend;
+			using Act2 = FoveatedRender::FlatAct2SrBackend;
+			auto* renderer = globals::game::renderer;
+			auto* context = globals::d3d::context;
+			if (!renderer || !context || !globals::state) {
+				if (!model3CaptureFailureLogged)
+					logger::error("[ARISE] Tail capture unavailable: renderer/context/state is missing");
+				model3CaptureFailureLogged = true;
+				return false;
+			}
+			const std::uint64_t frameId = globals::state->frameCount;
+			if (lastModel3CaptureFrame == frameId)
+				return true;
+			lastModel3CaptureFrame = frameId;
+			if (!globals::state->worldRenderedThisFrame || globals::state->isMainMenuOpen ||
+				globals::state->isLoadingMenuOpen) {
+				upscaling.dx12SwapChain.ClearAriseSceneCapture();
+				lastModel3Eligible = false;
+				lastModel3Frame = UINT64_MAX;
+				return true;
+			}
+			auto& framebuffer = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kFRAMEBUFFER];
+			auto& depth = renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kMAIN];
+			auto& rawMotion = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMOTION_VECTOR];
+			winrt::com_ptr<ID3D11Texture2D> framebufferHolder;
+			auto* framebufferTexture = ResolveRenderTargetTexture(framebuffer, framebufferHolder);
+			ID3D11Resource* motionResource = upscaling.motionVectorCopyTexture &&
+				upscaling.motionVectorCopyTexture->resource ? upscaling.motionVectorCopyTexture->resource.get() : rawMotion.texture;
+			ID3D11ShaderResourceView* motionSRV = upscaling.motionVectorCopyTexture &&
+				upscaling.motionVectorCopyTexture->srv ? upscaling.motionVectorCopyTexture->srv.get() : rawMotion.SRV;
+			winrt::com_ptr<ID3D11Texture2D> motionTexture;
+			if (!framebufferTexture || !depth.depthSRV || !motionResource || !motionSRV ||
+				FAILED(motionResource->QueryInterface(IID_PPV_ARGS(motionTexture.put())))) {
+				if (!model3CaptureFailureLogged)
+					logger::error("[ARISE] Tail capture unavailable: framebuffer={} depth={} motion={} motionSRV={}",
+						framebufferTexture != nullptr, depth.depthSRV != nullptr, motionResource != nullptr, motionSRV != nullptr);
+				model3CaptureFailureLogged = true;
+				return false;
+			}
+			D3D11_TEXTURE2D_DESC sceneDesc{};
+			D3D11_TEXTURE2D_DESC motionDesc{};
+			framebufferTexture->GetDesc(&sceneDesc);
+			motionTexture->GetDesc(&motionDesc);
+			const std::uint32_t displayWidth = upscaling.dx12SwapChain.PhysicalWidth();
+			const std::uint32_t displayHeight = upscaling.dx12SwapChain.PhysicalHeight();
+			const std::uint32_t sourceGuideWidth = upscaling.dx12SwapChain.LogicalWidth();
+			const std::uint32_t sourceGuideHeight = upscaling.dx12SwapChain.LogicalHeight();
+			if (sceneDesc.Width != sourceGuideWidth || sceneDesc.Height != sourceGuideHeight) {
+				if (!model3CaptureFailureLogged)
+					logger::error("[ARISE] Tail capture rejected: framebuffer={}x{} logical R={}x{}",
+						sceneDesc.Width, sceneDesc.Height, sourceGuideWidth, sourceGuideHeight);
+				model3CaptureFailureLogged = true;
+				return false;
+			}
+			auto plan = upscaling.foveatedRender.BuildFlatPipelinePlan(
+				displayWidth, displayHeight, sourceGuideWidth, sourceGuideHeight);
+			const bool requested = upscaling.foveatedRender.settings.neuralRenderingEnabled;
+			const bool unsupportedProvider =
+				(plan.act1Backend != Act1::kBypass && plan.act1Backend != Act1::kDLSS) ||
+				(plan.act2SrBackend != Act2::kDLSS && plan.act2SrBackend != Act2::kLanczos);
+			const bool eligible = requested && !unsupportedProvider;
+			if (requested && unsupportedProvider && !model3RestrictionLogged) {
+				logger::warn("[ARISE] Tail provider unsupported for ACT1={} ACT2={}; Lanczos/passthrough fallback active",
+					static_cast<uint>(plan.act1Backend), static_cast<uint>(plan.act2SrBackend));
+				model3RestrictionLogged = true;
+			} else if (!requested || !unsupportedProvider) {
+				model3RestrictionLogged = false;
+			}
+			const bool becameEligible = eligible && !lastModel3Eligible;
+			lastModel3Eligible = false;
+			if (!eligible)
+				lastModel3Frame = UINT64_MAX;
+			const bool guidesReady = EnsureGuideResources(motionResource,
+				sourceGuideWidth, sourceGuideHeight) &&
+				ResizeGuides(context, depth.depthSRV, motionSRV,
+					sourceGuideWidth, sourceGuideHeight, sourceGuideWidth, sourceGuideHeight, 1.0f);
+			if (!guidesReady) {
+				if (!model3CaptureFailureLogged)
+					logger::error("[ARISE] Tail capture unavailable: R guide preparation failed ({}x{})",
+						sourceGuideWidth, sourceGuideHeight);
+				model3CaptureFailureLogged = true;
+				return false;
+			}
+			model3CaptureFailureLogged = false;
+			auto hashCombine = [](std::uint64_t& seed, std::uint64_t value) {
+				seed ^= value + 0x9E3779B97F4A7C15ull + (seed << 6) + (seed >> 2);
+			};
+			std::uint64_t planSignature = 0;
+			for (const std::uint64_t value : {
+				static_cast<std::uint64_t>(sceneDesc.Width), static_cast<std::uint64_t>(sceneDesc.Height),
+				static_cast<std::uint64_t>(sceneDesc.Format), static_cast<std::uint64_t>(motionDesc.Format),
+				static_cast<std::uint64_t>(sourceGuideWidth), static_cast<std::uint64_t>(sourceGuideHeight),
+				static_cast<std::uint64_t>(plan.engineWidth), static_cast<std::uint64_t>(plan.engineHeight),
+				static_cast<std::uint64_t>(plan.displayWidth), static_cast<std::uint64_t>(plan.displayHeight),
+				static_cast<std::uint64_t>(plan.act1OutputWidth), static_cast<std::uint64_t>(plan.act1OutputHeight),
+				static_cast<std::uint64_t>(plan.nrWidth), static_cast<std::uint64_t>(plan.nrHeight),
+				static_cast<std::uint64_t>(plan.act1Backend), static_cast<std::uint64_t>(plan.act2SrBackend),
+				static_cast<std::uint64_t>(plan.fusion),
+				static_cast<std::uint64_t>(plan.act1Dsr),
+				static_cast<std::uint64_t>(plan.act1Quality),
+				static_cast<std::uint64_t>(plan.act1Preset),
+				static_cast<std::uint64_t>(upscaling.foveatedRender.settings.flatPipelineAct1Jitter),
+				static_cast<std::uint64_t>(plan.act2Quality),
+				static_cast<std::uint64_t>(upscaling.foveatedRender.settings.flatPipelineAct2Preset),
+				static_cast<std::uint64_t>(upscaling.foveatedRender.settings.flatPipelineAct2Jitter),
+				static_cast<std::uint64_t>(upscaling.foveatedRender.settings.neuralRenderingEnabled),
+				static_cast<std::uint64_t>(eligible),
+				static_cast<std::uint64_t>(upscaling.foveatedRender.settings.flatPipelineSharpen),
+				static_cast<std::uint64_t>(std::bit_cast<std::uint32_t>(upscaling.foveatedRender.settings.flatPipelineSharpness)),
+				static_cast<std::uint64_t>(upscaling.foveatedRender.settings.flatPipelineFusionDirection),
+				static_cast<std::uint64_t>(upscaling.foveatedRender.settings.flatPipelineFusionDenoise),
+				static_cast<std::uint64_t>(upscaling.foveatedRender.settings.flatPipelineFusionEnhancedGuidance),
+				static_cast<std::uint64_t>(std::bit_cast<std::uint32_t>(upscaling.foveatedRender.settings.flatPipelineFusionDenoiseStrength)),
+				static_cast<std::uint64_t>(std::bit_cast<std::uint32_t>(upscaling.foveatedRender.settings.flatPipelineFusionSoftness)),
+				static_cast<std::uint64_t>(std::bit_cast<std::uint32_t>(upscaling.foveatedRender.settings.flatPipelineFusionFrequencyGuidance)),
+				static_cast<std::uint64_t>(std::bit_cast<std::uint32_t>(upscaling.foveatedRender.settings.flatPipelineFusionDepthGuidance)),
+				static_cast<std::uint64_t>(std::bit_cast<std::uint32_t>(upscaling.foveatedRender.settings.flatPipelineFusionColorGuidance)),
+				static_cast<std::uint64_t>(std::bit_cast<std::uint32_t>(upscaling.foveatedRender.settings.neuralRenderingFusionLuma)),
+				static_cast<std::uint64_t>(std::bit_cast<std::uint32_t>(upscaling.foveatedRender.settings.neuralRenderingFusionChroma)),
+				static_cast<std::uint64_t>(std::bit_cast<std::uint32_t>(upscaling.foveatedRender.settings.neuralRenderingFusionEdgeProtection)),
+				static_cast<std::uint64_t>(std::bit_cast<std::uint32_t>(upscaling.foveatedRender.settings.neuralRenderingFusionResidualLimit)),
+				static_cast<std::uint64_t>(upscaling.foveatedRender.settings.neuralRenderingStyle),
+				static_cast<std::uint64_t>(upscaling.foveatedRender.settings.neuralRenderingAutoMask),
+				static_cast<std::uint64_t>(std::bit_cast<std::uint32_t>(upscaling.foveatedRender.settings.neuralRenderingIntensity)),
+				static_cast<std::uint64_t>(std::bit_cast<std::uint32_t>(upscaling.foveatedRender.settings.neuralRenderingLocalTone)),
+				static_cast<std::uint64_t>(std::bit_cast<std::uint32_t>(upscaling.foveatedRender.settings.neuralRenderingLocalStructure)),
+				static_cast<std::uint64_t>(std::bit_cast<std::uint32_t>(upscaling.foveatedRender.settings.neuralRenderingSkinStructure)) })
+				hashCombine(planSignature, value);
+			const bool firstPlan = !hasModel3Plan;
+			const bool planChanged = !firstPlan && planSignature != lastModel3PlanSignature;
+			if (planChanged && !upscaling.dx12SwapChain.PrepareAriseGraphPlanChange()) {
+				lastModel3Eligible = false;
+				lastModel3Frame = UINT64_MAX;
+				return false;
+			}
+			const bool reset = upscaling.foveatedRender.settings.neuralRenderingResetEveryFrame ||
+				becameEligible ||
+				lastModel3Frame == UINT64_MAX || frameId != lastModel3Frame + 1 ||
+				planChanged;
+			lastModel3Frame = eligible ? frameId : UINT64_MAX;
+			lastModel3PlanSignature = planSignature;
+			hasModel3Plan = true;
+			lastModel3Eligible = eligible;
+			sl::Constants cameraConstants{};
+			cameraConstants.cameraAspectRatio = static_cast<float>(sceneDesc.Width) / sceneDesc.Height;
+			cameraConstants.cameraFOV = Util::GetVerticalFOVRad();
+			cameraConstants.cameraNear = *globals::game::cameraNear;
+			cameraConstants.cameraFar = *globals::game::cameraFar;
+			auto viewMatrix = globals::game::frameBufferCached.GetCameraViewInverse(0).Transpose();
+			auto cameraViewToClip = globals::game::frameBufferCached.GetCameraProjUnjittered(0).Transpose();
+			cameraConstants.cameraMotionIncluded = sl::Boolean::eTrue;
+			cameraConstants.cameraPinholeOffset = { 0.0f, 0.0f };
+			cameraConstants.cameraRight = { viewMatrix._11, viewMatrix._12, viewMatrix._13 };
+			cameraConstants.cameraUp = { viewMatrix._21, viewMatrix._22, viewMatrix._23 };
+			cameraConstants.cameraFwd = { viewMatrix._31, viewMatrix._32, viewMatrix._33 };
+			cameraConstants.cameraPos = *(sl::float3*)&globals::game::frameBufferCached.GetCameraPosAdjust(0);
+			cameraConstants.cameraViewToClip = *(sl::float4x4*)&cameraViewToClip;
+			cameraConstants.depthInverted = sl::Boolean::eFalse;
+			recalculateCameraMatrices(cameraConstants);
+			cameraConstants.jitterOffset = { -upscaling.jitter.x, -upscaling.jitter.y };
+			cameraConstants.reset = reset ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+			cameraConstants.mvecScale = { 1.0f, 1.0f };
+			cameraConstants.motionVectors3D = sl::Boolean::eFalse;
+			cameraConstants.motionVectorsInvalidValue = FLT_MIN;
+			cameraConstants.orthographicProjection = sl::Boolean::eFalse;
+			cameraConstants.motionVectorsDilated = sl::Boolean::eFalse;
+			cameraConstants.motionVectorsJittered = sl::Boolean::eFalse;
+			sl::Constants act1Constants = cameraConstants;
+			if (upscaling.foveatedRender.settings.flatPipelineAct1Jitter != 0)
+				act1Constants.jitterOffset = { 0.0f, 0.0f };
+			sl::Constants act2Constants = cameraConstants;
+			if (upscaling.foveatedRender.settings.flatPipelineAct2Jitter == 0) {
+				act2Constants.jitterOffset.x *= static_cast<float>(plan.nrWidth) / sourceGuideWidth;
+				act2Constants.jitterOffset.y *= static_cast<float>(plan.nrHeight) / sourceGuideHeight;
+			} else
+				act2Constants.jitterOffset = { 0.0f, 0.0f };
+			if (firstPlan || planChanged) {
+				logger::info("[ARISE] Model3 plan scene R={}x{} display D={}x{} N={}x{} ratio=({:.4f},{:.4f}) DRS=locked "
+					"ACT1={} {}x{}->{}x{} quality={} preset={} jitter=({:.4f},{:.4f}) mvec=(1,1) "
+					"ACT2={} {}x{}->{}x{} jitter=({:.4f},{:.4f}) mvec=(1,1)",
+					sourceGuideWidth, sourceGuideHeight, displayWidth, displayHeight, plan.nrWidth, plan.nrHeight,
+					static_cast<float>(sourceGuideWidth) / displayWidth,
+					static_cast<float>(sourceGuideHeight) / displayHeight,
+					static_cast<uint>(plan.act1Backend), sourceGuideWidth, sourceGuideHeight,
+					plan.act1OutputWidth, plan.act1OutputHeight, plan.act1Quality,
+					plan.act1Preset,
+					act1Constants.jitterOffset.x, act1Constants.jitterOffset.y,
+					static_cast<uint>(plan.act2SrBackend), plan.nrWidth, plan.nrHeight,
+					plan.displayWidth, plan.displayHeight, act2Constants.jitterOffset.x, act2Constants.jitterOffset.y);
+			}
+			if (upscaling.foveatedRender.ariseDimensionDiagnostics.load(std::memory_order_acquire) &&
+				(firstPlan || planChanged || frameId % 120 == 0)) {
+				auto textureExtent = [](ID3D11Texture2D* texture) {
+					D3D11_TEXTURE2D_DESC desc{};
+					if (texture)
+						texture->GetDesc(&desc);
+					return std::pair{ desc.Width, desc.Height };
+				};
+				const auto mainExtent = textureExtent(
+					renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN].texture);
+				const auto totalExtent = textureExtent(
+					renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kTOTAL].texture);
+				logger::info("[ARISE DIM] frame={} kMAIN={}x{} kFRAMEBUFFER={}x{} kTOTAL={}x{} frontR={}x{} physicalD={}x{} ACT1={}x{} N={}x{} ACT2={}x{} jitterRaw=({:.4f},{:.4f}) jitterACT1=({:.4f},{:.4f}) jitterACT2=({:.4f},{:.4f})",
+					frameId, mainExtent.first, mainExtent.second, sceneDesc.Width, sceneDesc.Height,
+					totalExtent.first, totalExtent.second, sourceGuideWidth, sourceGuideHeight,
+					displayWidth, displayHeight, plan.act1OutputWidth, plan.act1OutputHeight,
+					plan.nrWidth, plan.nrHeight, plan.act2OutputWidth, plan.act2OutputHeight,
+					upscaling.jitter.x, upscaling.jitter.y,
+					act1Constants.jitterOffset.x, act1Constants.jitterOffset.y,
+					act2Constants.jitterOffset.x, act2Constants.jitterOffset.y);
+			}
+			upscaling.dx12SwapChain.CaptureAriseScene(
+				resizedDepthGuide->resource.get(), resizedMotionGuide->resource.get(), {
+					.frameId = frameId,
+					.guideWidth = sourceGuideWidth,
+					.guideHeight = sourceGuideHeight,
+					.plan = {
+						.frameId = frameId,
+						.sceneInputWidth = sourceGuideWidth,
+						.sceneInputHeight = sourceGuideHeight,
+						.engineWidth = sourceGuideWidth,
+						.engineHeight = sourceGuideHeight,
+						.displayWidth = plan.displayWidth,
+						.displayHeight = plan.displayHeight,
+						.act1OutputWidth = plan.act1OutputWidth,
+						.act1OutputHeight = plan.act1OutputHeight,
+						.nrWidth = plan.nrWidth,
+						.nrHeight = plan.nrHeight,
+						.act1 = static_cast<AriseReconstructionGraph::Act1Backend>(plan.act1Backend),
+						.act2Sr = static_cast<AriseReconstructionGraph::Act2SrBackend>(plan.act2SrBackend),
+						.fusionEnabled = plan.fusion,
+						.act1Quality = plan.act1Quality,
+						.act1Preset = plan.act1Preset,
+						.act2Quality = plan.act2Quality,
+						.act2Preset = upscaling.foveatedRender.settings.flatPipelineAct2Preset,
+						.act1Camera = { act1Constants },
+						.act2Camera = { act2Constants },
+						.fusion = {
+							.luma = upscaling.foveatedRender.settings.neuralRenderingFusionLuma,
+							.chroma = upscaling.foveatedRender.settings.neuralRenderingFusionChroma,
+							.edgeProtection = upscaling.foveatedRender.settings.neuralRenderingFusionEdgeProtection,
+							.residualLimit = upscaling.foveatedRender.settings.neuralRenderingFusionResidualLimit,
+							.direction = upscaling.foveatedRender.settings.flatPipelineFusionDirection,
+							.denoise = upscaling.foveatedRender.settings.flatPipelineFusionDenoise,
+							.denoiseStrength = upscaling.foveatedRender.settings.flatPipelineFusionDenoiseStrength,
+							.softness = upscaling.foveatedRender.settings.flatPipelineFusionSoftness,
+							.frequencyGuidance = upscaling.foveatedRender.settings.flatPipelineFusionFrequencyGuidance,
+							.depthGuidance = upscaling.foveatedRender.settings.flatPipelineFusionDepthGuidance,
+							.enhancedGuidance = upscaling.foveatedRender.settings.flatPipelineFusionEnhancedGuidance ? 1u : 0u,
+							.colorGuidance = upscaling.foveatedRender.settings.flatPipelineFusionColorGuidance,
+						},
+						.tuning = GetTuning(upscaling.foveatedRender.settings),
+						.motionVectorScaleX = static_cast<float>(plan.nrWidth),
+						.motionVectorScaleY = static_cast<float>(plan.nrHeight),
+						.sharpness = upscaling.foveatedRender.settings.flatPipelineSharpness,
+						.sharpen = upscaling.foveatedRender.settings.flatPipelineSharpen,
+						.requested = requested,
+						.eligible = eligible && guidesReady,
+						.renderDocReplacement = upscaling.dx12SwapChain.IsRenderDocCompatibility(),
+						.reset = reset,
+					},
+				});
+			return true;
+		}
 	}
 
 	bool ApplyFoveatedLdr()
 	{
 		auto& upscaling = globals::features::upscaling;
 		auto& foveated = upscaling.foveatedRender;
+		if (!globals::game::isVR && upscaling.dx12SwapChain.useArise)
+			return CaptureModel3Tail(upscaling);
 		if (!globals::game::isVR)
 			return ApplyFlatPipeline(upscaling, foveated);
 		if (!globals::game::isVR || !FoveatedRenderImpl::Bridge::IsRouteActive() ||
@@ -1332,6 +1605,11 @@ namespace NeuralRendering
 		lastFlatAct1JitterMode = UINT32_MAX;
 		lastFlatAct2JitterMode = UINT32_MAX;
 		lastFlatPlanSignature = 0;
+		lastModel3PlanSignature = 0;
+		hasModel3Plan = false;
+		lastModel3Frame = UINT64_MAX;
+		lastModel3Eligible = false;
+		model3RestrictionLogged = false;
 		act2BackendStats = {};
 	}
 }

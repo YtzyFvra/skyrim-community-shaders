@@ -9,6 +9,7 @@
 #include "Menu.h"
 #include "Plugin.h"
 #include "State.h"
+#include "Features/Upscaling.h"
 #include "Utils/UI.h"
 
 #define I18N_KEY_PREFIX "feature.renderdoc."
@@ -237,7 +238,10 @@ void RenderDoc::DrawSettings()
 
 							// Actual capture logic
 							logger::info("[RenderDoc] Manual capture triggered by user");
-							TriggerConfiguredCapture(false);
+							if (globals::features::upscaling.dx12SwapChain.IsRenderDocCompatibility())
+								RequestLogicalFrameCapture();
+							else
+								TriggerConfiguredCapture(false);
 						}
 					} catch (const std::exception& e) {
 						logger::error("[RenderDoc] Exception during capture logic: {}", e.what());
@@ -688,6 +692,31 @@ void RenderDoc::TriggerCapture()
 	InvalidateCaptureCache();
 }
 
+void RenderDoc::RequestLogicalFrameCapture()
+{
+	if (!renderDocApi || logicalCaptureActive.load(std::memory_order_acquire))
+		return;
+	logicalCapturePending.store(true, std::memory_order_release);
+	logger::info("[RenderDoc] Queued explicit D3D11 logical-frame capture");
+}
+
+void RenderDoc::AdvanceLogicalFrameCapture(ID3D11Device* a_device)
+{
+	if (!renderDocApi || !a_device)
+		return;
+	if (logicalCaptureActive.exchange(false, std::memory_order_acq_rel)) {
+		const uint32_t ended = renderDocApi->EndFrameCapture(a_device, nullptr);
+		logger::info("[RenderDoc] Ended explicit D3D11 logical-frame capture result={}", ended);
+		InvalidateCaptureCache();
+		return;
+	}
+	if (logicalCapturePending.exchange(false, std::memory_order_acq_rel)) {
+		renderDocApi->StartFrameCapture(a_device, nullptr);
+		logicalCaptureActive.store(true, std::memory_order_release);
+		logger::info("[RenderDoc] Started explicit D3D11 logical-frame capture");
+	}
+}
+
 void RenderDoc::TriggerMultiFrameCapture(uint32_t a_frameCount)
 {
 	if (!renderDocApi) {
@@ -748,7 +777,10 @@ bool RenderDoc::HandleCaptureHotkey(uint32_t a_vkKey)
 	}
 
 	logger::info("[RenderDoc] Capture hotkey triggered");
-	TriggerConfiguredCapture();
+	if (globals::features::upscaling.dx12SwapChain.IsRenderDocCompatibility())
+		RequestLogicalFrameCapture();
+	else
+		TriggerConfiguredCapture();
 	return true;
 }
 

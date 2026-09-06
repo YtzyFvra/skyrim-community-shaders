@@ -33,7 +33,7 @@ namespace NeuralRendering
 	class Runtime
 	{
 	public:
-		static Runtime& Instance();
+		Runtime() = default;
 		~Runtime();
 		Runtime(const Runtime&) = delete;
 		Runtime& operator=(const Runtime&) = delete;
@@ -59,7 +59,6 @@ namespace NeuralRendering
 		[[nodiscard]] std::uint64_t SuccessfulFrames() const { return successfulFrames_; }
 
 	private:
-		Runtime() = default;
 		void* module_ = nullptr;
 		void* parameters_ = nullptr;
 		void* featureHandles_[2]{};

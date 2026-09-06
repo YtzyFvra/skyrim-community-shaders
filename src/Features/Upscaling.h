@@ -209,7 +209,9 @@ public:
 	bool ShouldPrepareFrameGeneration() const;
 	bool IsFrameGenerationConfiguredForSession() const
 	{
-		return IsFrameGenerationDx12PathActive() && settings.frameGenerationMode != 0;
+		const bool enabled = dx12SwapChain.useArise && bootSnapshot.IsLatched() ?
+			bootSnapshot.Boot(&Settings::frameGenerationMode) != 0 : settings.frameGenerationMode != 0;
+		return IsFrameGenerationDx12PathActive() && enabled;
 	}
 	/** @brief Returns the prepared frame's generation decision until its buffers are cleared after Present. */
 	bool ShouldUseFrameGenerationThisFrame() const;
@@ -515,6 +517,8 @@ public:
 	void SetProxyD3D11DeviceContext(ID3D11DeviceContext* context);
 	void CreateProxySwapChain(IDXGIAdapter* adapter, DXGI_SWAP_CHAIN_DESC swapChainDesc);
 	void CreateProxySwapChainDirect(IDXGIAdapter* adapter, DXGI_SWAP_CHAIN_DESC swapChainDesc);
+	void CreateProxySwapChainArise(IDXGIAdapter* adapter, DXGI_SWAP_CHAIN_DESC swapChainDesc,
+		bool asyncTail, bool enableDLSSG);
 	void CreateProxyInterop();
 	IDXGISwapChain* GetProxySwapChain();
 

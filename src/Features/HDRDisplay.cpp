@@ -1,4 +1,6 @@
 #include "HDRDisplay.h"
+
+#include "Upscaling/NeuralRendering/ArisePipeline.h"
 #include "GpuPass.h"
 
 #include "PCH.h"
@@ -294,6 +296,21 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 void HDRDisplay::DrawSettings()
 {
 	auto hdrWarningPopupTitle = std::format("{}##HDRDisplay", T(TKEY("warning_popup_title"), "HDR Warning"));
+	const bool model3Active = globals::features::upscaling.loaded &&
+		globals::features::upscaling.dx12SwapChain.useArise;
+	bool hdrForcedOff = false;
+	if (model3Active) {
+		std::lock_guard<std::mutex> lock(settingsMutex);
+		if (settings.enableHDR) {
+			settings.enableHDR = false;
+			hdrForcedOff = true;
+		}
+	}
+	if (hdrForcedOff) {
+		logger::warn("[HDR] HDR disabled because ARISE Model 3 only supports SDR");
+		UpdateHDRData();
+		UpdateSwapChainColorSpace();
+	}
 
 	if (isHDRMonitor) {
 		Util::Text::Success("%s", T(TKEY("display_detected"), "HDR Display Detected"));
@@ -317,6 +334,10 @@ void HDRDisplay::DrawSettings()
 	}
 
 	ImGui::Spacing();
+	if (model3Active) {
+		Util::Text::WrappedWarning("HDR is unavailable while ARISE Model 3 is active. Disable Model 3 and restart to enable HDR.");
+		ImGui::Spacing();
+	}
 
 	bool oldEnableHDR;
 	bool currentEnableHDR;
@@ -328,7 +349,8 @@ void HDRDisplay::DrawSettings()
 
 	// Disable the checkbox only when no HDR monitor is detected AND HDR is not already on
 	// (allow disabling HDR even on SDR if it was enabled from saved settings).
-	if (!isHDRMonitor && !currentEnableHDR) {
+	const bool hdrCheckboxDisabled = model3Active || (!isHDRMonitor && !currentEnableHDR);
+	if (hdrCheckboxDisabled) {
 		ImGui::BeginDisabled();
 	}
 
@@ -348,12 +370,14 @@ void HDRDisplay::DrawSettings()
 		}
 	}
 
-	if (!isHDRMonitor && !oldEnableHDR) {
+	if (hdrCheckboxDisabled) {
 		ImGui::EndDisabled();
 	}
 
 	if (auto _tt = Util::HoverTooltipWrapper()) {
-		if (isHDRMonitor) {
+		if (model3Active) {
+			ImGui::TextUnformatted("ARISE Model 3 currently supports SDR only. Disable it and restart before enabling HDR.");
+		} else if (isHDRMonitor) {
 			ImGui::TextUnformatted(T(TKEY("enable_hdr_tooltip"), "Enable HDR output. Matches vanilla visuals with extended dynamic range."));
 		} else if (isHDRCapableMonitor) {
 			ImGui::TextUnformatted(T(TKEY("enable_hdr_tooltip_windows_off"), "Monitor supports HDR but Windows HDR is off. Enable HDR in Windows Display Settings, then restart the game."));
@@ -363,7 +387,7 @@ void HDRDisplay::DrawSettings()
 	}
 
 	// Advanced override button — shown when HDR is neither active nor auto-detected
-	if (!isHDRMonitor && !oldEnableHDR) {
+	if (!model3Active && !isHDRMonitor && !oldEnableHDR) {
 		ImGui::SameLine();
 		if (ImGui::Button(T(TKEY("advanced"), "Advanced"))) {
 			bool dontShowWarning;
@@ -637,6 +661,12 @@ void HDRDisplay::SetupResources()
 		settings.hdrAutoDetected = true;
 		logger::info("[HDR] Auto-configured HDR based on display: {}", isHDRMonitor ? "enabled" : "disabled");
 	}
+	if (globals::features::upscaling.loaded && globals::features::upscaling.dx12SwapChain.useArise) {
+		std::lock_guard<std::mutex> lock(settingsMutex);
+		if (settings.enableHDR)
+			logger::warn("[HDR] Forcing HDR off because ARISE Model 3 only supports SDR");
+		settings.enableHDR = false;
+	}
 
 	cachedDisplayMaxLuminance = GetDisplayMaxLuminance();
 
@@ -842,9 +872,10 @@ HDRDisplay::D3D12UIBufferMode HDRDisplay::GetD3D12UIBufferMode()
 
 	const bool hdrReady = loaded && settings.enableHDR && hdrDataCB && outputTexture;
 	const bool hdrShaderAvailable = hdrReady && GetHDROutputCS() != nullptr;
+	const bool model3Compositor = globals::features::upscaling.dx12SwapChain.useArise;
 
-	mode.useUIBuffer = hdrShaderAvailable || IsFGCompositingThisFrame();
-	mode.useFallbackCopy = hdrReady && !hdrShaderAvailable;
+	mode.useUIBuffer = model3Compositor || hdrShaderAvailable || IsFGCompositingThisFrame();
+	mode.useFallbackCopy = !model3Compositor && hdrReady && !hdrShaderAvailable;
 	return mode;
 }
 
@@ -952,7 +983,13 @@ namespace
 			if (globals::features::hdrDisplay.IsPresentSuppressed())
 				return S_OK;
 
-			return func(This, SyncInterval, Flags);
+			auto& arise = NeuralRendering::ARISE::Pipeline::Instance();
+			const auto swapChain = reinterpret_cast<std::uintptr_t>(This);
+			arise.ObserveFlatPresent(swapChain, SyncInterval, Flags);
+			const auto visualToken = arise.PrepareFlatVisualValidation(swapChain, Flags);
+			const HRESULT result = func(This, SyncInterval, Flags);
+			arise.CompleteFlatVisualValidation(visualToken, result);
+			return result;
 		}
 		static inline REL::Relocation<decltype(thunk)> func;
 	};
@@ -1036,12 +1073,29 @@ ID3D11BlendState* HDRDisplay::GetPatchedAlphaBlendState(ID3D11BlendState* origin
 
 HRESULT HDRDisplay::PresentToSwapChain(IDXGISwapChain* swapChain, UINT syncInterval, UINT flags)
 {
-	return SwapChainPresentBottom::func(swapChain, syncInterval, flags);
+	auto& arise = NeuralRendering::ARISE::Pipeline::Instance();
+	const auto swapChainAddress = reinterpret_cast<std::uintptr_t>(swapChain);
+	arise.ObserveFlatPresent(swapChainAddress, syncInterval, flags);
+	const auto visualToken = arise.PrepareFlatVisualValidation(swapChainAddress, flags);
+	const HRESULT result = SwapChainPresentBottom::func(swapChain, syncInterval, flags);
+	arise.CompleteFlatVisualValidation(visualToken, result);
+	return result;
 }
 
 void HDRDisplay::DrawImGuiForPresent(bool frameGenActive, bool hdrReady)
 {
-	if (frameGenActive) {
+	auto& upscaling = globals::features::upscaling;
+	if (upscaling.dx12SwapChain.useArise && upscaling.dx12SwapChain.uiBufferWrapped &&
+		upscaling.dx12SwapChain.uiBufferWrapped->rtv) {
+		ID3D11RenderTargetView* uiRTV = upscaling.dx12SwapChain.uiBufferWrapped->rtv;
+		globals::d3d::context->OMSetRenderTargets(1, &uiRTV, nullptr);
+		D3D11_VIEWPORT uiViewport{};
+		uiViewport.Width = static_cast<float>(upscaling.dx12SwapChain.LogicalWidth());
+		uiViewport.Height = static_cast<float>(upscaling.dx12SwapChain.LogicalHeight());
+		uiViewport.MinDepth = 0.0f;
+		uiViewport.MaxDepth = 1.0f;
+		globals::d3d::context->RSSetViewports(1, &uiViewport);
+	} else if (frameGenActive) {
 		auto& data = globals::game::renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGET::kFRAMEBUFFER];
 		auto* dataRTV = Util::AsReal(data.RTV);
 		globals::d3d::context->OMSetRenderTargets(1, &dataRTV, nullptr);
@@ -1122,6 +1176,19 @@ HRESULT HDRDisplay::HandleSwapChainPresent(
 	UINT flags,
 	const std::function<HRESULT(IDXGISwapChain*, UINT, UINT)>& presentChain)
 {
+	bool hdrForcedOff = false;
+	if (globals::features::upscaling.dx12SwapChain.useArise) {
+		std::lock_guard<std::mutex> lock(settingsMutex);
+		if (settings.enableHDR) {
+			settings.enableHDR = false;
+			hdrForcedOff = true;
+		}
+	}
+	if (hdrForcedOff) {
+		logger::warn("[HDR] Rejected runtime HDR enable while ARISE Model 3 is active");
+		UpdateHDRData();
+		UpdateSwapChainColorSpace();
+	}
 	const bool frameGenActive = globals::features::upscaling.d3d12SwapChainActive;
 	const bool hdrReady = loaded && hdrDataCB && outputTexture && settings.enableHDR;
 

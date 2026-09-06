@@ -21,6 +21,12 @@ namespace NeuralRendering
 	class D3D12Interop
 	{
 	public:
+		struct PreparedSubmission
+		{
+			std::uint64_t engineReady = 0;
+			std::uint64_t nrDone = 0;
+		};
+
 		~D3D12Interop();
 
 		D3D12Interop(const D3D12Interop&) = delete;
@@ -29,6 +35,12 @@ namespace NeuralRendering
 		bool Initialize(IDXGIAdapter* adapter, ID3D11Device* device, ID3D11DeviceContext* context);
 		void Shutdown();
 		bool CreateSharedTexture(const D3D11_TEXTURE2D_DESC& desc, SharedTexture& texture, const char* name);
+		bool PrepareInput(PreparedSubmission& submission);
+		bool BeginPrepared(const PreparedSubmission& submission, ID3D12GraphicsCommandList** commandList);
+		bool EndPrepared(const PreparedSubmission& submission);
+		bool SignalPreparedFailure(const PreparedSubmission& submission);
+		bool QueueWaitOutput(const PreparedSubmission& submission);
+		[[nodiscard]] bool IsComplete(const PreparedSubmission& submission) const;
 		bool BeginD3D12(ID3D12GraphicsCommandList** commandList);
 		bool BeginTotalTiming(ID3D12GraphicsCommandList* commandList);
 		bool EndTotalTiming(ID3D12GraphicsCommandList* commandList);
@@ -73,7 +85,8 @@ namespace NeuralRendering
 
 		Microsoft::WRL::ComPtr<ID3D11Device5> device11_;
 		Microsoft::WRL::ComPtr<ID3D11DeviceContext4> context11_;
-		Microsoft::WRL::ComPtr<ID3D11Fence> fence11_;
+		Microsoft::WRL::ComPtr<ID3D11Fence> engineReadyFence11_;
+		Microsoft::WRL::ComPtr<ID3D11Fence> nrDoneFence11_;
 		Microsoft::WRL::ComPtr<ID3D12Device> device12_;
 		Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue12_;
 		Microsoft::WRL::ComPtr<ID3D12QueryHeap> timestampHeap_;
@@ -81,9 +94,12 @@ namespace NeuralRendering
 		Microsoft::WRL::ComPtr<ID3D12QueryHeap> totalTimestampHeap_;
 		Microsoft::WRL::ComPtr<ID3D12Resource> totalTimestampReadback_;
 		std::array<CommandContext, kCommandContextCount> commandContexts_;
-		Microsoft::WRL::ComPtr<ID3D12Fence> fence12_;
+		Microsoft::WRL::ComPtr<ID3D12Fence> engineReadyFence12_;
+		Microsoft::WRL::ComPtr<ID3D12Fence> nrDoneFence12_;
 		HANDLE fenceEvent_ = nullptr;
-		std::uint64_t fenceValue_ = 0;
+		std::uint64_t engineReadyFenceValue_ = 0;
+		std::uint64_t nrDoneFenceValue_ = 0;
+		std::uint64_t finalizedNrDoneFenceValue_ = 0;
 		HRESULT lastError_ = S_OK;
 		const char* lastOperation_ = "none";
 		std::uint32_t lastResourceFlags_ = 0;
@@ -98,6 +114,7 @@ namespace NeuralRendering
 		double lastCpuBackpressureMs_ = 0.0;
 		std::uint32_t recordingTimingPairCount_ = 0;
 		std::uint32_t recordingTotalTimingPairCount_ = 0;
+		PreparedSubmission recordingSubmission_{};
 		bool evaluationTimingActive_ = false;
 		bool totalTimingActive_ = false;
 		bool backpressureLogged_ = false;

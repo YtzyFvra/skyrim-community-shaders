@@ -38,6 +38,8 @@ public:
 	bool IsAvailable() const { return renderDocApi != nullptr; }
 	void TriggerCapture();
 	void TriggerMultiFrameCapture(uint32_t a_frameCount);
+	void RequestLogicalFrameCapture();
+	void AdvanceLogicalFrameCapture(ID3D11Device* a_device);
 	bool HandleCaptureHotkey(uint32_t a_vkKey);
 	void SetCaptureFilePathTemplate(const std::string& a_template);
 	std::string GetCapturesDirectory() const;
@@ -118,6 +120,8 @@ public:
 	// RenderDoc library and API
 	void* renderDocModule = nullptr;
 	RENDERDOC_API_1_7_0* renderDocApi = nullptr;
+	std::atomic_bool logicalCapturePending = false;
+	std::atomic_bool logicalCaptureActive = false;
 
 	// Pending comments to attach to the next capture (applied when a new capture is detected)
 	std::string pendingCaptureComments;

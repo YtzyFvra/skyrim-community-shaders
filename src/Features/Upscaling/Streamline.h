@@ -210,18 +210,30 @@ public:
 	void BindReflexAndPCL();
 
 	// DLSS-G frame generation methods (DX12 instance only)
-	void ConfigureDLSSG(bool enabled);
+	void ConfigureDLSSG(bool enabled, uint32_t guideWidth = 0, uint32_t guideHeight = 0,
+		uint32_t colorWidth = 0, uint32_t colorHeight = 0,
+		DXGI_FORMAT depthFormat = DXGI_FORMAT_UNKNOWN, DXGI_FORMAT motionFormat = DXGI_FORMAT_UNKNOWN,
+		DXGI_FORMAT hudLessFormat = DXGI_FORMAT_UNKNOWN, DXGI_FORMAT uiFormat = DXGI_FORMAT_UNKNOWN,
+		uint32_t backBufferCount = 0);
 	/**
 	 * @brief Emits a PCL latency marker for the current frame token. The marker's frame
 	 * index is how DLSS-G's pacer matches presents to constants -- structural for FG.
 	 */
 	void EmitPCLMarker(sl::PCLMarker a_marker);
+	void EmitPCLMarker(sl::PCLMarker a_marker, const sl::FrameToken& token);
 	void TagDX12Resources(ID3D12GraphicsCommandList* cmdList,
 		ID3D12Resource* depth, ID3D12Resource* mvec, ID3D12Resource* hudLessColor,
 		ID3D12Resource* uiColorAndAlpha, uint32_t width, uint32_t height);
+	void TagDX12Resources(const sl::FrameToken& token, ID3D12GraphicsCommandList* cmdList,
+		ID3D12Resource* depth, ID3D12Resource* mvec, ID3D12Resource* hudLessColor,
+		ID3D12Resource* uiColorAndAlpha, uint32_t guideWidth, uint32_t guideHeight,
+		uint32_t displayWidth, uint32_t displayHeight);
 
 	/** @brief Acquires a new frame token from Streamline for the current frame. */
 	bool EnsureFrameToken();
+	bool AcquireFrameToken(uint32_t frameId, sl::FrameToken*& token);
+	bool SetConstants(const sl::FrameToken& token, const sl::Constants& constants,
+		sl::ViewportHandle viewportHandle);
 	bool CheckFrameConstants(sl::ViewportHandle p_viewport, uint32_t eyeIndex = 0,
 		bool forceReset = false, bool forceZeroJitter = false,
 		float jitterScaleX = 1.0f, float jitterScaleY = 1.0f);

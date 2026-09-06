@@ -7,8 +7,8 @@ cbuffer FusionConstants : register(b0)
 {
 	uint FullWidth;
 	uint FullHeight;
-	uint LowWidth;
-	uint LowHeight;
+	uint GuidanceWidth;
+	uint GuidanceHeight;
 	float LumaStrength;
 	float ChromaStrength;
 	float EdgeProtection;
@@ -28,15 +28,28 @@ cbuffer FusionConstants : register(b0)
 
 static const float3 LumaWeights = float3(0.2126, 0.7152, 0.0722);
 
+float4 LoadGuidance(int2 pixel)
+{
+	pixel = clamp(pixel, int2(0, 0), int2(GuidanceWidth - 1, GuidanceHeight - 1));
+	return OriginalColor.Load(int3(pixel, 0));
+}
+
 float4 LoadOriginal(int2 pixel)
 {
 	pixel = clamp(pixel, int2(0, 0), int2(FullWidth - 1, FullHeight - 1));
-	return OriginalColor.Load(int3(pixel, 0));
+	float2 position = (float2(pixel) + 0.5) *
+		float2(GuidanceWidth, GuidanceHeight) / float2(FullWidth, FullHeight) - 0.5;
+	int2 base = int2(floor(position));
+	float2 fraction = frac(position);
+	return lerp(
+		lerp(LoadGuidance(base), LoadGuidance(base + int2(1, 0)), fraction.x),
+		lerp(LoadGuidance(base + int2(0, 1)), LoadGuidance(base + int2(1, 1)), fraction.x),
+		fraction.y);
 }
 
 float4 LoadNeural(int2 pixel)
 {
-	pixel = clamp(pixel, int2(0, 0), int2(LowWidth - 1, LowHeight - 1));
+	pixel = clamp(pixel, int2(0, 0), int2(FullWidth - 1, FullHeight - 1));
 	return NeuralColor.Load(int3(pixel, 0));
 }
 

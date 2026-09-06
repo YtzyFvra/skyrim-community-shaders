@@ -24,15 +24,47 @@
 #include "../../Utils/BootSnapshot.h"
 #include "../../Utils/Subrect.h"
 
+#include <atomic>
 #include <chrono>
 
 struct FoveatedRender
 {
 	enum class FlatAct1Backend : uint { kBypass, kDLSS, kFSR3 };
 	enum class FlatAct2Backend : uint { kDLSS, kFSR3, kNIS, kFusion, kLanczos };
+	enum class FlatAct2SrBackend : uint { kDLSS, kFSR3, kNIS, kLanczos };
+	enum class ResampleFilter : uint { kLanczos, kStandard, kFootprint };
+
+	struct Extent
+	{
+		uint32_t width = 0;
+		uint32_t height = 0;
+	};
+
+	struct UnifiedPipelineSettings
+	{
+		bool act1Srss = false;
+		uint act1SrssQuality = 4;
+		uint act1SrssPreset = 4;
+		float guidanceScale = 1.0f;
+		uint act1Downsample = static_cast<uint>(ResampleFilter::kLanczos);
+		uint act2SrBackend = static_cast<uint>(FlatAct2SrBackend::kNIS);
+		uint act2Upsample = static_cast<uint>(ResampleFilter::kLanczos);
+		bool fusionEnabled = false;
+	};
+
+	inline static constexpr Util::Settings::RestartTable<UnifiedPipelineSettings, 4> kUnifiedRestartFields{ {
+		UTIL_RESTART_FIELD(UnifiedPipelineSettings, act1Srss, "SRSS"),
+		UTIL_RESTART_FIELD(UnifiedPipelineSettings, act1SrssQuality, "SRSS Mode"),
+		UTIL_RESTART_FIELD(UnifiedPipelineSettings, act1SrssPreset, "SRSS Preset"),
+		UTIL_RESTART_FIELD(UnifiedPipelineSettings, guidanceScale, "Guidance Scale"),
+	} };
 
 	struct FlatPipelinePlan
 	{
+		Extent renderR{};
+		Extent guidanceG{};
+		Extent neuralN{};
+		Extent displayD{};
 		uint32_t displayWidth = 0;
 		uint32_t displayHeight = 0;
 		uint32_t engineWidth = 0;
@@ -47,8 +79,15 @@ struct FoveatedRender
 		uint32_t act2OutputHeight = 0;
 		FlatAct1Backend act1Backend = FlatAct1Backend::kBypass;
 		FlatAct2Backend act2Backend = FlatAct2Backend::kNIS;
+		FlatAct2SrBackend act2SrBackend = FlatAct2SrBackend::kNIS;
+		ResampleFilter act1Downsample = ResampleFilter::kLanczos;
+		ResampleFilter act2Upsample = ResampleFilter::kLanczos;
+		uint32_t act1Quality = 1;
+		uint32_t act1Preset = 0;
 		uint32_t act2Quality = 1;
 		bool act1Dsr = false;
+		bool srss = false;
+		bool fusion = false;
 		bool sharpen = false;
 	};
 	// DLSS execution mode for VR
@@ -121,6 +160,12 @@ struct FoveatedRender
 		float subrectFalloffCurve = 1.0f;
 		float subrectDitherStrength = 1.0f;
 		bool neuralRenderingEnabled = false;
+		bool ariseShadowScheduler = false;
+		bool ariseVisualValidation = false;
+		bool ariseWorkerNr = false;
+		bool ariseModel3 = false;
+		bool singleThreadPerfMode = false;
+		uint ariseBufferCount = 2;
 		uint flatPipelineAct1Backend = static_cast<uint>(FlatAct1Backend::kDLSS);
 		uint flatPipelineAct1Quality = 1;
 		uint flatPipelineAct1Preset = 0;
@@ -128,6 +173,7 @@ struct FoveatedRender
 		bool flatPipelineAct1Dsr = false;
 		float flatPipelineNrScale = 0.67f;
 		uint flatPipelineAct2Backend = static_cast<uint>(FlatAct2Backend::kNIS);
+		UnifiedPipelineSettings unifiedPipeline{};
 		uint flatPipelineAct2Preset = 0;
 		uint flatPipelineAct2Jitter = 1;
 		uint flatPipelineFusionDirection = 0;
@@ -170,10 +216,15 @@ struct FoveatedRender
 		float neuralRenderingFusionResidualLimit = 0.16f;
 	};
 
-	inline static constexpr Util::Settings::RestartTable<Settings, 1> kRestartFields{ {
+	inline static constexpr Util::Settings::RestartTable<Settings, 5> kRestartFields{ {
 		UTIL_RESTART_FIELD(Settings, enabled, "Foveated DLSS"),
+		UTIL_RESTART_FIELD(Settings, ariseModel3, "ARISE Model 3"),
+		UTIL_RESTART_FIELD(Settings, singleThreadPerfMode, "Single-thread PerfMode"),
+		UTIL_RESTART_FIELD(Settings, flatPipelineAct1Backend, "Logical R Backend"),
+		UTIL_RESTART_FIELD(Settings, flatPipelineAct1Quality, "Logical R Preset"),
 	} };
 	Util::Settings::BootSnapshot<Settings> bootSnapshot{ kRestartFields };
+	Util::Settings::BootSnapshot<UnifiedPipelineSettings> unifiedBootSnapshot{ kUnifiedRestartFields };
 
 	/** @brief Region-preset display names, shared by PostPostLoad's seed list, the
 	 *  top-level preset buttons, and Upscaling::ApplyPerformanceProfile. */
@@ -185,6 +236,10 @@ struct FoveatedRender
 	static constexpr const char* kPresetNasalConvergence70 = "Nasal Convergence 70%";  ///< 70% crop biased toward nasal convergence.
 
 	Settings settings;
+	std::atomic_bool ariseDimensionDiagnostics = false;
+	std::atomic_bool ariseDisableUiComposite = false;
+	std::atomic_bool ariseForceSynchronous = false;
+	std::atomic_bool ariseBypassGraph = false;
 	Util::Subrect::Controller subrectController;
 
 	// Called from Upscaling::DrawSettings. DrawEnable renders the always-visible
@@ -194,18 +249,61 @@ struct FoveatedRender
 	void DrawEnable();
 	void DrawSettings();
 	void DrawNeuralRenderingSettings();
-	FlatPipelinePlan BuildFlatPipelinePlan(uint32_t displayWidth, uint32_t displayHeight) const;
+	FlatPipelinePlan BuildFlatPipelinePlan(uint32_t displayWidth, uint32_t displayHeight,
+		uint32_t engineWidth = 0, uint32_t engineHeight = 0) const;
 	// Called from Upscaling::SaveSettings / LoadSettings to round-trip JSON.
 	void SaveSettings(json& o_json);
 	void LoadSettings(const json& o_json);
 	void RestoreDefaultSettings();
 	void ClearShaderCache();
+	[[nodiscard]] bool WantsLogicalPerfMode() const { return settings.ariseModel3 || settings.singleThreadPerfMode; }
+	[[nodiscard]] bool BootUsesLogicalPerfMode() const
+	{
+		return bootSnapshot.Boot(&Settings::ariseModel3) || bootSnapshot.Boot(&Settings::singleThreadPerfMode);
+	}
+	[[nodiscard]] UnifiedPipelineSettings ActiveUnifiedPipelineSettings() const
+	{
+		auto active = settings.unifiedPipeline;
+		if (BootUsesLogicalPerfMode() && unifiedBootSnapshot.IsLatched()) {
+			active.act1Srss = unifiedBootSnapshot.Boot(&UnifiedPipelineSettings::act1Srss);
+			active.act1SrssQuality = unifiedBootSnapshot.Boot(&UnifiedPipelineSettings::act1SrssQuality);
+			active.act1SrssPreset = unifiedBootSnapshot.Boot(&UnifiedPipelineSettings::act1SrssPreset);
+			active.guidanceScale = unifiedBootSnapshot.Boot(&UnifiedPipelineSettings::guidanceScale);
+		}
+		return active;
+	}
 	// Called from Upscaling::PostPostLoad to seed subrect presets.
 	void PostPostLoad();
+	void InstallD3DHook(ID3D11DeviceContext* context);
 
 	struct UICompositeRenderHook
 	{
 		static void thunk(void* imageSpaceShader, RE::BSTriShape* shape, RE::ImageSpaceEffectParam* param);
+		static inline REL::Relocation<decltype(thunk)> func;
+	};
+	struct MenuCopyRenderHook
+	{
+		static void thunk(void* imageSpaceShader, RE::BSTriShape* shape, RE::ImageSpaceEffectParam* param);
+		static inline REL::Relocation<decltype(thunk)> func;
+	};
+	struct DistantBlurRenderHook
+	{
+		static void thunk(void* imageSpaceShader, RE::BSTriShape* shape, RE::ImageSpaceEffectParam* param);
+		static inline REL::Relocation<decltype(thunk)> func;
+	};
+	struct DistantBlurFoggedRenderHook
+	{
+		static void thunk(void* imageSpaceShader, RE::BSTriShape* shape, RE::ImageSpaceEffectParam* param);
+		static inline REL::Relocation<decltype(thunk)> func;
+	};
+	struct DistantBlurMaskedFoggedRenderHook
+	{
+		static void thunk(void* imageSpaceShader, RE::BSTriShape* shape, RE::ImageSpaceEffectParam* param);
+		static inline REL::Relocation<decltype(thunk)> func;
+	};
+	struct ID3D11DeviceContext_RSSetViewportsHook
+	{
+		static void thunk(ID3D11DeviceContext* context, UINT viewportCount, const D3D11_VIEWPORT* viewports);
 		static inline REL::Relocation<decltype(thunk)> func;
 	};
 

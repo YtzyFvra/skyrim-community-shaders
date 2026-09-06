@@ -168,6 +168,8 @@ namespace DX
 			return s_str;
 		}
 
+		[[nodiscard]] HRESULT code() const noexcept { return result; }
+
 	private:
 		HRESULT result;
 	};

@@ -4,11 +4,15 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 
 struct ID3D11Device;
 struct ID3D11DeviceContext;
 struct ID3D11Resource;
 struct ID3D11ShaderResourceView;
+struct ID3D12Device;
+struct ID3D12GraphicsCommandList;
+struct ID3D12Resource;
 
 namespace NeuralRendering
 {
@@ -51,6 +55,15 @@ namespace NeuralRendering
 			const std::array<StereoEyeInput, 2>& eyes,
 			std::uint32_t guideWidth, std::uint32_t guideHeight,
 			std::uint32_t colorWidth, std::uint32_t colorHeight, const Tuning& tuning);
+		/** @brief Binds the process-wide Feature 18 runtime to the Model 3 physical D3D12 device. */
+		bool InitializeModel3(ID3D12Device* externalDevice, std::function<bool()> drainOwner);
+		/** @brief Records a native-resolution Feature 18 evaluation on the caller's command list. */
+		bool ExecuteModel3(ID3D12GraphicsCommandList* commandList, ID3D12Resource* color,
+			ID3D12Resource* depth, ID3D12Resource* motionVectors, ID3D12Resource* output,
+			std::uint32_t width, std::uint32_t height,
+			float motionVectorScaleX, float motionVectorScaleY, const Tuning& tuning, bool reset);
+		/** @brief Shuts down Model 3 after its owner has drained all submitted GPU work. */
+		void ResetModel3();
 		void Reset();
 		void ResetHistory();
 

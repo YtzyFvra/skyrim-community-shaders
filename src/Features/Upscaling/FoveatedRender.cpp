@@ -8,12 +8,24 @@
 #include "../Upscaling.h"
 #include "FoveatedRender/Core.h"
 #include "NeuralRendering/Integration.h"
+#include "NeuralRendering/ArisePipeline.h"
 #include "NeuralRendering/Renderer.h"
 #include "Profiler.h"
 
 #include <algorithm>
 
 #define I18N_KEY_PREFIX "feature.upscaling."
+
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
+	FoveatedRender::UnifiedPipelineSettings,
+	act1Srss,
+	act1SrssQuality,
+	act1SrssPreset,
+	guidanceScale,
+	act1Downsample,
+	act2SrBackend,
+	act2Upsample,
+	fusionEnabled);
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	FoveatedRender::Settings,
@@ -30,6 +42,11 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	subrectFalloffCurve,
 	subrectDitherStrength,
 	neuralRenderingEnabled,
+	ariseShadowScheduler,
+	ariseVisualValidation,
+	ariseWorkerNr,
+	ariseModel3,
+	ariseBufferCount,
 	flatPipelineAct1Backend,
 	flatPipelineAct1Quality,
 	flatPipelineAct1Preset,
@@ -85,6 +102,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 void FoveatedRender::PostPostLoad()
 {
 	bootSnapshot.LatchIfNeeded(settings);
+	unifiedBootSnapshot.LatchIfNeeded(settings.unifiedPipeline);
 
 	// Opt into the stereo extension so the controller tracks a separate
 	// right-eye UV (HMD nose-side overlap symmetry).
@@ -116,13 +134,125 @@ void FoveatedRender::PostPostLoad()
 	// current preset in the DrawEditor dropdown, not just whichever ones they
 	// happened to click as buttons.
 	subrectController.MaterializeNewDefaults();
+	NeuralRendering::ARISE::Pipeline::Instance().Install();
+	NeuralRendering::ARISE::Pipeline::Instance().SetSlotCount(settings.ariseBufferCount);
+	NeuralRendering::ARISE::Pipeline::Instance().SetVisualValidation(settings.ariseVisualValidation);
+	NeuralRendering::ARISE::Pipeline::Instance().SetWorkerNrEnabled(settings.ariseWorkerNr);
+	NeuralRendering::ARISE::Pipeline::Instance().SetEnabled(settings.ariseShadowScheduler);
 	stl::write_vfunc<0x1, UICompositeRenderHook>(RE::VTABLE_BSImagespaceShaderCopyDynamicFetchDisabled[3]);
+	if (!globals::game::isVR && WantsLogicalPerfMode())
+		stl::write_vfunc<0x1, MenuCopyRenderHook>(RE::VTABLE_BSImagespaceShaderCopy[3]);
+	stl::write_vfunc<0x1, DistantBlurRenderHook>(RE::VTABLE_BSImagespaceShaderDistantBlur[3]);
+	stl::write_vfunc<0x1, DistantBlurFoggedRenderHook>(RE::VTABLE_BSImagespaceShaderDistantBlurFogged[3]);
+	stl::write_vfunc<0x1, DistantBlurMaskedFoggedRenderHook>(RE::VTABLE_BSImagespaceShaderDistantBlurMaskedFogged[3]);
 }
 
 void FoveatedRender::UICompositeRenderHook::thunk(void* imageSpaceShader, RE::BSTriShape* shape, RE::ImageSpaceEffectParam* param)
 {
 	NeuralRendering::ApplyFoveatedLdr();
 	func(imageSpaceShader, shape, param);
+}
+
+namespace
+{
+	thread_local std::uint32_t logicalTargetRenderDepth = 0;
+
+	class LogicalTargetRenderScope
+	{
+	public:
+		LogicalTargetRenderScope() { ++logicalTargetRenderDepth; }
+		~LogicalTargetRenderScope() { --logicalTargetRenderDepth; }
+	};
+
+	template <class Original>
+	void RunDistantBlurAtLogicalTarget(Original& original, void* imageSpaceShader,
+		RE::BSTriShape* shape, RE::ImageSpaceEffectParam* param)
+	{
+		auto& upscaling = globals::features::upscaling;
+		if (globals::game::isVR || !upscaling.dx12SwapChain.useArise) {
+			original(imageSpaceShader, shape, param);
+			return;
+		}
+
+		LogicalTargetRenderScope scope;
+		original(imageSpaceShader, shape, param);
+	}
+}
+
+void FoveatedRender::MenuCopyRenderHook::thunk(
+	void* imageSpaceShader, RE::BSTriShape* shape, RE::ImageSpaceEffectParam* param)
+{
+	auto* state = globals::state;
+	if (!state || (state->worldRenderedThisFrame && !state->IsPausedOrMenuOpen(RE::UI::GetSingleton()))) {
+		func(imageSpaceShader, shape, param);
+		return;
+	}
+
+	LogicalTargetRenderScope scope;
+	func(imageSpaceShader, shape, param);
+}
+
+void FoveatedRender::DistantBlurRenderHook::thunk(void* imageSpaceShader, RE::BSTriShape* shape, RE::ImageSpaceEffectParam* param)
+{
+	RunDistantBlurAtLogicalTarget(func, imageSpaceShader, shape, param);
+}
+
+void FoveatedRender::DistantBlurFoggedRenderHook::thunk(void* imageSpaceShader, RE::BSTriShape* shape, RE::ImageSpaceEffectParam* param)
+{
+	RunDistantBlurAtLogicalTarget(func, imageSpaceShader, shape, param);
+}
+
+void FoveatedRender::DistantBlurMaskedFoggedRenderHook::thunk(void* imageSpaceShader, RE::BSTriShape* shape, RE::ImageSpaceEffectParam* param)
+{
+	RunDistantBlurAtLogicalTarget(func, imageSpaceShader, shape, param);
+}
+
+void FoveatedRender::ID3D11DeviceContext_RSSetViewportsHook::thunk(
+	ID3D11DeviceContext* context, UINT viewportCount, const D3D11_VIEWPORT* viewports)
+{
+	if (!logicalTargetRenderDepth || viewportCount != 1 || !viewports) {
+		func(context, viewportCount, viewports);
+		return;
+	}
+
+	winrt::com_ptr<ID3D11RenderTargetView> target;
+	context->OMGetRenderTargets(1, target.put(), nullptr);
+	if (!target) {
+		func(context, viewportCount, viewports);
+		return;
+	}
+
+	D3D11_RENDER_TARGET_VIEW_DESC viewDesc{};
+	target->GetDesc(&viewDesc);
+	if (viewDesc.ViewDimension != D3D11_RTV_DIMENSION_TEXTURE2D) {
+		func(context, viewportCount, viewports);
+		return;
+	}
+
+	winrt::com_ptr<ID3D11Resource> resource;
+	target->GetResource(resource.put());
+	winrt::com_ptr<ID3D11Texture2D> texture;
+	if (!resource || FAILED(resource->QueryInterface(texture.put()))) {
+		func(context, viewportCount, viewports);
+		return;
+	}
+
+	D3D11_TEXTURE2D_DESC textureDesc{};
+	texture->GetDesc(&textureDesc);
+	D3D11_VIEWPORT corrected = viewports[0];
+	corrected.TopLeftX = 0.0f;
+	corrected.TopLeftY = 0.0f;
+	corrected.Width = static_cast<float>(std::max(1u, textureDesc.Width >> viewDesc.Texture2D.MipSlice));
+	corrected.Height = static_cast<float>(std::max(1u, textureDesc.Height >> viewDesc.Texture2D.MipSlice));
+	func(context, 1, &corrected);
+}
+
+void FoveatedRender::InstallD3DHook(ID3D11DeviceContext* context)
+{
+	if (!context || globals::game::isVR || !WantsLogicalPerfMode())
+		return;
+
+	stl::detour_vfunc<44, ID3D11DeviceContext_RSSetViewportsHook>(context);
 }
 
 void FoveatedRender::ClearShaderCache()
@@ -138,23 +268,60 @@ void FoveatedRender::ClearShaderCache()
 void FoveatedRender::SaveSettings(json& o_json)
 {
 	o_json = settings;
+	o_json["unifiedPipeline"] = settings.unifiedPipeline;
+	o_json["singleThreadPerfMode"] = settings.singleThreadPerfMode;
 	subrectController.SaveSettings(o_json);
 }
 
 void FoveatedRender::LoadSettings(const json& o_json)
 {
 	settings = o_json;
+	settings.singleThreadPerfMode = o_json.value("singleThreadPerfMode", false);
+	if (const auto unified = o_json.find("unifiedPipeline"); unified != o_json.end() && unified->is_object()) {
+		settings.unifiedPipeline = unified->get<UnifiedPipelineSettings>();
+	} else {
+		settings.unifiedPipeline.act1Srss = settings.flatPipelineAct1Dsr;
+		settings.unifiedPipeline.guidanceScale = settings.flatPipelineAct1Dsr ? 2.0f : 1.0f;
+		switch (static_cast<FlatAct2Backend>(std::min(settings.flatPipelineAct2Backend, 4u))) {
+		case FlatAct2Backend::kDLSS:
+			settings.unifiedPipeline.act2SrBackend = static_cast<uint>(FlatAct2SrBackend::kDLSS);
+			break;
+		case FlatAct2Backend::kFSR3:
+			settings.unifiedPipeline.act2SrBackend = static_cast<uint>(FlatAct2SrBackend::kFSR3);
+			break;
+		case FlatAct2Backend::kNIS:
+			settings.unifiedPipeline.act2SrBackend = static_cast<uint>(FlatAct2SrBackend::kNIS);
+			break;
+		case FlatAct2Backend::kFusion:
+			settings.unifiedPipeline.act2SrBackend = static_cast<uint>(FlatAct2SrBackend::kLanczos);
+			settings.unifiedPipeline.fusionEnabled = true;
+			break;
+		case FlatAct2Backend::kLanczos:
+			settings.unifiedPipeline.act2SrBackend = static_cast<uint>(FlatAct2SrBackend::kLanczos);
+			break;
+		}
+	}
 	// Util::Subrect::Controller::LoadSettings takes `const json&` (Subrect.h:68)
 	// so no const_cast is needed — keeping it would imply mutation that never
 	// happens.
 	subrectController.LoadSettings(o_json);
 	ClampSettings();
+	NeuralRendering::ARISE::Pipeline::Instance().SetEnabled(false);
+	NeuralRendering::ARISE::Pipeline::Instance().SetWorkerNrEnabled(false);
+	NeuralRendering::ARISE::Pipeline::Instance().SetSlotCount(settings.ariseBufferCount);
+	NeuralRendering::ARISE::Pipeline::Instance().SetVisualValidation(settings.ariseVisualValidation);
+	NeuralRendering::ARISE::Pipeline::Instance().SetWorkerNrEnabled(settings.ariseWorkerNr);
+	NeuralRendering::ARISE::Pipeline::Instance().SetEnabled(settings.ariseShadowScheduler);
 }
 
 void FoveatedRender::RestoreDefaultSettings()
 {
 	settings = {};
 	ClampSettings();
+	NeuralRendering::ARISE::Pipeline::Instance().SetVisualValidation(false);
+	NeuralRendering::ARISE::Pipeline::Instance().SetWorkerNrEnabled(false);
+	NeuralRendering::ARISE::Pipeline::Instance().SetEnabled(false);
+	NeuralRendering::ARISE::Pipeline::Instance().SetSlotCount(settings.ariseBufferCount);
 }
 
 void FoveatedRender::ClampSettings()
@@ -172,10 +339,54 @@ void FoveatedRender::ClampSettings()
 	settings.subrectFalloffCurve = std::clamp(settings.subrectFalloffCurve, 0.5f, 2.0f);
 	settings.subrectDitherStrength = std::clamp(settings.subrectDitherStrength, 0.0f, 2.0f);
 	settings.neuralRenderingPreset = std::min(settings.neuralRenderingPreset, 4u);
+	settings.ariseBufferCount = std::clamp(settings.ariseBufferCount, 2u, 3u);
+	if (settings.singleThreadPerfMode)
+		settings.ariseModel3 = false;
+	if (WantsLogicalPerfMode()) {
+		settings.ariseBufferCount = 3;
+		bool migrated = false;
+		if (settings.flatPipelineAct1Backend == static_cast<uint>(FlatAct1Backend::kFSR3)) {
+			settings.flatPipelineAct1Backend = static_cast<uint>(FlatAct1Backend::kDLSS);
+			migrated = true;
+		}
+		if (settings.flatPipelineAct2Backend == static_cast<uint>(FlatAct2Backend::kFSR3) ||
+			settings.flatPipelineAct2Backend == static_cast<uint>(FlatAct2Backend::kNIS)) {
+			settings.flatPipelineAct2Backend = static_cast<uint>(FlatAct2Backend::kDLSS);
+			migrated = true;
+		}
+		static bool migrationLogged = false;
+		if (migrated && !migrationLogged) {
+			logger::info("[ARISE] Migrated legacy Model 3 FSR/NIS backend selection to DLSS");
+			migrationLogged = true;
+		}
+	}
 	settings.flatPipelineAct1Backend = std::min(settings.flatPipelineAct1Backend, 2u);
 	settings.flatPipelineAct1Quality = std::min(settings.flatPipelineAct1Quality, 4u);
 	settings.flatPipelineAct1Preset = std::min(settings.flatPipelineAct1Preset, 4u);
 	settings.flatPipelineAct1Jitter = std::min(settings.flatPipelineAct1Jitter, 1u);
+	auto& unified = settings.unifiedPipeline;
+	unified.act1SrssQuality = std::clamp(unified.act1SrssQuality, 3u, 4u);
+	if (unified.act1SrssQuality == 3)
+		unified.act1SrssPreset = 2;
+	else if (unified.act1SrssPreset != 3 && unified.act1SrssPreset != 4)
+		unified.act1SrssPreset = 4;
+	unified.guidanceScale = std::clamp(unified.guidanceScale, 1.0f, 2.0f);
+	unified.act1Downsample = static_cast<uint>(ResampleFilter::kLanczos);
+	unified.act2SrBackend = std::min(unified.act2SrBackend, static_cast<uint>(FlatAct2SrBackend::kLanczos));
+	unified.act2Upsample = static_cast<uint>(ResampleFilter::kLanczos);
+	if (WantsLogicalPerfMode()) {
+		settings.flatPipelineAct1Backend = static_cast<uint>(FlatAct1Backend::kDLSS);
+		if (unified.act2SrBackend == static_cast<uint>(FlatAct2SrBackend::kFSR3) ||
+			unified.act2SrBackend == static_cast<uint>(FlatAct2SrBackend::kNIS))
+			unified.act2SrBackend = static_cast<uint>(FlatAct2SrBackend::kDLSS);
+	}
+	settings.flatPipelineAct1Dsr = false;
+	if (unified.fusionEnabled)
+		settings.flatPipelineAct2Backend = static_cast<uint>(FlatAct2Backend::kFusion);
+	else if (unified.act2SrBackend == static_cast<uint>(FlatAct2SrBackend::kLanczos))
+		settings.flatPipelineAct2Backend = static_cast<uint>(FlatAct2Backend::kLanczos);
+	else
+		settings.flatPipelineAct2Backend = unified.act2SrBackend;
 	settings.flatPipelineNrScale = std::clamp(settings.flatPipelineNrScale, 0.33f, 0.95f);
 	settings.flatPipelineAct2Backend = std::min(settings.flatPipelineAct2Backend, 4u);
 	settings.flatPipelineAct2Preset = std::min(settings.flatPipelineAct2Preset, 4u);
@@ -218,14 +429,36 @@ void FoveatedRender::ClampSettings()
 }
 
 FoveatedRender::FlatPipelinePlan FoveatedRender::BuildFlatPipelinePlan(
-	uint32_t displayWidth, uint32_t displayHeight) const
+	uint32_t displayWidth, uint32_t displayHeight, uint32_t engineWidth, uint32_t engineHeight) const
 {
 	FlatPipelinePlan plan{};
 	plan.displayWidth = displayWidth;
 	plan.displayHeight = displayHeight;
-	plan.act1Backend = static_cast<FlatAct1Backend>(std::min(settings.flatPipelineAct1Backend, 2u));
-	plan.act2Backend = static_cast<FlatAct2Backend>(std::min(settings.flatPipelineAct2Backend, 4u));
-	plan.act1Dsr = settings.flatPipelineAct1Dsr && plan.act1Backend != FlatAct1Backend::kBypass;
+	plan.displayD = { displayWidth, displayHeight };
+	const bool model3AtBoot = BootUsesLogicalPerfMode();
+	const auto unified = ActiveUnifiedPipelineSettings();
+	const uint act1Backend = model3AtBoot ? bootSnapshot.Boot(&Settings::flatPipelineAct1Backend) : settings.flatPipelineAct1Backend;
+	const uint act1QualitySetting = model3AtBoot ? bootSnapshot.Boot(&Settings::flatPipelineAct1Quality) : settings.flatPipelineAct1Quality;
+	plan.act1Backend = model3AtBoot ? FlatAct1Backend::kDLSS : static_cast<FlatAct1Backend>(std::min(act1Backend, 2u));
+	plan.act2SrBackend = static_cast<FlatAct2SrBackend>(std::min(
+		unified.act2SrBackend, static_cast<uint>(FlatAct2SrBackend::kLanczos)));
+	plan.fusion = unified.fusionEnabled;
+	if (plan.fusion) {
+		plan.act2Backend = FlatAct2Backend::kFusion;
+	} else {
+		switch (plan.act2SrBackend) {
+		case FlatAct2SrBackend::kDLSS: plan.act2Backend = FlatAct2Backend::kDLSS; break;
+		case FlatAct2SrBackend::kFSR3: plan.act2Backend = FlatAct2Backend::kFSR3; break;
+		case FlatAct2SrBackend::kNIS: plan.act2Backend = FlatAct2Backend::kNIS; break;
+		case FlatAct2SrBackend::kLanczos: plan.act2Backend = FlatAct2Backend::kLanczos; break;
+		}
+	}
+	plan.act1Downsample = static_cast<ResampleFilter>(unified.act1Downsample);
+	plan.act2Upsample = static_cast<ResampleFilter>(unified.act2Upsample);
+	plan.act1Dsr = !model3AtBoot && settings.flatPipelineAct1Dsr && plan.act1Backend != FlatAct1Backend::kBypass;
+	plan.srss = unified.act1Srss && plan.act1Backend == FlatAct1Backend::kDLSS;
+	plan.act1Quality = plan.srss ? unified.act1SrssQuality : act1QualitySetting;
+	plan.act1Preset = plan.srss ? unified.act1SrssPreset : settings.flatPipelineAct1Preset;
 	plan.sharpen = settings.flatPipelineSharpen;
 	if (!displayWidth || !displayHeight)
 		return plan;
@@ -236,18 +469,29 @@ FoveatedRender::FlatPipelinePlan FoveatedRender::BuildFlatPipelinePlan(
 			value * multiplier / Upscaling::GetQualityModeRatio(std::min(quality, 4u)))));
 	};
 
-	if (plan.act1Backend == FlatAct1Backend::kBypass) {
+	if (engineWidth && engineHeight) {
+		plan.engineWidth = engineWidth;
+		plan.engineHeight = engineHeight;
+		plan.act1OutputWidth = plan.act1Backend == FlatAct1Backend::kBypass ? plan.engineWidth :
+			std::max(2u, static_cast<uint32_t>(std::lround(displayWidth *
+				(plan.srss ? unified.guidanceScale : 1.0f))) & ~1u);
+		plan.act1OutputHeight = plan.act1Backend == FlatAct1Backend::kBypass ? plan.engineHeight :
+			std::max(2u, static_cast<uint32_t>(std::lround(displayHeight *
+				(plan.srss ? unified.guidanceScale : 1.0f))) & ~1u);
+	} else if (plan.act1Backend == FlatAct1Backend::kBypass) {
 		plan.engineWidth = displayWidth;
 		plan.engineHeight = displayHeight;
 		plan.act1OutputWidth = displayWidth;
 		plan.act1OutputHeight = displayHeight;
 	} else {
-		const uint act1Quality = plan.act1Dsr ? 4u : settings.flatPipelineAct1Quality;
+		const uint act1Quality = plan.act1Dsr ? 4u : act1QualitySetting;
 		plan.engineWidth = std::min(displayWidth, scaled(displayWidth, act1Quality, plan.act1Dsr));
 		plan.engineHeight = std::min(displayHeight, scaled(displayHeight, act1Quality, plan.act1Dsr));
 		plan.act1OutputWidth = displayWidth * (plan.act1Dsr ? 2u : 1u);
 		plan.act1OutputHeight = displayHeight * (plan.act1Dsr ? 2u : 1u);
 	}
+	plan.renderR = { plan.engineWidth, plan.engineHeight };
+	plan.guidanceG = { plan.act1OutputWidth, plan.act1OutputHeight };
 
 	plan.nrWidth = std::min(plan.act1OutputWidth, std::max(1u, static_cast<uint32_t>(
 		std::lround(displayWidth * settings.flatPipelineNrScale))));
@@ -255,6 +499,7 @@ FoveatedRender::FlatPipelinePlan FoveatedRender::BuildFlatPipelinePlan(
 		std::lround(displayHeight * settings.flatPipelineNrScale))));
 	plan.nrOutputWidth = plan.nrWidth;
 	plan.nrOutputHeight = plan.nrHeight;
+	plan.neuralN = { plan.nrWidth, plan.nrHeight };
 	plan.act2OutputWidth = displayWidth;
 	plan.act2OutputHeight = displayHeight;
 	if (plan.act2Backend == FlatAct2Backend::kDLSS) {
@@ -526,22 +771,85 @@ void FoveatedRender::DrawNeuralRenderingSettings()
 		if (!globals::game::isVR) {
 			static const char* act1Backends[] = { "Bypass", "DLSS", "FSR3" };
 			ImGui::TextDisabled("Injection Point: PostInject LDR / Before UI (fixed)");
-			ImGui::TextDisabled("Execution: ACT1 -> NR -> ACT2 -> RCAS in one hook");
+			ImGui::TextDisabled("Execution: ACT1 SR -> ACT1 DS -> NR -> ACT2 SR -> Fusion -> RCAS");
 			ImGui::Separator();
-			ImGui::TextUnformatted("ACT1 - LDR Reconstruction");
-			ImGui::Combo("ACT1 Backend", reinterpret_cast<int*>(&settings.flatPipelineAct1Backend), act1Backends, IM_ARRAYSIZE(act1Backends));
+			ImGui::TextUnformatted("ACT1 SR - Scene R to Guidance G");
+			if (WantsLogicalPerfMode())
+				ImGui::TextDisabled("ACT1 SR Backend: DLSS (fixed for ARISE)");
+			else
+				ImGui::Combo("ACT1 SR Backend", reinterpret_cast<int*>(&settings.flatPipelineAct1Backend),
+					act1Backends, IM_ARRAYSIZE(act1Backends));
 			if (settings.flatPipelineAct1Backend != 0) {
-				ImGui::Combo("ACT1 Quality", reinterpret_cast<int*>(&settings.flatPipelineAct1Quality), qualityModes, IM_ARRAYSIZE(qualityModes));
-				if (settings.flatPipelineAct1Backend == static_cast<uint>(FlatAct1Backend::kDLSS))
-					ImGui::Combo("ACT1 DLSS Preset", reinterpret_cast<int*>(&settings.flatPipelineAct1Preset), dlssPresets, IM_ARRAYSIZE(dlssPresets));
+				ImGui::Combo(WantsLogicalPerfMode() ? "Engine R Preset (Restart)" : "ACT1 Quality",
+					reinterpret_cast<int*>(&settings.flatPipelineAct1Quality), qualityModes, IM_ARRAYSIZE(qualityModes));
+				if (WantsLogicalPerfMode()) {
+					Util::UI::RestartGatedAnnotate(bootSnapshot, settings, &Settings::flatPipelineAct1Quality,
+						"Defines the logical scene resolution allocated from physical display resolution.");
+					if (bootSnapshot.HasPendingChange(settings, &Settings::flatPipelineAct1Quality)) {
+						const auto activeQuality = std::min(
+							bootSnapshot.Boot(&Settings::flatPipelineAct1Quality),
+							static_cast<uint>(IM_ARRAYSIZE(qualityModes) - 1));
+						ImGui::TextDisabled("Active this session: %s (restart to apply selection)", qualityModes[activeQuality]);
+					}
+				}
+				if (settings.flatPipelineAct1Backend == static_cast<uint>(FlatAct1Backend::kDLSS)) {
+					ImGui::Checkbox("Super Resolution Super Sampling (SRSS)", &settings.unifiedPipeline.act1Srss);
+					if (WantsLogicalPerfMode())
+						Util::UI::RestartGatedAnnotate(unifiedBootSnapshot, settings.unifiedPipeline,
+							&UnifiedPipelineSettings::act1Srss, "Changes the ACT1 Guidance G resource contract.");
+					if (!settings.unifiedPipeline.act1Srss)
+						ImGui::TextDisabled("SRSS Off: Guidance G equals Display D");
+					if (settings.unifiedPipeline.act1Srss) {
+						static const char* srssModes[] = { "Performance", "Ultra Performance" };
+						int srssMode = static_cast<int>(settings.unifiedPipeline.act1SrssQuality - 3);
+						if (ImGui::Combo("SRSS Mode", &srssMode, srssModes, IM_ARRAYSIZE(srssModes)))
+							settings.unifiedPipeline.act1SrssQuality = static_cast<uint>(srssMode + 3);
+						if (WantsLogicalPerfMode())
+							Util::UI::RestartGatedAnnotate(unifiedBootSnapshot, settings.unifiedPipeline,
+								&UnifiedPipelineSettings::act1SrssQuality);
+						if (settings.unifiedPipeline.act1SrssQuality == 3) {
+							ImGui::TextDisabled("SRSS Preset: Preset K (fixed)");
+						} else {
+							static const char* srssPresets[] = { "Preset L", "Preset M" };
+							int srssPreset = static_cast<int>(settings.unifiedPipeline.act1SrssPreset - 3);
+							if (ImGui::Combo("SRSS Preset", &srssPreset, srssPresets, IM_ARRAYSIZE(srssPresets)))
+								settings.unifiedPipeline.act1SrssPreset = static_cast<uint>(srssPreset + 3);
+							if (WantsLogicalPerfMode())
+								Util::UI::RestartGatedAnnotate(unifiedBootSnapshot, settings.unifiedPipeline,
+									&UnifiedPipelineSettings::act1SrssPreset);
+						}
+						ImGui::SliderFloat("Guidance Scale (G/D)", &settings.unifiedPipeline.guidanceScale,
+							1.0f, 2.0f, "%.2fx");
+						if (WantsLogicalPerfMode())
+							Util::UI::RestartGatedAnnotate(unifiedBootSnapshot, settings.unifiedPipeline,
+								&UnifiedPipelineSettings::guidanceScale);
+						const auto active = ActiveUnifiedPipelineSettings();
+						if (WantsLogicalPerfMode() &&
+							(unifiedBootSnapshot.HasPendingChange(settings.unifiedPipeline, &UnifiedPipelineSettings::act1Srss) ||
+								unifiedBootSnapshot.HasPendingChange(settings.unifiedPipeline, &UnifiedPipelineSettings::act1SrssQuality) ||
+								unifiedBootSnapshot.HasPendingChange(settings.unifiedPipeline, &UnifiedPipelineSettings::act1SrssPreset) ||
+								unifiedBootSnapshot.HasPendingChange(settings.unifiedPipeline, &UnifiedPipelineSettings::guidanceScale)))
+							ImGui::TextDisabled("Active this session: %s, mode %u, preset %u, G/D %.2fx",
+								active.act1Srss ? "SRSS On" : "SRSS Off", active.act1SrssQuality,
+								active.act1SrssPreset, active.guidanceScale);
+						ImGui::TextDisabled("Recommended: Ultra Performance + Preset M");
+					} else {
+						ImGui::Combo("ACT1 DLSS Preset", reinterpret_cast<int*>(&settings.flatPipelineAct1Preset),
+							dlssPresets, IM_ARRAYSIZE(dlssPresets));
+					}
+				}
 				ImGui::Combo("ACT1 Jitter Submission", reinterpret_cast<int*>(&settings.flatPipelineAct1Jitter), jitterModes, IM_ARRAYSIZE(jitterModes));
-				ImGui::Checkbox("ACT1 DSR 2x", &settings.flatPipelineAct1Dsr);
 			}
+			ImGui::TextUnformatted("ACT1 DS - Guidance G to Neural N");
+			ImGui::TextDisabled("Filter: HQ Lanczos (runs whenever G differs from N)");
+			ImGui::TextDisabled("Footprint Integral (planned / unavailable)");
 			ImGui::Separator();
 		}
 
-		const bool supportedRoute = globals::features::upscaling.GetUpscaleMethod() == Upscaling::UpscaleMethod::kDLSS &&
-			!globals::features::upscaling.IsFrameGenerationConfiguredForSession() &&
+		const bool model3Route = !globals::game::isVR && upscaling.dx12SwapChain.useArise;
+		const bool supportedRoute = (model3Route ||
+			globals::features::upscaling.GetUpscaleMethod() == Upscaling::UpscaleMethod::kDLSS) &&
+			(model3Route || !globals::features::upscaling.IsFrameGenerationConfiguredForSession()) &&
 			(!globals::game::isVR || (GetDlssMode() == DlssMode::kDefault &&
 				globals::features::upscaling.perfMode.IsHookActive()));
 		if (!supportedRoute) {
@@ -561,25 +869,48 @@ void FoveatedRender::DrawNeuralRenderingSettings()
 				ImGui::TextUnformatted("NR");
 				ImGui::SliderFloat("NR Resolution Scale", &settings.flatPipelineNrScale, 0.33f, 0.95f, "%.2f");
 				{
+					const bool model3 = globals::features::upscaling.dx12SwapChain.useArise;
 					const auto preview = BuildFlatPipelinePlan(
-						globals::state ? static_cast<uint32_t>(globals::state->screenSize.x) : 0u,
-						globals::state ? static_cast<uint32_t>(globals::state->screenSize.y) : 0u);
+						model3 ? globals::features::upscaling.dx12SwapChain.PhysicalWidth() :
+							(globals::state ? static_cast<uint32_t>(globals::state->screenSize.x) : 0u),
+						model3 ? globals::features::upscaling.dx12SwapChain.PhysicalHeight() :
+							(globals::state ? static_cast<uint32_t>(globals::state->screenSize.y) : 0u),
+						model3 ? globals::features::upscaling.dx12SwapChain.LogicalWidth() : 0u,
+						model3 ? globals::features::upscaling.dx12SwapChain.LogicalHeight() : 0u);
 					const double displayPixels = static_cast<double>(preview.displayWidth) * preview.displayHeight;
 					const double nrPixels = static_cast<double>(preview.nrWidth) * preview.nrHeight;
-					ImGui::TextDisabled("NR extent: %ux%u | %.1f%% pixels",
-						preview.nrWidth, preview.nrHeight, displayPixels > 0.0 ? nrPixels * 100.0 / displayPixels : 0.0);
+					ImGui::TextDisabled("R %ux%u -> G %ux%u -> N %ux%u -> D %ux%u",
+						preview.renderR.width, preview.renderR.height,
+						preview.guidanceG.width, preview.guidanceG.height,
+						preview.neuralN.width, preview.neuralN.height,
+						preview.displayD.width, preview.displayD.height);
+					ImGui::TextDisabled("Neural N: %.1f%% of Display D pixels",
+						displayPixels > 0.0 ? nrPixels * 100.0 / displayPixels : 0.0);
 				}
 				{
-					static const char* act2Backends[] = { "DLSS", "FSR3", "NIS", "Fusion", "HQ Lanczos" };
+					static const char* act2Backends[] = { "DLSS", "FSR3", "NIS", "HQ Lanczos" };
+					static const char* model3Act2Backends[] = { "DLSS", "HQ Lanczos" };
 					ImGui::Separator();
-					ImGui::TextUnformatted("ACT2");
-					ImGui::Combo("ACT2 Backend", reinterpret_cast<int*>(&settings.flatPipelineAct2Backend), act2Backends, IM_ARRAYSIZE(act2Backends));
-					if (settings.flatPipelineAct2Backend == static_cast<uint>(FlatAct2Backend::kDLSS))
+					ImGui::TextUnformatted("ACT2 SR");
+					if (WantsLogicalPerfMode()) {
+						int model3Act2 = settings.unifiedPipeline.act2SrBackend ==
+							static_cast<uint>(FlatAct2SrBackend::kLanczos) ? 1 : 0;
+						if (ImGui::Combo("ACT2 SR Backend", &model3Act2, model3Act2Backends, IM_ARRAYSIZE(model3Act2Backends)))
+							settings.unifiedPipeline.act2SrBackend = model3Act2 ?
+								static_cast<uint>(FlatAct2SrBackend::kLanczos) : static_cast<uint>(FlatAct2SrBackend::kDLSS);
+					} else {
+						ImGui::Combo("ACT2 SR Backend", reinterpret_cast<int*>(&settings.unifiedPipeline.act2SrBackend),
+							act2Backends, IM_ARRAYSIZE(act2Backends));
+					}
+					if (settings.unifiedPipeline.act2SrBackend == static_cast<uint>(FlatAct2SrBackend::kDLSS))
 						ImGui::Combo("ACT2 DLSS Preset", reinterpret_cast<int*>(&settings.flatPipelineAct2Preset), dlssPresets, IM_ARRAYSIZE(dlssPresets));
-					if (settings.flatPipelineAct2Backend == static_cast<uint>(FlatAct2Backend::kDLSS) ||
-						settings.flatPipelineAct2Backend == static_cast<uint>(FlatAct2Backend::kFSR3))
+					if (settings.unifiedPipeline.act2SrBackend == static_cast<uint>(FlatAct2SrBackend::kDLSS) ||
+						settings.unifiedPipeline.act2SrBackend == static_cast<uint>(FlatAct2SrBackend::kFSR3))
 						ImGui::Combo("ACT2 Jitter Submission", reinterpret_cast<int*>(&settings.flatPipelineAct2Jitter), jitterModes, IM_ARRAYSIZE(jitterModes));
-					if (settings.flatPipelineAct2Backend == static_cast<uint>(FlatAct2Backend::kFusion)) {
+					ImGui::TextDisabled("ACT2 Spatial Filter: HQ Lanczos");
+					ImGui::TextDisabled("Footprint Integral (planned / unavailable)");
+					ImGui::Checkbox("Enable ACT2 Fusion", &settings.unifiedPipeline.fusionEnabled);
+					if (settings.unifiedPipeline.fusionEnabled) {
 						static const char* fusionDirections[] = { "ACT1 guides NR", "NR guides ACT1" };
 						static const char* denoiseModes[] = { "Off", "Residual Bilateral", "Soft Gaussian", "Luma Preserve", "Strong Clean" };
 						static const char* fusionPresets[] = { "Custom", "Clean", "Soft", "Dreamy", "Detail", "NR Led" };
@@ -651,6 +982,112 @@ void FoveatedRender::DrawNeuralRenderingSettings()
 				settings.neuralRenderingPreset = 0;
 
 			if (ImGui::TreeNodeEx("Diagnostics")) {
+				if (!globals::game::isVR) {
+					if (ImGui::Checkbox("ARISE Async PerfMode", &settings.ariseModel3) && settings.ariseModel3) {
+						settings.singleThreadPerfMode = false;
+						settings.ariseBufferCount = 3;
+					}
+					Util::UI::RestartGatedAnnotate(bootSnapshot, settings, &Settings::ariseModel3,
+						"Uses a three-slot logical Present tail. Restart required; HDR is not supported.");
+					if (ImGui::Checkbox("Single-thread PerfMode", &settings.singleThreadPerfMode) && settings.singleThreadPerfMode) {
+						settings.ariseModel3 = false;
+						settings.ariseBufferCount = 3;
+					}
+					Util::UI::RestartGatedAnnotate(bootSnapshot, settings, &Settings::singleThreadPerfMode,
+						"Uses the same logical R proxy and six-pass graph on the Present calling thread.");
+					if (upscaling.dx12SwapChain.useArise)
+						ImGui::TextDisabled("Active execution: %s",
+							upscaling.dx12SwapChain.IsAriseAsyncTail() ? "ARISE asynchronous Tail" : "Single-thread synchronous Tail");
+					ImGui::BeginDisabled(!upscaling.dx12SwapChain.useArise);
+					auto runtimeToggle = [](const char* label, std::atomic_bool& value) {
+						bool enabled = value.load(std::memory_order_relaxed);
+						if (!ImGui::Checkbox(label, &enabled))
+							return false;
+						value.store(enabled, std::memory_order_release);
+						return true;
+					};
+					runtimeToggle("Model 3 Dimension Diagnostics", ariseDimensionDiagnostics);
+					runtimeToggle("Disable Model 3 UI Composite", ariseDisableUiComposite);
+					runtimeToggle("Force Synchronous Model 3", ariseForceSynchronous);
+					const bool graphToggleChanged = runtimeToggle("Bypass Model 3 Graph", ariseBypassGraph);
+					if (graphToggleChanged && upscaling.dx12SwapChain.useArise &&
+						!ariseBypassGraph.load(std::memory_order_acquire))
+						upscaling.dx12SwapChain.PrepareAriseGraphPlanChange();
+					ImGui::EndDisabled();
+				}
+				if (!globals::game::isVR && ImGui::Checkbox("ARISE Feature 18 Worker", &settings.ariseWorkerNr))
+					NeuralRendering::ARISE::Pipeline::Instance().SetWorkerNrEnabled(settings.ariseWorkerNr);
+				if (ImGui::Checkbox("ARISE Shadow Scheduler", &settings.ariseShadowScheduler))
+					NeuralRendering::ARISE::Pipeline::Instance().SetEnabled(settings.ariseShadowScheduler);
+				ImGui::BeginDisabled(settings.ariseShadowScheduler || settings.ariseWorkerNr || WantsLogicalPerfMode());
+				static const char* ariseBufferCounts[] = { "2 Slots", "3 Slots" };
+				int ariseBufferIndex = static_cast<int>(settings.ariseBufferCount - 2);
+				if (ImGui::Combo("ARISE Frame Slots", &ariseBufferIndex, ariseBufferCounts, IM_ARRAYSIZE(ariseBufferCounts))) {
+					settings.ariseBufferCount = static_cast<uint>(ariseBufferIndex + 2);
+					NeuralRendering::ARISE::Pipeline::Instance().SetSlotCount(settings.ariseBufferCount);
+				}
+				ImGui::EndDisabled();
+				if (settings.ariseShadowScheduler &&
+					ImGui::Checkbox("ARISE Visual Validation", &settings.ariseVisualValidation))
+					NeuralRendering::ARISE::Pipeline::Instance().SetVisualValidation(settings.ariseVisualValidation);
+				const auto ariseStats = NeuralRendering::ARISE::Pipeline::Instance().GetStatistics();
+				ImGui::TextDisabled("ARISE: Flat %llu | VR %llu | consumed %llu | saturated %llu (%.3f%%)",
+					static_cast<unsigned long long>(ariseStats.observedFlatPresents),
+					static_cast<unsigned long long>(ariseStats.observedVrSubmits),
+					static_cast<unsigned long long>(ariseStats.consumedSubmits),
+					static_cast<unsigned long long>(ariseStats.saturatedSubmits), ariseStats.saturationRate);
+				ImGui::TextDisabled("ARISE Queue: %u/%u | high-water %u | saturation streak %u (max %u)",
+					ariseStats.queuedSlots, ariseStats.slotCount, ariseStats.queueHighWater,
+					ariseStats.currentSaturationStreak, ariseStats.maxSaturationStreak);
+				ImGui::TextDisabled("ARISE Color: D3D11 copies %llu | D3D12 submits %llu | completes %llu | visual %llu | failures %llu",
+					static_cast<unsigned long long>(ariseStats.colorCopies),
+					static_cast<unsigned long long>(ariseStats.gpuSubmits),
+					static_cast<unsigned long long>(ariseStats.gpuCompletes),
+					static_cast<unsigned long long>(ariseStats.visualPresents),
+					static_cast<unsigned long long>(ariseStats.interopFailures));
+				ImGui::TextDisabled("ARISE Worker NR: queued %llu | succeeded %llu | fallback %llu | failed %llu",
+					static_cast<unsigned long long>(ariseStats.workerNrQueued),
+					static_cast<unsigned long long>(ariseStats.workerNrSucceeded),
+					static_cast<unsigned long long>(ariseStats.workerNrFallback),
+					static_cast<unsigned long long>(ariseStats.workerNrFailed));
+				const auto model3Stats = upscaling.dx12SwapChain.GetAriseStatistics();
+					if (upscaling.dx12SwapChain.useArise)
+						ImGui::TextDisabled("Logical R execution: %s",
+							model3Stats.asyncTail ? "ARISE asynchronous Tail" : "Single-thread Present Tail");
+				if (model3Stats.renderDocCompatibility)
+					ImGui::TextDisabled("RenderDoc compatibility: DLSS/NR replaced; graph topology preserved");
+				ImGui::TextDisabled("Model 3 extents: logical R %ux%u | physical D %ux%u",
+					upscaling.dx12SwapChain.LogicalWidth(), upscaling.dx12SwapChain.LogicalHeight(),
+					upscaling.dx12SwapChain.PhysicalWidth(), upscaling.dx12SwapChain.PhysicalHeight());
+				ImGui::TextDisabled("DX12 DLSS provider: %s", model3Stats.dlssAvailable ? "available" : "unavailable");
+				ImGui::TextDisabled("ARISE Model 3: %s%s", model3Stats.graphPath.c_str(),
+					model3Stats.tailNrAvailable ? "" : " (runtime unavailable; passthrough)");
+				ImGui::TextDisabled("Graph passes: ACT1 bypass %llu | Lanczos %llu | NR %llu | Fusion %llu | RCAS %llu",
+					static_cast<unsigned long long>(model3Stats.graph.act1Bypass),
+					static_cast<unsigned long long>(model3Stats.graph.lanczos),
+					static_cast<unsigned long long>(model3Stats.graph.neuralRendering),
+					static_cast<unsigned long long>(model3Stats.graph.fusion),
+					static_cast<unsigned long long>(model3Stats.graph.rcas));
+				ImGui::TextDisabled("DLSS provider: ACT1 ok %llu / failed %llu | ACT2 ok %llu / failed %llu",
+					static_cast<unsigned long long>(model3Stats.graph.dlss.act1Succeeded),
+					static_cast<unsigned long long>(model3Stats.graph.dlss.act1Failed),
+					static_cast<unsigned long long>(model3Stats.graph.dlss.act2Succeeded),
+					static_cast<unsigned long long>(model3Stats.graph.dlss.act2Failed));
+				ImGui::TextDisabled("Graph recovery: unsupported %llu | fallback %llu | failed %llu",
+					static_cast<unsigned long long>(model3Stats.graph.unsupported),
+					static_cast<unsigned long long>(model3Stats.graph.fallback),
+					static_cast<unsigned long long>(model3Stats.graph.failed));
+				ImGui::TextDisabled("Model 3 frames: captured %llu | reconstructed %llu | fallback %llu | UI %llu",
+					static_cast<unsigned long long>(model3Stats.captured),
+					static_cast<unsigned long long>(model3Stats.reconstructed),
+					static_cast<unsigned long long>(model3Stats.fallback),
+					static_cast<unsigned long long>(model3Stats.uiComposites));
+				ImGui::TextDisabled("Model 3 Present: logical %llu | physical %llu | backpressure %llu | failures %llu | last 0x%08X",
+					static_cast<unsigned long long>(model3Stats.logicalPresents),
+					static_cast<unsigned long long>(model3Stats.physicalPresents),
+					static_cast<unsigned long long>(model3Stats.backpressure),
+					static_cast<unsigned long long>(model3Stats.failures),
+					static_cast<std::uint32_t>(model3Stats.lastPresentResult));
 				const auto stats = NeuralRendering::GetAct2BackendStats();
 				ImGui::TextDisabled("Actual jitter: %.4f, %.4f", upscaling.jitter.x, upscaling.jitter.y);
 				ImGui::TextDisabled("ACT1 submits: %s | ACT2 submits: %s",
