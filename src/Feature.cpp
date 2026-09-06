@@ -6,6 +6,7 @@
 #include "Features/CSUtility.h"
 #include "Features/CloudRelight.h"
 #include "Features/CloudShadows.h"
+#include "Features/DLSSBooster.h"
 #include "Features/DynamicCubemaps.h"
 #include "Features/ProceduralSun.h"
 #if defined(ENABLE_EFFECTS11)
@@ -279,6 +280,7 @@ namespace
 			&globals::features::extendedTranslucency,
 			&globals::features::renderDoc,
 			&globals::features::upscaling,
+			&globals::features::dlssBooster,
 			&globals::features::remoteControl,
 			&globals::features::csEditor,
 			&globals::features::sceneSelector,

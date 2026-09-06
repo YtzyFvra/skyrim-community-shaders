@@ -377,6 +377,9 @@ std::string I18n::DetectSystemLocale() const
 	case LANG_POLISH:
 		detected = "pl";
 		break;
+	case LANG_DUTCH:
+		detected = "nl";
+		break;
 	case LANG_TURKISH:
 		detected = "tr";
 		break;

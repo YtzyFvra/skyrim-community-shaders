@@ -43,6 +43,7 @@ struct PerformanceOverlay;
 struct WetnessEffects;
 struct ExtendedTranslucency;
 struct Upscaling;
+struct DLSSBooster;
 class Profiler;
 struct CSEditor;
 struct CSUtility;
@@ -145,6 +146,7 @@ namespace globals
 		extern WetnessEffects wetnessEffects;
 		extern ExtendedTranslucency extendedTranslucency;
 		extern Upscaling upscaling;
+		extern DLSSBooster dlssBooster;
 		extern HDRDisplay hdrDisplay;
 #if defined(ENABLE_EFFECTS11)
 		extern Effects11 effects11;

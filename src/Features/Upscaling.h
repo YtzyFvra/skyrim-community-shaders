@@ -276,6 +276,12 @@ public:
 	/// panel and the Performance hub. VR-only; self-gates via IsRuntimeSupported()
 	/// (shown disabled off-VR rather than hidden).
 	void DrawFoveationControls(bool showTuning = true);
+	/** @brief DLSS model preset and RCAS sharpening. Shared with RTX DLSS Booster. */
+	void DrawDlssModelControls();
+	/** @brief Flat Frame Generation / DLSS-G tree. Shared with RTX DLSS Booster. */
+	void DrawFrameGenerationSettings();
+	/** @brief NVIDIA Reflex latency controls. Shared with RTX DLSS Booster. */
+	void DrawReflexSettings();
 	const char* GetQualityModeName(uint qualityMode) const;
 	virtual void SaveSettings(json& o_json) override;
 	virtual void LoadSettings(json& o_json) override;
@@ -290,6 +296,7 @@ public:
 	virtual void Load() override;
 	virtual void PostPostLoad() override;
 	virtual void SetupResources() override;
+	virtual void Reset() override;
 
 	UpscaleMethod GetUpscaleMethod() const;
 	FrameGenMethod GetFrameGenMethod() const;

@@ -7,6 +7,7 @@
 #include "Features/CSUtility.h"
 #include "Features/CloudRelight.h"
 #include "Features/CloudShadows.h"
+#include "Features/DLSSBooster.h"
 #include "Features/DynamicCubemaps.h"
 #include "Features/Effects11.h"
 #include "Features/ExponentialHeightFog.h"
@@ -109,6 +110,7 @@ namespace globals
 		WetnessEffects wetnessEffects{};
 		ExtendedTranslucency extendedTranslucency{};
 		Upscaling upscaling{};
+		DLSSBooster dlssBooster{};
 		HDRDisplay hdrDisplay{};
 #if defined(ENABLE_EFFECTS11)
 		Effects11 effects11{};
