@@ -55,6 +55,12 @@ namespace NeuralRendering
 		void ResetHistory();
 
 		[[nodiscard]] bool IsFailureLatched() const;
+		[[nodiscard]] double LastEvaluationGpuMs() const;
+		[[nodiscard]] double LastD3D12TotalGpuMs() const;
+		[[nodiscard]] std::uint64_t D3D12TotalTimingSamples() const;
+		[[nodiscard]] std::uint64_t EvaluationTimingSamples() const;
+		[[nodiscard]] std::uint64_t CpuBackpressureCount() const;
+		[[nodiscard]] double LastCpuBackpressureMs() const;
 		[[nodiscard]] std::uint32_t NgxResult() const;
 		[[nodiscard]] std::uint64_t SuccessfulFrames() const;
 		[[nodiscard]] const char* StatusText() const;

@@ -33,6 +33,31 @@ namespace NeuralRendering
 		queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
 		result = device12_->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&queue12_));
 		if (FAILED(result)) return RecordFailure(result);
+		result = queue12_->GetTimestampFrequency(&timestampFrequency_);
+		if (FAILED(result) || !timestampFrequency_) return RecordFailure(FAILED(result) ? result : E_FAIL);
+		D3D12_QUERY_HEAP_DESC queryDesc{};
+		queryDesc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+		queryDesc.Count = static_cast<UINT>(kCommandContextCount * kTimingPairsPerContext * 2);
+		result = device12_->CreateQueryHeap(&queryDesc, IID_PPV_ARGS(&timestampHeap_));
+		if (FAILED(result)) return RecordFailure(result);
+		result = device12_->CreateQueryHeap(&queryDesc, IID_PPV_ARGS(&totalTimestampHeap_));
+		if (FAILED(result)) return RecordFailure(result);
+		D3D12_HEAP_PROPERTIES readbackHeap{};
+		readbackHeap.Type = D3D12_HEAP_TYPE_READBACK;
+		D3D12_RESOURCE_DESC readbackDesc{};
+		readbackDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+		readbackDesc.Width = kCommandContextCount * kTimingPairsPerContext * 2 * sizeof(std::uint64_t);
+		readbackDesc.Height = 1;
+		readbackDesc.DepthOrArraySize = 1;
+		readbackDesc.MipLevels = 1;
+		readbackDesc.SampleDesc.Count = 1;
+		readbackDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+		result = device12_->CreateCommittedResource(&readbackHeap, D3D12_HEAP_FLAG_NONE, &readbackDesc,
+			D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&timestampReadback_));
+		if (FAILED(result)) return RecordFailure(result);
+		result = device12_->CreateCommittedResource(&readbackHeap, D3D12_HEAP_FLAG_NONE, &readbackDesc,
+			D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&totalTimestampReadback_));
+		if (FAILED(result)) return RecordFailure(result);
 		for (auto& commandContext : commandContexts_) {
 			result = device12_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
 				IID_PPV_ARGS(&commandContext.allocator));
@@ -70,11 +95,26 @@ namespace NeuralRendering
 		recordingContext_ = kCommandContextCount;
 		commandContextCursor_ = 0;
 		backpressureLogged_ = false;
+		timestampFrequency_ = 0;
+		lastEvaluationGpuMs_ = 0.0;
+		lastTotalGpuMs_ = 0.0;
+		evaluationTimingSamples_ = 0;
+		totalTimingSamples_ = 0;
+		cpuBackpressureCount_ = 0;
+		lastCpuBackpressureMs_ = 0.0;
+		recordingTimingPairCount_ = 0;
+		recordingTotalTimingPairCount_ = 0;
+		evaluationTimingActive_ = false;
+		totalTimingActive_ = false;
 		initialized_ = false;
 		fenceValue_ = 0;
 		fence11_.Reset();
 		fence12_.Reset();
 		commandContexts_ = {};
+		timestampReadback_.Reset();
+		timestampHeap_.Reset();
+		totalTimestampReadback_.Reset();
+		totalTimestampHeap_.Reset();
 		queue12_.Reset();
 		device12_.Reset();
 		context11_.Reset();
@@ -150,11 +190,15 @@ namespace NeuralRendering
 				logger::warn("[DLSSNR] D3D12 command contexts saturated; applying CPU backpressure");
 				backpressureLogged_ = true;
 			}
+			const ULONGLONG waitStart = GetTickCount64();
 			if (!WaitForFence(commandContexts_[contextIndex].fenceValue))
 				return false;
+			lastCpuBackpressureMs_ = static_cast<double>(GetTickCount64() - waitStart);
+			++cpuBackpressureCount_;
 		}
 
 		auto& commandContext = commandContexts_[contextIndex];
+		ResolveCompletedTiming(contextIndex);
 		commandContext.fenceValue = 0;
 		const std::uint64_t readyValue = ++fenceValue_;
 		HRESULT result = context11_->Signal(fence11_.Get(), readyValue);
@@ -166,9 +210,64 @@ namespace NeuralRendering
 		result = commandContext.commandList->Reset(commandContext.allocator.Get(), nullptr);
 		if (FAILED(result)) return RecordFailure(result);
 		recording_ = true;
+		recordingTimingPairCount_ = 0;
+		recordingTotalTimingPairCount_ = 0;
+		evaluationTimingActive_ = false;
+		totalTimingActive_ = false;
 		recordingContext_ = contextIndex;
 		commandContextCursor_ = (contextIndex + 1) % kCommandContextCount;
 		*commandList = commandContext.commandList.Get();
+		return true;
+	}
+
+	bool D3D12Interop::BeginTotalTiming(ID3D12GraphicsCommandList* commandList)
+	{
+		if (!recording_ || recordingContext_ >= kCommandContextCount || !commandList || !totalTimestampHeap_ ||
+			totalTimingActive_ || recordingTotalTimingPairCount_ >= kTimingPairsPerContext)
+			return false;
+		const UINT queryIndex = static_cast<UINT>((recordingContext_ * kTimingPairsPerContext + recordingTotalTimingPairCount_) * 2);
+		commandList->EndQuery(totalTimestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryIndex);
+		totalTimingActive_ = true;
+		return true;
+	}
+
+	bool D3D12Interop::EndTotalTiming(ID3D12GraphicsCommandList* commandList)
+	{
+		if (!recording_ || recordingContext_ >= kCommandContextCount || !commandList || !totalTimestampHeap_ ||
+			!totalTimestampReadback_ || !totalTimingActive_)
+			return false;
+		const UINT firstQuery = static_cast<UINT>((recordingContext_ * kTimingPairsPerContext + recordingTotalTimingPairCount_) * 2);
+		commandList->EndQuery(totalTimestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, firstQuery + 1);
+		commandList->ResolveQueryData(totalTimestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, firstQuery, 2,
+			totalTimestampReadback_.Get(), firstQuery * sizeof(std::uint64_t));
+		++recordingTotalTimingPairCount_;
+		totalTimingActive_ = false;
+		return true;
+	}
+
+	bool D3D12Interop::BeginEvaluationTiming(ID3D12GraphicsCommandList* commandList)
+	{
+		if (!recording_ || recordingContext_ >= kCommandContextCount || !commandList || !timestampHeap_ ||
+			evaluationTimingActive_ || recordingTimingPairCount_ >= kTimingPairsPerContext)
+			return false;
+		const UINT queryIndex = static_cast<UINT>((recordingContext_ * kTimingPairsPerContext + recordingTimingPairCount_) * 2);
+		commandList->EndQuery(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+			queryIndex);
+		evaluationTimingActive_ = true;
+		return true;
+	}
+
+	bool D3D12Interop::EndEvaluationTiming(ID3D12GraphicsCommandList* commandList)
+	{
+		if (!recording_ || recordingContext_ >= kCommandContextCount || !commandList || !timestampHeap_ ||
+			!timestampReadback_ || !evaluationTimingActive_)
+			return false;
+		const UINT firstQuery = static_cast<UINT>((recordingContext_ * kTimingPairsPerContext + recordingTimingPairCount_) * 2);
+		commandList->EndQuery(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, firstQuery + 1);
+		commandList->ResolveQueryData(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, firstQuery, 2,
+			timestampReadback_.Get(), firstQuery * sizeof(std::uint64_t));
+		++recordingTimingPairCount_;
+		evaluationTimingActive_ = false;
 		return true;
 	}
 
@@ -177,6 +276,8 @@ namespace NeuralRendering
 		if (!initialized_ || !recording_ || recordingContext_ >= kCommandContextCount)
 			return RecordFailure(E_UNEXPECTED);
 		recording_ = false;
+		evaluationTimingActive_ = false;
+		totalTimingActive_ = false;
 		auto& commandContext = commandContexts_[recordingContext_];
 		recordingContext_ = kCommandContextCount;
 		HRESULT result = commandContext.commandList->Close();
@@ -187,12 +288,68 @@ namespace NeuralRendering
 		result = queue12_->Signal(fence12_.Get(), completeValue);
 		if (FAILED(result)) return RecordFailure(result);
 		commandContext.fenceValue = completeValue;
+		commandContext.timingPairCount = recordingTimingPairCount_;
+		commandContext.timingPending = recordingTimingPairCount_ != 0;
+		commandContext.totalTimingPairCount = recordingTotalTimingPairCount_;
+		commandContext.totalTimingPending = recordingTotalTimingPairCount_ != 0;
 
 		// This queues a GPU-side dependency. Subsequent D3D11 output copies wait
 		// for Feature 18 without stalling the render thread on the CPU.
 		result = context11_->Wait(fence11_.Get(), completeValue);
 		if (FAILED(result)) return RecordFailure(result);
 		lastError_ = S_OK;
+		return true;
+	}
+
+	void D3D12Interop::ResolveCompletedTiming(std::size_t contextIndex)
+	{
+		if (contextIndex >= kCommandContextCount || !timestampFrequency_)
+			return;
+		auto& commandContext = commandContexts_[contextIndex];
+		if (commandContext.timingPending) {
+			double gpuMs = 0.0;
+			if (ResolveTimingBuffer(timestampReadback_.Get(), contextIndex, commandContext.timingPairCount, gpuMs)) {
+				lastEvaluationGpuMs_ = gpuMs;
+				++evaluationTimingSamples_;
+			}
+			commandContext.timingPending = false;
+			commandContext.timingPairCount = 0;
+		}
+		if (commandContext.totalTimingPending) {
+			double gpuMs = 0.0;
+			if (ResolveTimingBuffer(totalTimestampReadback_.Get(), contextIndex, commandContext.totalTimingPairCount, gpuMs)) {
+				lastTotalGpuMs_ = gpuMs;
+				++totalTimingSamples_;
+			}
+			commandContext.totalTimingPending = false;
+			commandContext.totalTimingPairCount = 0;
+		}
+	}
+
+	bool D3D12Interop::ResolveTimingBuffer(ID3D12Resource* readback, std::size_t contextIndex, std::uint32_t pairCount, double& gpuMs)
+	{
+		if (!readback || !pairCount || !timestampFrequency_)
+			return false;
+		const std::size_t firstTimestamp = contextIndex * kTimingPairsPerContext * 2;
+		const D3D12_RANGE readRange{
+			firstTimestamp * sizeof(std::uint64_t),
+			(firstTimestamp + pairCount * 2) * sizeof(std::uint64_t)
+		};
+		void* mapped = nullptr;
+		if (FAILED(readback->Map(0, &readRange, &mapped)) || !mapped)
+			return false;
+		gpuMs = 0.0;
+		{
+			const auto* timestamps = static_cast<const std::uint64_t*>(mapped);
+			for (std::uint32_t pairIndex = 0; pairIndex < pairCount; ++pairIndex) {
+				const auto* pair = timestamps + firstTimestamp + pairIndex * 2;
+				if (pair[1] >= pair[0])
+					gpuMs += static_cast<double>(pair[1] - pair[0]) * 1000.0 /
+						static_cast<double>(timestampFrequency_);
+			}
+			const D3D12_RANGE writtenRange{ 0, 0 };
+			readback->Unmap(0, &writtenRange);
+		}
 		return true;
 	}
 

@@ -2034,9 +2034,8 @@ void Upscaling::ConfigureUpscaling(RE::BSGraphics::State* a_viewport)
 			if (flatPipeline) {
 				if (plan.act1Backend != FoveatedRender::FlatAct1Backend::kBypass)
 					phaseCount = std::max(phaseCount, GetJitterPhaseCount(plan.engineWidth, plan.act1OutputWidth));
-				if (plan.nrMode == FoveatedRender::FlatNrMode::kNR &&
-					(plan.act2Backend == FoveatedRender::FlatAct2Backend::kDLSS ||
-						plan.act2Backend == FoveatedRender::FlatAct2Backend::kFSR3))
+				if (plan.act2Backend == FoveatedRender::FlatAct2Backend::kDLSS ||
+					plan.act2Backend == FoveatedRender::FlatAct2Backend::kFSR3)
 					phaseCount = std::max(phaseCount, GetJitterPhaseCount(plan.nrWidth, plan.act2OutputWidth));
 			}
 
@@ -2552,32 +2551,25 @@ json Upscaling::GetDiagnostics()
 	diagnostics["frameGenActive"] = IsFrameGenerationActive();
 	diagnostics["frameGenMultiplier"] = GetFrameGenerationMultiplier();
 	if (!globals::game::isVR) {
-		const bool postInject = bootSnapshot.Boot(&Settings::flatDlssPostInject);
-		const uint32_t act1Mode = postInject ? 0u : bootSnapshot.Boot(&Settings::flatAct1ResControl);
 		const auto& nr = foveatedRender.settings;
-		const char* act2Mode = "FullNR";
-		if (nr.neuralRenderingHalfResolution) {
-			switch (nr.neuralRenderingOutputMode) {
-			case 0: act2Mode = "ReducedFusion"; break;
-			case 1: act2Mode = "ReducedNIS"; break;
-			case 2: act2Mode = "ReducedDLSS"; break;
-			case 3: act2Mode = "ReducedFSR3"; break;
-			default: break;
-			}
-		}
-		const float nrWorkingScale = nr.neuralRenderingWorkingScale == 1 ? 2.0f / 3.0f :
-			(nr.neuralRenderingWorkingScale == 2 ? 0.77f : 0.5f);
+		const uint32_t displayWidth = globals::state ? static_cast<uint32_t>(globals::state->screenSize.x) : 0u;
+		const uint32_t displayHeight = globals::state ? static_cast<uint32_t>(globals::state->screenSize.y) : 0u;
+		const auto plan = foveatedRender.BuildFlatPipelinePlan(displayWidth, displayHeight);
+		const auto act1Mode = std::string(magic_enum::enum_name(plan.act1Backend));
+		const auto act2Mode = std::string(magic_enum::enum_name(plan.act2Backend));
 		diagnostics["flatPipeline"] = {
-			{ "injectPoint", postInject ? "PostInjectLDR" : "PrePostHDR" },
+			{ "injectPoint", "PostInjectLDR" },
 			{ "postInjectActive", IsFlatDlssPostInjectActive() },
 			{ "act1Mode", act1Mode },
 			{ "act2Mode", act2Mode },
 			{ "nrEnabled", nr.neuralRenderingEnabled },
-			{ "nrWorkingScale", nrWorkingScale },
+			{ "nrScale", nr.flatPipelineNrScale },
+			{ "nrWidth", plan.nrWidth },
+			{ "nrHeight", plan.nrHeight },
 			{ "renderWidth", lastDlssRenderWidth },
 			{ "renderHeight", lastDlssRenderHeight },
-			{ "displayWidth", globals::state ? static_cast<uint32_t>(globals::state->screenSize.x) : 0u },
-			{ "displayHeight", globals::state ? static_cast<uint32_t>(globals::state->screenSize.y) : 0u },
+			{ "displayWidth", displayWidth },
+			{ "displayHeight", displayHeight },
 		};
 	}
 	if (method == FrameGenMethod::kDLSSG) {

@@ -9,6 +9,7 @@
 #include "FoveatedRender/Core.h"
 #include "NeuralRendering/Integration.h"
 #include "NeuralRendering/Renderer.h"
+#include "Profiler.h"
 
 #include <algorithm>
 
@@ -31,11 +32,21 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	neuralRenderingEnabled,
 	flatPipelineAct1Backend,
 	flatPipelineAct1Quality,
+	flatPipelineAct1Preset,
+	flatPipelineAct1Jitter,
 	flatPipelineAct1Dsr,
-	flatPipelineNrMode,
-	flatPipelineNrQuality,
-	flatPipelineNrDsr,
+	flatPipelineNrScale,
 	flatPipelineAct2Backend,
+	flatPipelineAct2Preset,
+	flatPipelineAct2Jitter,
+	flatPipelineFusionDirection,
+	flatPipelineFusionDenoise,
+	flatPipelineFusionDenoiseStrength,
+	flatPipelineFusionSoftness,
+	flatPipelineFusionEnhancedGuidance,
+	flatPipelineFusionFrequencyGuidance,
+	flatPipelineFusionDepthGuidance,
+	flatPipelineFusionColorGuidance,
 	flatPipelineSharpen,
 	flatPipelineSharpness,
 	flatAct1Enabled,
@@ -163,9 +174,19 @@ void FoveatedRender::ClampSettings()
 	settings.neuralRenderingPreset = std::min(settings.neuralRenderingPreset, 4u);
 	settings.flatPipelineAct1Backend = std::min(settings.flatPipelineAct1Backend, 2u);
 	settings.flatPipelineAct1Quality = std::min(settings.flatPipelineAct1Quality, 4u);
-	settings.flatPipelineNrMode = std::min(settings.flatPipelineNrMode, 1u);
-	settings.flatPipelineNrQuality = std::min(settings.flatPipelineNrQuality, 4u);
+	settings.flatPipelineAct1Preset = std::min(settings.flatPipelineAct1Preset, 4u);
+	settings.flatPipelineAct1Jitter = std::min(settings.flatPipelineAct1Jitter, 1u);
+	settings.flatPipelineNrScale = std::clamp(settings.flatPipelineNrScale, 0.33f, 0.95f);
 	settings.flatPipelineAct2Backend = std::min(settings.flatPipelineAct2Backend, 4u);
+	settings.flatPipelineAct2Preset = std::min(settings.flatPipelineAct2Preset, 4u);
+	settings.flatPipelineAct2Jitter = std::min(settings.flatPipelineAct2Jitter, 1u);
+	settings.flatPipelineFusionDirection = std::min(settings.flatPipelineFusionDirection, 1u);
+	settings.flatPipelineFusionDenoise = std::min(settings.flatPipelineFusionDenoise, 4u);
+	settings.flatPipelineFusionDenoiseStrength = std::clamp(settings.flatPipelineFusionDenoiseStrength, 0.0f, 1.0f);
+	settings.flatPipelineFusionSoftness = std::clamp(settings.flatPipelineFusionSoftness, 0.0f, 1.0f);
+	settings.flatPipelineFusionFrequencyGuidance = std::clamp(settings.flatPipelineFusionFrequencyGuidance, 0.0f, 1.0f);
+	settings.flatPipelineFusionDepthGuidance = std::clamp(settings.flatPipelineFusionDepthGuidance, 0.0f, 1.0f);
+	settings.flatPipelineFusionColorGuidance = std::clamp(settings.flatPipelineFusionColorGuidance, 0.0f, 1.0f);
 	settings.flatPipelineSharpness = std::clamp(settings.flatPipelineSharpness, 0.0f, 1.0f);
 	settings.flatAct1QualityMode = std::min(settings.flatAct1QualityMode, 4u);
 	settings.flatAct1Preset = std::min(settings.flatAct1Preset, 4u);
@@ -183,7 +204,7 @@ void FoveatedRender::ClampSettings()
 	settings.neuralRenderingWorkingScale = std::min(settings.neuralRenderingWorkingScale, 2u);
 	settings.neuralRenderingOutputMode = std::min(settings.neuralRenderingOutputMode, 3u);
 	settings.neuralRenderingNisSharpness = std::clamp(settings.neuralRenderingNisSharpness, 0.0f, 1.0f);
-	settings.neuralRenderingFusionPreset = std::min(settings.neuralRenderingFusionPreset, 4u);
+	settings.neuralRenderingFusionPreset = std::min(settings.neuralRenderingFusionPreset, 5u);
 	settings.neuralRenderingFusionLuma = std::clamp(settings.neuralRenderingFusionLuma, 0.0f, 1.5f);
 	settings.neuralRenderingFusionChroma = std::clamp(settings.neuralRenderingFusionChroma, 0.0f, 1.5f);
 	settings.neuralRenderingFusionEdgeProtection = std::clamp(settings.neuralRenderingFusionEdgeProtection, 0.0f, 1.0f);
@@ -203,10 +224,11 @@ FoveatedRender::FlatPipelinePlan FoveatedRender::BuildFlatPipelinePlan(
 	plan.displayWidth = displayWidth;
 	plan.displayHeight = displayHeight;
 	plan.act1Backend = static_cast<FlatAct1Backend>(std::min(settings.flatPipelineAct1Backend, 2u));
-	plan.nrMode = static_cast<FlatNrMode>(std::min(settings.flatPipelineNrMode, 1u));
 	plan.act2Backend = static_cast<FlatAct2Backend>(std::min(settings.flatPipelineAct2Backend, 4u));
 	plan.act1Dsr = settings.flatPipelineAct1Dsr && plan.act1Backend != FlatAct1Backend::kBypass;
-	plan.nrDsr = settings.flatPipelineNrDsr;
+	plan.sharpen = settings.flatPipelineSharpen;
+	if (!displayWidth || !displayHeight)
+		return plan;
 
 	const auto scaled = [](uint32_t value, uint quality, bool dsr) {
 		const float multiplier = dsr ? 2.0f : 1.0f;
@@ -227,21 +249,50 @@ FoveatedRender::FlatPipelinePlan FoveatedRender::BuildFlatPipelinePlan(
 		plan.act1OutputHeight = displayHeight * (plan.act1Dsr ? 2u : 1u);
 	}
 
-	const uint nrQuality = plan.nrDsr ? 4u : settings.flatPipelineNrQuality;
-	plan.nrWidth = std::min(plan.act1OutputWidth, scaled(displayWidth, nrQuality, plan.nrDsr));
-	plan.nrHeight = std::min(plan.act1OutputHeight, scaled(displayHeight, nrQuality, plan.nrDsr));
-	if (plan.nrMode == FlatNrMode::kNRSR) {
-		plan.nrOutputWidth = displayWidth;
-		plan.nrOutputHeight = displayHeight;
-		plan.act2OutputWidth = displayWidth;
-		plan.act2OutputHeight = displayHeight;
-	} else {
+	plan.nrWidth = std::min(plan.act1OutputWidth, std::max(1u, static_cast<uint32_t>(
+		std::lround(displayWidth * settings.flatPipelineNrScale))));
+	plan.nrHeight = std::min(plan.act1OutputHeight, std::max(1u, static_cast<uint32_t>(
+		std::lround(displayHeight * settings.flatPipelineNrScale))));
+	plan.nrOutputWidth = plan.nrWidth;
+	plan.nrOutputHeight = plan.nrHeight;
+	plan.act2OutputWidth = displayWidth;
+	plan.act2OutputHeight = displayHeight;
+	if (plan.act2Backend == FlatAct2Backend::kDLSS) {
+		float closestScaleDistance = std::numeric_limits<float>::max();
+		const float actualScale = static_cast<float>(plan.nrWidth) / static_cast<float>(displayWidth);
+		for (uint candidate = 1; candidate <= 4; ++candidate) {
+			const float candidateScale = 1.0f / Upscaling::GetQualityModeRatio(candidate);
+			const float distance = std::abs(candidateScale - actualScale);
+			if (distance < closestScaleDistance) {
+				closestScaleDistance = distance;
+				plan.act2Quality = candidate;
+			}
+		}
+		struct DlssRangeCache
+		{
+			uint32_t quality = UINT32_MAX;
+			uint32_t outputWidth = 0;
+			uint32_t outputHeight = 0;
+			uint32_t requestedWidth = 0;
+			uint32_t requestedHeight = 0;
+			uint32_t clampedWidth = 0;
+			uint32_t clampedHeight = 0;
+		};
+		static DlssRangeCache rangeCache;
+		if (Upscaling::streamline.slDLSSGetOptimalSettings) {
+			if (rangeCache.quality != plan.act2Quality || rangeCache.outputWidth != displayWidth ||
+				rangeCache.outputHeight != displayHeight || rangeCache.requestedWidth != plan.nrWidth ||
+				rangeCache.requestedHeight != plan.nrHeight) {
+				rangeCache = { plan.act2Quality, displayWidth, displayHeight, plan.nrWidth, plan.nrHeight,
+					plan.nrWidth, plan.nrHeight };
+				Upscaling::streamline.ClampToDLSSRenderRange(plan.act2Quality, displayWidth, displayHeight,
+					rangeCache.clampedWidth, rangeCache.clampedHeight);
+			}
+			plan.nrWidth = rangeCache.clampedWidth;
+			plan.nrHeight = rangeCache.clampedHeight;
+		}
 		plan.nrOutputWidth = plan.nrWidth;
 		plan.nrOutputHeight = plan.nrHeight;
-		const bool temporalDsr = plan.nrDsr &&
-			(plan.act2Backend == FlatAct2Backend::kDLSS || plan.act2Backend == FlatAct2Backend::kFSR3);
-		plan.act2OutputWidth = displayWidth * (temporalDsr ? 2u : 1u);
-		plan.act2OutputHeight = displayHeight * (temporalDsr ? 2u : 1u);
 	}
 	return plan;
 }
@@ -470,12 +521,20 @@ void FoveatedRender::DrawNeuralRenderingSettings()
 	if (ImGui::CollapsingHeader(T(TKEY("neural_rendering_header"), "DLSS Neural Rendering"), ImGuiTreeNodeFlags_DefaultOpen)) {
 		auto& upscaling = globals::features::upscaling;
 		static const char* qualityModes[] = { "DLAA / Native", "Quality", "Balanced", "Performance", "Ultra Performance" };
+		static const char* dlssPresets[] = { "Default", "Preset J", "Preset K", "Preset L", "Preset M" };
+		static const char* jitterModes[] = { "Actual Camera Jitter", "Zero" };
 		if (!globals::game::isVR) {
 			static const char* act1Backends[] = { "Bypass", "DLSS", "FSR3" };
+			ImGui::TextDisabled("Injection Point: PostInject LDR / Before UI (fixed)");
+			ImGui::TextDisabled("Execution: ACT1 -> NR -> ACT2 -> RCAS in one hook");
+			ImGui::Separator();
 			ImGui::TextUnformatted("ACT1 - LDR Reconstruction");
 			ImGui::Combo("ACT1 Backend", reinterpret_cast<int*>(&settings.flatPipelineAct1Backend), act1Backends, IM_ARRAYSIZE(act1Backends));
 			if (settings.flatPipelineAct1Backend != 0) {
 				ImGui::Combo("ACT1 Quality", reinterpret_cast<int*>(&settings.flatPipelineAct1Quality), qualityModes, IM_ARRAYSIZE(qualityModes));
+				if (settings.flatPipelineAct1Backend == static_cast<uint>(FlatAct1Backend::kDLSS))
+					ImGui::Combo("ACT1 DLSS Preset", reinterpret_cast<int*>(&settings.flatPipelineAct1Preset), dlssPresets, IM_ARRAYSIZE(dlssPresets));
+				ImGui::Combo("ACT1 Jitter Submission", reinterpret_cast<int*>(&settings.flatPipelineAct1Jitter), jitterModes, IM_ARRAYSIZE(jitterModes));
 				ImGui::Checkbox("ACT1 DSR 2x", &settings.flatPipelineAct1Dsr);
 			}
 			ImGui::Separator();
@@ -499,18 +558,61 @@ void FoveatedRender::DrawNeuralRenderingSettings()
 		if (settings.neuralRenderingEnabled) {
 			if (!globals::game::isVR) {
 				ImGui::Separator();
-				static const char* nrModes[] = { "NR (N -> N)", "NRSR Experimental (N -> D)" };
 				ImGui::TextUnformatted("NR");
-				ImGui::Combo("NR Mode", reinterpret_cast<int*>(&settings.flatPipelineNrMode), nrModes, IM_ARRAYSIZE(nrModes));
-				ImGui::Combo("NR Quality", reinterpret_cast<int*>(&settings.flatPipelineNrQuality), qualityModes, IM_ARRAYSIZE(qualityModes));
-				ImGui::Checkbox("NR DSR 2x", &settings.flatPipelineNrDsr);
-				if (settings.flatPipelineNrMode == 1)
-					Util::Text::Warning("Experimental: Feature 18 may only write the top-left N region even when evaluation succeeds.");
-				if (settings.flatPipelineNrMode == 0) {
+				ImGui::SliderFloat("NR Resolution Scale", &settings.flatPipelineNrScale, 0.33f, 0.95f, "%.2f");
+				{
+					const auto preview = BuildFlatPipelinePlan(
+						globals::state ? static_cast<uint32_t>(globals::state->screenSize.x) : 0u,
+						globals::state ? static_cast<uint32_t>(globals::state->screenSize.y) : 0u);
+					const double displayPixels = static_cast<double>(preview.displayWidth) * preview.displayHeight;
+					const double nrPixels = static_cast<double>(preview.nrWidth) * preview.nrHeight;
+					ImGui::TextDisabled("NR extent: %ux%u | %.1f%% pixels",
+						preview.nrWidth, preview.nrHeight, displayPixels > 0.0 ? nrPixels * 100.0 / displayPixels : 0.0);
+				}
+				{
 					static const char* act2Backends[] = { "DLSS", "FSR3", "NIS", "Fusion", "HQ Lanczos" };
 					ImGui::Separator();
 					ImGui::TextUnformatted("ACT2");
 					ImGui::Combo("ACT2 Backend", reinterpret_cast<int*>(&settings.flatPipelineAct2Backend), act2Backends, IM_ARRAYSIZE(act2Backends));
+					if (settings.flatPipelineAct2Backend == static_cast<uint>(FlatAct2Backend::kDLSS))
+						ImGui::Combo("ACT2 DLSS Preset", reinterpret_cast<int*>(&settings.flatPipelineAct2Preset), dlssPresets, IM_ARRAYSIZE(dlssPresets));
+					if (settings.flatPipelineAct2Backend == static_cast<uint>(FlatAct2Backend::kDLSS) ||
+						settings.flatPipelineAct2Backend == static_cast<uint>(FlatAct2Backend::kFSR3))
+						ImGui::Combo("ACT2 Jitter Submission", reinterpret_cast<int*>(&settings.flatPipelineAct2Jitter), jitterModes, IM_ARRAYSIZE(jitterModes));
+					if (settings.flatPipelineAct2Backend == static_cast<uint>(FlatAct2Backend::kFusion)) {
+						static const char* fusionDirections[] = { "ACT1 guides NR", "NR guides ACT1" };
+						static const char* denoiseModes[] = { "Off", "Residual Bilateral", "Soft Gaussian", "Luma Preserve", "Strong Clean" };
+						static const char* fusionPresets[] = { "Custom", "Clean", "Soft", "Dreamy", "Detail", "NR Led" };
+						int fusionPreset = static_cast<int>(settings.neuralRenderingFusionPreset);
+						if (ImGui::Combo("Fusion Preset", &fusionPreset, fusionPresets, IM_ARRAYSIZE(fusionPresets))) {
+							settings.neuralRenderingFusionPreset = static_cast<uint>(fusionPreset);
+							switch (settings.neuralRenderingFusionPreset) {
+							case 1: settings.flatPipelineFusionDirection = 0; settings.flatPipelineFusionDenoise = 1; settings.flatPipelineFusionDenoiseStrength = 0.55f; settings.flatPipelineFusionSoftness = 0.25f; settings.flatPipelineFusionFrequencyGuidance = 0.70f; settings.flatPipelineFusionDepthGuidance = 0.80f; settings.neuralRenderingFusionLuma = 0.75f; settings.neuralRenderingFusionChroma = 0.50f; settings.neuralRenderingFusionEdgeProtection = 0.45f; settings.neuralRenderingFusionResidualLimit = 0.12f; break;
+							case 2: settings.flatPipelineFusionDirection = 0; settings.flatPipelineFusionDenoise = 2; settings.flatPipelineFusionDenoiseStrength = 0.65f; settings.flatPipelineFusionSoftness = 0.65f; settings.flatPipelineFusionFrequencyGuidance = 0.75f; settings.flatPipelineFusionDepthGuidance = 0.80f; settings.neuralRenderingFusionLuma = 0.65f; settings.neuralRenderingFusionChroma = 0.40f; settings.neuralRenderingFusionEdgeProtection = 0.50f; settings.neuralRenderingFusionResidualLimit = 0.10f; break;
+							case 3: settings.flatPipelineFusionDirection = 0; settings.flatPipelineFusionDenoise = 4; settings.flatPipelineFusionDenoiseStrength = 0.80f; settings.flatPipelineFusionSoftness = 0.85f; settings.flatPipelineFusionFrequencyGuidance = 0.85f; settings.flatPipelineFusionDepthGuidance = 0.90f; settings.neuralRenderingFusionLuma = 0.55f; settings.neuralRenderingFusionChroma = 0.35f; settings.neuralRenderingFusionEdgeProtection = 0.60f; settings.neuralRenderingFusionResidualLimit = 0.08f; break;
+							case 4: settings.flatPipelineFusionDirection = 1; settings.flatPipelineFusionDenoise = 1; settings.flatPipelineFusionDenoiseStrength = 0.40f; settings.flatPipelineFusionSoftness = 0.20f; settings.flatPipelineFusionFrequencyGuidance = 0.45f; settings.flatPipelineFusionDepthGuidance = 0.65f; settings.neuralRenderingFusionLuma = 0.80f; settings.neuralRenderingFusionChroma = 0.45f; settings.neuralRenderingFusionEdgeProtection = 0.30f; settings.neuralRenderingFusionResidualLimit = 0.14f; break;
+							case 5: settings.flatPipelineFusionDirection = 1; settings.flatPipelineFusionDenoise = 3; settings.flatPipelineFusionDenoiseStrength = 0.55f; settings.flatPipelineFusionSoftness = 0.45f; settings.flatPipelineFusionFrequencyGuidance = 0.60f; settings.flatPipelineFusionDepthGuidance = 0.75f; settings.neuralRenderingFusionLuma = 0.55f; settings.neuralRenderingFusionChroma = 0.35f; settings.neuralRenderingFusionEdgeProtection = 0.45f; settings.neuralRenderingFusionResidualLimit = 0.11f; break;
+							default: break;
+							}
+						}
+						ImGui::Combo("Fusion Direction", reinterpret_cast<int*>(&settings.flatPipelineFusionDirection), fusionDirections, IM_ARRAYSIZE(fusionDirections));
+						ImGui::Combo("Fusion Denoise", reinterpret_cast<int*>(&settings.flatPipelineFusionDenoise), denoiseModes, IM_ARRAYSIZE(denoiseModes));
+						bool customFusion = false;
+						customFusion |= ImGui::SliderFloat("Fusion Denoise Strength", &settings.flatPipelineFusionDenoiseStrength, 0.0f, 1.0f, "%.2f");
+						customFusion |= ImGui::SliderFloat("Fusion Softness", &settings.flatPipelineFusionSoftness, 0.0f, 1.0f, "%.2f");
+						ImGui::Checkbox("Enable Enhanced Guidance", &settings.flatPipelineFusionEnhancedGuidance);
+						if (settings.flatPipelineFusionEnhancedGuidance) {
+							customFusion |= ImGui::SliderFloat("Fusion Frequency Guidance", &settings.flatPipelineFusionFrequencyGuidance, 0.0f, 1.0f, "%.2f");
+							customFusion |= ImGui::SliderFloat("Fusion Depth Guidance", &settings.flatPipelineFusionDepthGuidance, 0.0f, 1.0f, "%.2f");
+							customFusion |= ImGui::SliderFloat("Fusion Color Guidance", &settings.flatPipelineFusionColorGuidance, 0.0f, 1.0f, "%.2f");
+						}
+						customFusion |= ImGui::SliderFloat("Fusion Luma", &settings.neuralRenderingFusionLuma, 0.0f, 1.5f, "%.2f");
+						customFusion |= ImGui::SliderFloat("Fusion Chroma", &settings.neuralRenderingFusionChroma, 0.0f, 1.5f, "%.2f");
+						customFusion |= ImGui::SliderFloat("Fusion Edge Protection", &settings.neuralRenderingFusionEdgeProtection, 0.0f, 1.0f, "%.2f");
+						customFusion |= ImGui::SliderFloat("Fusion Residual Limit", &settings.neuralRenderingFusionResidualLimit, 0.01f, 0.5f, "%.3f");
+						if (customFusion)
+							settings.neuralRenderingFusionPreset = 0;
+					}
 				}
 				ImGui::Separator();
 				ImGui::TextUnformatted("Final Sharpen");
@@ -552,8 +654,8 @@ void FoveatedRender::DrawNeuralRenderingSettings()
 				const auto stats = NeuralRendering::GetAct2BackendStats();
 				ImGui::TextDisabled("Actual jitter: %.4f, %.4f", upscaling.jitter.x, upscaling.jitter.y);
 				ImGui::TextDisabled("ACT1 submits: %s | ACT2 submits: %s",
-					upscaling.settings.flatAct1JitterMode == 0 ? "Actual" : "Zero",
-					upscaling.settings.flatAct2JitterMode == 0 ? "Actual" : "Zero");
+					(globals::game::isVR ? upscaling.settings.flatAct1JitterMode : settings.flatPipelineAct1Jitter) == 0 ? "Actual" : "Zero",
+					(globals::game::isVR ? upscaling.settings.flatAct2JitterMode : settings.flatPipelineAct2Jitter) == 0 ? "Actual" : "Zero");
 				ImGui::TextDisabled("ACT1 DLSS successful frames: %llu",
 					static_cast<unsigned long long>(Upscaling::streamline.flatAct1SuccessfulFrames));
 				ImGui::TextDisabled("ACT2 successful frames: NIS %llu | DLSS %llu | FSR3 %llu",
@@ -594,6 +696,63 @@ void FoveatedRender::DrawNeuralRenderingSettings()
 					neuralRenderer.StatusText(), neuralRenderer.NgxResult(),
 					static_cast<unsigned long long>(neuralRenderer.SuccessfulFrames()));
 			}
+			static double endToEndGpuMs = 0.0;
+			static std::uint32_t observedCapturedFrame = 0;
+			static std::uint32_t endToEndCapturedFrame = 0;
+			bool endToEndAvailable = endToEndCapturedFrame != 0;
+			if (globals::profiler) {
+				globals::profiler->RequestCapture();
+				const std::uint32_t capturedFrame = globals::profiler->GetCapturedFrameCount();
+				const std::string_view timerName = globals::game::isVR ?
+					"NeuralRendering::EvaluateStereo" : "NeuralRendering::Evaluate";
+				if (capturedFrame != observedCapturedFrame) {
+					observedCapturedFrame = capturedFrame;
+					endToEndCapturedFrame = 0;
+					endToEndAvailable = false;
+					for (const auto& result : globals::profiler->GetResults()) {
+						if (result.name == timerName && result.activeGpu) {
+							endToEndGpuMs = result.gpuTimeMs;
+							endToEndCapturedFrame = capturedFrame;
+							endToEndAvailable = true;
+							break;
+						}
+					}
+				}
+			}
+			const double dx12TotalGpuMs = neuralRenderer.LastD3D12TotalGpuMs();
+			const double pureNgxGpuMs = neuralRenderer.LastEvaluationGpuMs();
+			const double endToEndSampleGpuMs = endToEndGpuMs;
+			const double dx12WrapperGpuMs = std::max(0.0, dx12TotalGpuMs - pureNgxGpuMs);
+			const double interopResidualGpuMs = endToEndAvailable ? std::max(0.0, endToEndSampleGpuMs - dx12TotalGpuMs) : 0.0;
+			const auto percent = [endToEndSampleGpuMs, endToEndAvailable](double value) {
+				return endToEndAvailable && endToEndSampleGpuMs > 0.0 ? value * 100.0 / endToEndSampleGpuMs : 0.0;
+			};
+			if (endToEndAvailable)
+				ImGui::TextDisabled("NR End-to-End GPU: %.3f ms | captured frame: %u", endToEndGpuMs, endToEndCapturedFrame);
+			else
+				ImGui::TextDisabled("NR End-to-End GPU: waiting for profiler capture");
+			if (endToEndAvailable) {
+				ImGui::TextDisabled("NR DX12 Total GPU: %.3f ms (%.1f%%) | samples: %llu",
+					dx12TotalGpuMs, percent(dx12TotalGpuMs),
+					static_cast<unsigned long long>(neuralRenderer.D3D12TotalTimingSamples()));
+				ImGui::TextDisabled("NR Pure NGX GPU: %.3f ms (%.1f%%) | samples: %llu",
+					pureNgxGpuMs, percent(pureNgxGpuMs),
+					static_cast<unsigned long long>(neuralRenderer.EvaluationTimingSamples()));
+				ImGui::TextDisabled("DX12 wrapper: %.3f ms (%.1f%%)", dx12WrapperGpuMs, percent(dx12WrapperGpuMs));
+				ImGui::TextDisabled("Interop/copy/fence residual: %.3f ms (%.1f%%)",
+					interopResidualGpuMs, percent(interopResidualGpuMs));
+			} else {
+				ImGui::TextDisabled("NR DX12 Total GPU: %.3f ms | share: N/A | samples: %llu",
+					dx12TotalGpuMs, static_cast<unsigned long long>(neuralRenderer.D3D12TotalTimingSamples()));
+				ImGui::TextDisabled("NR Pure NGX GPU: %.3f ms | share: N/A | samples: %llu",
+					pureNgxGpuMs, static_cast<unsigned long long>(neuralRenderer.EvaluationTimingSamples()));
+				ImGui::TextDisabled("DX12 wrapper: %.3f ms | share: N/A", dx12WrapperGpuMs);
+				ImGui::TextDisabled("Interop/copy/fence residual: N/A");
+			}
+			ImGui::TextDisabled("Percentages compare latest asynchronous samples.");
+			ImGui::TextDisabled("Interop CPU backpressure: %llu | last wait: %.1f ms",
+				static_cast<unsigned long long>(neuralRenderer.CpuBackpressureCount()),
+				neuralRenderer.LastCpuBackpressureMs());
 		}
 		if (!supportedRoute)
 			ImGui::EndDisabled();

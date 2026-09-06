@@ -95,6 +95,7 @@ namespace NeuralRendering
 				eye.color.resource12.Get(), eye.depth.resource12.Get(),
 				eye.motionVectors.resource12.Get(), eye.output.resource12.Get()
 			};
+			interop.BeginTotalTiming(commandList);
 			for (std::size_t index = 0; index < std::size(barriers); ++index) {
 				barriers[index].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
 				barriers[index].Transition.pResource = resources[index];
@@ -104,14 +105,17 @@ namespace NeuralRendering
 				                                                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 			}
 			commandList->ResourceBarrier(static_cast<UINT>(std::size(barriers)), barriers);
+			interop.BeginEvaluationTiming(commandList);
 			const bool succeeded = Runtime::Instance().Execute(commandList, eyeIndex,
 				eye.color.resource12.Get(), eye.depth.resource12.Get(), eye.motionVectors.resource12.Get(),
 				eye.output.resource12.Get(), guideWidth, guideHeight,
 				colorWidth, colorHeight, outputWidth, outputHeight,
 				motionVectorScaleX, motionVectorScaleY, tuning, resetPending[eyeIndex] || forceReset);
+			interop.EndEvaluationTiming(commandList);
 			for (auto& barrier : barriers)
 				std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
 			commandList->ResourceBarrier(static_cast<UINT>(std::size(barriers)), barriers);
+			interop.EndTotalTiming(commandList);
 			if (!interop.EndD3D12())
 				return LatchFailure("EndD3D12", interop.LastError());
 			if (!succeeded)
@@ -170,6 +174,7 @@ namespace NeuralRendering
 					eye.color.resource12.Get(), eye.depth.resource12.Get(),
 					eye.motionVectors.resource12.Get(), eye.output.resource12.Get()
 				};
+				interop.BeginTotalTiming(commandList);
 				for (std::size_t index = 0; index < std::size(barriers); ++index) {
 					barriers[index].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
 					barriers[index].Transition.pResource = resources[index];
@@ -179,15 +184,18 @@ namespace NeuralRendering
 					                                                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 				}
 				commandList->ResourceBarrier(static_cast<UINT>(std::size(barriers)), barriers);
+				interop.BeginEvaluationTiming(commandList);
 				const auto& input = inputs[eyeIndex];
 				const bool eyeSucceeded = Runtime::Instance().Execute(commandList, eyeIndex,
 					eye.color.resource12.Get(), eye.depth.resource12.Get(), eye.motionVectors.resource12.Get(),
 					eye.output.resource12.Get(), guideWidth, guideHeight,
 					colorWidth, colorHeight, colorWidth, colorHeight,
 					input.motionVectorScaleX, input.motionVectorScaleY, tuning, resetPending[eyeIndex]);
+				interop.EndEvaluationTiming(commandList);
 				for (auto& barrier : barriers)
 					std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
 				commandList->ResourceBarrier(static_cast<UINT>(std::size(barriers)), barriers);
+				interop.EndTotalTiming(commandList);
 				if (!eyeSucceeded) {
 					succeeded = false;
 					break;
@@ -228,6 +236,12 @@ namespace NeuralRendering
 		}
 
 		[[nodiscard]] bool IsFailureLatched() const { return failureLatched; }
+		[[nodiscard]] double LastEvaluationGpuMs() const { return interop.LastEvaluationGpuMs(); }
+		[[nodiscard]] double LastD3D12TotalGpuMs() const { return interop.LastTotalGpuMs(); }
+		[[nodiscard]] std::uint64_t D3D12TotalTimingSamples() const { return interop.TotalTimingSamples(); }
+		[[nodiscard]] std::uint64_t EvaluationTimingSamples() const { return interop.EvaluationTimingSamples(); }
+		[[nodiscard]] std::uint64_t CpuBackpressureCount() const { return interop.CpuBackpressureCount(); }
+		[[nodiscard]] double LastCpuBackpressureMs() const { return interop.LastCpuBackpressureMs(); }
 
 	private:
 		bool CopyDepthGuide(ID3D11DeviceContext* context, ID3D11ShaderResourceView* source,
@@ -361,6 +375,12 @@ namespace NeuralRendering
 	void Renderer::Reset() { state_->Reset(); }
 	void Renderer::ResetHistory() { state_->ResetHistory(); }
 	bool Renderer::IsFailureLatched() const { return state_->IsFailureLatched(); }
+	double Renderer::LastEvaluationGpuMs() const { return state_->LastEvaluationGpuMs(); }
+	double Renderer::LastD3D12TotalGpuMs() const { return state_->LastD3D12TotalGpuMs(); }
+	std::uint64_t Renderer::D3D12TotalTimingSamples() const { return state_->D3D12TotalTimingSamples(); }
+	std::uint64_t Renderer::EvaluationTimingSamples() const { return state_->EvaluationTimingSamples(); }
+	std::uint64_t Renderer::CpuBackpressureCount() const { return state_->CpuBackpressureCount(); }
+	double Renderer::LastCpuBackpressureMs() const { return state_->LastCpuBackpressureMs(); }
 	std::uint32_t Renderer::NgxResult() const { return Runtime::Instance().NgxResult(); }
 	std::uint64_t Renderer::SuccessfulFrames() const { return Runtime::Instance().SuccessfulFrames(); }
 	const char* Renderer::StatusText() const { return ToString(Runtime::Instance().Status()); }

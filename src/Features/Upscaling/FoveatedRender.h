@@ -29,7 +29,6 @@
 struct FoveatedRender
 {
 	enum class FlatAct1Backend : uint { kBypass, kDLSS, kFSR3 };
-	enum class FlatNrMode : uint { kNR, kNRSR };
 	enum class FlatAct2Backend : uint { kDLSS, kFSR3, kNIS, kFusion, kLanczos };
 
 	struct FlatPipelinePlan
@@ -47,10 +46,10 @@ struct FoveatedRender
 		uint32_t act2OutputWidth = 0;
 		uint32_t act2OutputHeight = 0;
 		FlatAct1Backend act1Backend = FlatAct1Backend::kBypass;
-		FlatNrMode nrMode = FlatNrMode::kNR;
 		FlatAct2Backend act2Backend = FlatAct2Backend::kNIS;
+		uint32_t act2Quality = 1;
 		bool act1Dsr = false;
-		bool nrDsr = false;
+		bool sharpen = false;
 	};
 	// DLSS execution mode for VR
 	enum class DlssMode : uint
@@ -124,11 +123,21 @@ struct FoveatedRender
 		bool neuralRenderingEnabled = false;
 		uint flatPipelineAct1Backend = static_cast<uint>(FlatAct1Backend::kDLSS);
 		uint flatPipelineAct1Quality = 1;
+		uint flatPipelineAct1Preset = 0;
+		uint flatPipelineAct1Jitter = 0;
 		bool flatPipelineAct1Dsr = false;
-		uint flatPipelineNrMode = static_cast<uint>(FlatNrMode::kNR);
-		uint flatPipelineNrQuality = 1;
-		bool flatPipelineNrDsr = false;
+		float flatPipelineNrScale = 0.67f;
 		uint flatPipelineAct2Backend = static_cast<uint>(FlatAct2Backend::kNIS);
+		uint flatPipelineAct2Preset = 0;
+		uint flatPipelineAct2Jitter = 1;
+		uint flatPipelineFusionDirection = 0;
+		uint flatPipelineFusionDenoise = 1;
+		float flatPipelineFusionDenoiseStrength = 0.45f;
+		float flatPipelineFusionSoftness = 0.35f;
+		bool flatPipelineFusionEnhancedGuidance = false;
+		float flatPipelineFusionFrequencyGuidance = 0.65f;
+		float flatPipelineFusionDepthGuidance = 0.75f;
+		float flatPipelineFusionColorGuidance = 0.70f;
 		bool flatPipelineSharpen = false;
 		float flatPipelineSharpness = 0.2f;
 		bool flatAct1Enabled = true;
