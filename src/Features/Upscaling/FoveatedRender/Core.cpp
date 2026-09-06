@@ -13,86 +13,6 @@
 
 namespace FoveatedRenderImpl::Ops
 {
-	namespace
-	{
-		struct DepthCopyConstants
-		{
-			uint32_t sourceOffsetX = 0;
-			uint32_t sourceOffsetY = 0;
-			uint32_t width = 0;
-			uint32_t height = 0;
-		};
-		static_assert(sizeof(DepthCopyConstants) == 16);
-
-		bool EnsureDepthCopyResources()
-		{
-			if (!globals::d3d::device)
-				return false;
-			if (!Core::vrDepthCopyCS.Get(L"Data/Shaders/Upscaling/FoveatedRender/DepthToPerEyeCS.hlsl", {}, "cs_5_0", "main", "FoveatedRender::DepthToPerEyeCS")) {
-				static std::once_flag loggedFailure;
-				std::call_once(loggedFailure, [] { logger::error("[FOVEATED] DepthToPerEyeCS unavailable; depth conversion disabled, the foveated route falls back"); });
-				return false;
-			}
-			if (!Core::vrDepthCopyCB) {
-				try {
-					Core::vrDepthCopyCB = eastl::make_unique<ConstantBuffer>(ConstantBufferDesc<DepthCopyConstants>(), "FoveatedRender::DepthToPerEyeCB");
-				} catch (...) {
-					static std::once_flag loggedFailure;
-					std::call_once(loggedFailure, [] { logger::error("[FOVEATED] Failed to create DepthToPerEye constant buffer"); });
-					return false;
-				}
-			}
-			return true;
-		}
-	}
-
-	bool CopyDepthRegionToTexture(
-		ID3D11ShaderResourceView* sourceSRV,
-		ID3D11UnorderedAccessView* destinationUAV,
-		uint32_t sourceOffsetX,
-		uint32_t sourceOffsetY,
-		uint32_t width,
-		uint32_t height)
-	{
-		auto* context = globals::d3d::context;
-		if (!sourceSRV || !context || !destinationUAV || width == 0 || height == 0 || !EnsureDepthCopyResources())
-			return false;
-
-		winrt::com_ptr<ID3D11Resource> source;
-		sourceSRV->GetResource(source.put());
-		winrt::com_ptr<ID3D11Texture2D> sourceTexture;
-		if (!source || FAILED(source->QueryInterface(IID_PPV_ARGS(sourceTexture.put()))))
-			return false;
-		D3D11_TEXTURE2D_DESC sourceDesc{};
-		sourceTexture->GetDesc(&sourceDesc);
-		if (sourceDesc.ArraySize != 1 || sourceDesc.MipLevels != 1 || sourceDesc.SampleDesc.Count != 1 ||
-			sourceOffsetX > sourceDesc.Width || width > sourceDesc.Width - sourceOffsetX ||
-			sourceOffsetY > sourceDesc.Height || height > sourceDesc.Height - sourceOffsetY)
-			return false;
-
-		const DepthCopyConstants constants{ sourceOffsetX, sourceOffsetY, width, height };
-		Core::vrDepthCopyCB->Update(constants);
-
-		CS_GPU_PASS("FoveatedRender::DepthToPerEye");
-		context->CSSetShader(Core::vrDepthCopyCS.get(), nullptr, 0);
-		ID3D11Buffer* cbs[1]{ Core::vrDepthCopyCB->CB() };
-		context->CSSetConstantBuffers(0, 1, cbs);
-		ID3D11ShaderResourceView* srvs[1]{ sourceSRV };
-		context->CSSetShaderResources(0, 1, srvs);
-		ID3D11UnorderedAccessView* uavs[1]{ destinationUAV };
-		context->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
-		context->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
-
-		ID3D11ShaderResourceView* nullSRV[1]{};
-		ID3D11UnorderedAccessView* nullUAV[1]{};
-		ID3D11Buffer* nullCB[1]{};
-		context->CSSetShaderResources(0, 1, nullSRV);
-		context->CSSetUnorderedAccessViews(0, 1, nullUAV, nullptr);
-		context->CSSetConstantBuffers(0, 1, nullCB);
-		context->CSSetShader(nullptr, nullptr, 0);
-		return true;
-	}
-
 	// Mirrors the StretchCB layout in SubrectStretchCS.hlsl — 8 dims + mode +
 	// blur radius + debug flag + pad. Kept at namespace scope so the create-CB
 	// path can size against sizeof(StretchCB) instead of a magic number.
@@ -104,37 +24,6 @@ namespace FoveatedRenderImpl::Ops
 		uint32_t debugVisualize;
 		uint32_t pad;
 	};
-
-	namespace
-	{
-		eastl::unique_ptr<Texture2D> CreateTypedDepthTexture(uint32_t width, uint32_t height, const std::string& name)
-		{
-			D3D11_TEXTURE2D_DESC depthDesc = {};
-			depthDesc.Width = width;
-			depthDesc.Height = height;
-			depthDesc.MipLevels = 1;
-			depthDesc.ArraySize = 1;
-			depthDesc.Format = DXGI_FORMAT_R32_TYPELESS;
-			depthDesc.SampleDesc.Count = 1;
-			depthDesc.Usage = D3D11_USAGE_DEFAULT;
-			depthDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
-			auto texture = eastl::make_unique<Texture2D>(depthDesc, name.c_str());
-
-			D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
-			srvDesc.Format = DXGI_FORMAT_R32_FLOAT;
-			srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-			srvDesc.Texture2D.MipLevels = 1;
-			texture->CreateSRV(srvDesc);
-
-			D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
-			uavDesc.Format = DXGI_FORMAT_R32_FLOAT;
-			uavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
-			uavDesc.Texture2D.MipSlice = 0;
-			texture->CreateUAV(uavDesc);
-
-			return texture;
-		}
-	}
 
 	eastl::unique_ptr<Texture2D> CreateTextureFromSource(ID3D11Resource* src, uint32_t width, uint32_t height,
 		bool copyBindFlags, bool createSRV, bool createUAV, const char* name)
@@ -191,6 +80,99 @@ namespace FoveatedRenderImpl::Ops
 		return tex;
 	}
 
+	eastl::unique_ptr<Texture2D> CreateLinearDepthTexture(uint32_t width, uint32_t height, const char* name)
+	{
+		D3D11_TEXTURE2D_DESC depthDesc = {};
+		depthDesc.Width = width;
+		depthDesc.Height = height;
+		depthDesc.MipLevels = 1;
+		depthDesc.ArraySize = 1;
+		depthDesc.Format = DXGI_FORMAT_R32_FLOAT;
+		depthDesc.SampleDesc.Count = 1;
+		depthDesc.Usage = D3D11_USAGE_DEFAULT;
+		depthDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+		auto tex = eastl::make_unique<Texture2D>(depthDesc);
+		if (name)
+			Util::SetResourceName(tex->resource.get(), name);
+
+		D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+		srvDesc.Format = DXGI_FORMAT_R32_FLOAT;
+		srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+		srvDesc.Texture2D.MipLevels = 1;
+		tex->CreateSRV(srvDesc);
+
+		D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
+		uavDesc.Format = DXGI_FORMAT_R32_FLOAT;
+		uavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+		tex->CreateUAV(uavDesc);
+		return tex;
+	}
+
+	void EnsureDepthCopyCS()
+	{
+		if (Core::vrDepthCopyCS)
+			return;
+
+		Core::vrDepthCopyCS.attach(static_cast<ID3D11ComputeShader*>(Util::CompileShader(
+			L"Data/Shaders/Upscaling/FoveatedRender/CopyDepthSubrectCS.hlsl", {}, "cs_5_0")));
+		if (!Core::vrDepthCopyCS) {
+			logger::error("[FOVEATED] Failed to compile CopyDepthSubrectCS");
+			return;
+		}
+		Util::SetResourceName(Core::vrDepthCopyCS.get(), "FoveatedRender::CopyDepthSubrectCS");
+
+		D3D11_BUFFER_DESC cbDesc = {};
+		cbDesc.ByteWidth = 32;  // srcX, srcY, dstX, dstY, w, h, pad×2
+		cbDesc.Usage = D3D11_USAGE_DYNAMIC;
+		cbDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+		cbDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+		if (FAILED(globals::d3d::device->CreateBuffer(&cbDesc, nullptr, Core::vrDepthCopyCB.put()))) {
+			logger::error("[FOVEATED] Failed to create CopyDepthSubrect constant buffer");
+			Core::vrDepthCopyCS = nullptr;
+			return;
+		}
+		Util::SetResourceName(Core::vrDepthCopyCB.get(), "FoveatedRender::CopyDepthSubrectCB");
+	}
+
+	bool CopyDepthSubrect(ID3D11ShaderResourceView* srcSRV, ID3D11UnorderedAccessView* dstUAV,
+		uint32_t srcX, uint32_t srcY, uint32_t dstX, uint32_t dstY, uint32_t w, uint32_t h)
+	{
+		EnsureDepthCopyCS();
+		if (!Core::vrDepthCopyCS || !Core::vrDepthCopyCB || !srcSRV || !dstUAV || w == 0 || h == 0) {
+			logger::error("[FOVEATED] CopyDepthSubrect missing CS/CB/views or zero extent");
+			return false;
+		}
+
+		auto context = globals::d3d::context;
+		D3D11_MAPPED_SUBRESOURCE mapped{};
+		if (FAILED(context->Map(Core::vrDepthCopyCB.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+			logger::error("[FOVEATED] CopyDepthSubrect Map(vrDepthCopyCB) failed");
+			return false;
+		}
+		uint32_t cb[8] = { srcX, srcY, dstX, dstY, w, h, 0, 0 };
+		std::memcpy(mapped.pData, cb, sizeof(cb));
+		context->Unmap(Core::vrDepthCopyCB.get(), 0);
+
+		context->CSSetShader(Core::vrDepthCopyCS.get(), nullptr, 0);
+		ID3D11Buffer* cbs[1] = { Core::vrDepthCopyCB.get() };
+		context->CSSetConstantBuffers(0, 1, cbs);
+		ID3D11ShaderResourceView* srvs[1] = { srcSRV };
+		context->CSSetShaderResources(0, 1, srvs);
+		ID3D11UnorderedAccessView* uavs[1] = { dstUAV };
+		context->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
+
+		context->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
+
+		ID3D11ShaderResourceView* nullSRV[1] = { nullptr };
+		ID3D11UnorderedAccessView* nullUAV[1] = { nullptr };
+		ID3D11Buffer* nullCB[1] = { nullptr };
+		context->CSSetShaderResources(0, 1, nullSRV);
+		context->CSSetUnorderedAccessViews(0, 1, nullUAV, nullptr);
+		context->CSSetConstantBuffers(0, 1, nullCB);
+		context->CSSetShader(nullptr, nullptr, 0);
+		return true;
+	}
+
 	void EnsureVRIntermediateTextures(
 		uint32_t inWidth,
 		uint32_t inHeight,
@@ -238,9 +220,7 @@ namespace FoveatedRenderImpl::Ops
 
 			Core::vrIntermediateColorIn[i] = CreateTextureFromSource(colorSrc, inWidth, inHeight, false, true, true, ("FoveatedRender_ColorIn_" + suffix).c_str());
 			Core::vrIntermediateColorOut[i] = CreateTextureFromSource(colorSrc, outWidth, outHeight, false, true, false, ("FoveatedRender_ColorOut_" + suffix).c_str());
-
-			Core::vrIntermediateDepth[i] = CreateTypedDepthTexture(inWidth, inHeight, "FoveatedRender_Depth_" + suffix);
-
+			Core::vrIntermediateDepth[i] = CreateLinearDepthTexture(inWidth, inHeight, ("FoveatedRender_Depth_" + suffix).c_str());
 			Core::vrIntermediateMotionVectors[i] = CreateTextureFromSource(mvecSrc, inWidth, inHeight, false, true, false, ("FoveatedRender_MVec_" + suffix).c_str());
 			if (reactiveSrc)
 				Core::vrIntermediateReactiveMask[i] = CreateTextureFromSource(reactiveSrc, inWidth, inHeight, false, true, false, ("FoveatedRender_Reactive_" + suffix).c_str());
@@ -277,9 +257,7 @@ namespace FoveatedRenderImpl::Ops
 				std::string suffix = (i == 0) ? "Left" : "Right";
 				Core::vrSubrectColorIn[i] = CreateTextureFromSource(colorSrc, subInW, subInH, false, true, true, ("FoveatedRender_Subrect_ColorIn_" + suffix).c_str());
 				Core::vrSubrectColorOut[i] = CreateTextureFromSource(colorSrc, subOutW, subOutH, false, true, false, ("FoveatedRender_Subrect_ColorOut_" + suffix).c_str());
-
-				Core::vrSubrectDepth[i] = CreateTypedDepthTexture(subInW, subInH, "FoveatedRender_Subrect_Depth_" + suffix);
-
+				Core::vrSubrectDepth[i] = CreateLinearDepthTexture(subInW, subInH, ("FoveatedRender_Subrect_Depth_" + suffix).c_str());
 				Core::vrSubrectMotionVectors[i] = CreateTextureFromSource(mvecSrc, subInW, subInH, false, true, false, ("FoveatedRender_Subrect_MVec_" + suffix).c_str());
 				if (reactiveSrc)
 					Core::vrSubrectReactiveMask[i] = CreateTextureFromSource(reactiveSrc, subInW, subInH, false, true, false, ("FoveatedRender_Subrect_Reactive_" + suffix).c_str());
@@ -343,12 +321,8 @@ namespace FoveatedRenderImpl::Ops
 			D3D11_BOX srcBox = { offsetXIn, 0, 0, offsetXIn + eyeWidthIn, eyeHeightIn, 1 };
 
 			context->CopySubresourceRegion(Core::vrIntermediateColorIn[i]->resource.get(), 0, 0, 0, 0, colorSrc, 0, &srcBox);
-			if (!CopyDepthRegionToTexture(depthSRV, Core::vrIntermediateDepth[i]->uav.get(),
-					offsetXIn, 0, eyeWidthIn, eyeHeightIn)) {
-				static std::once_flag loggedFailure;
-				std::call_once(loggedFailure, [] { logger::error("[FOVEATED] Failed to convert native depth for eye"); });
+			if (!CopyDepthSubrect(depthSRV, Core::vrIntermediateDepth[i]->uav.get(), offsetXIn, 0, 0, 0, eyeWidthIn, eyeHeightIn))
 				return false;
-			}
 			context->CopySubresourceRegion(Core::vrIntermediateMotionVectors[i]->resource.get(), 0, 0, 0, 0, mvecSrc, 0, &srcBox);
 			if (transparencySrc)
 				context->CopySubresourceRegion(Core::vrIntermediateTransparencyMask[i]->resource.get(), 0, 0, 0, 0, transparencySrc, 0, &srcBox);
@@ -966,14 +940,14 @@ namespace FoveatedRenderImpl
 		vrSubrectStretchCB = nullptr;
 		vrSubrectStretchSampler = nullptr;
 
-		vrDepthCopyCS.Reset();
-		vrDepthCopyCB = nullptr;
-
 		vrTemporalSmoothCS = nullptr;
 		vrTemporalSmoothCB = nullptr;
 		vrTemporalSmoothSampler = nullptr;
 
 		vrSubrectBlendCS = nullptr;
 		vrSubrectBlendCB = nullptr;
+
+		vrDepthCopyCS = nullptr;
+		vrDepthCopyCB = nullptr;
 	}
 }

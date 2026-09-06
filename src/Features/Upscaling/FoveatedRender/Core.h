@@ -85,10 +85,6 @@ namespace FoveatedRenderImpl
 		static inline winrt::com_ptr<ID3D11Buffer> vrSubrectStretchCB;
 		static inline winrt::com_ptr<ID3D11SamplerState> vrSubrectStretchSampler;
 
-		// Native depth-stencil -> typed per-eye R32_FLOAT conversion
-		static inline Util::LazyShader<ID3D11ComputeShader> vrDepthCopyCS;
-		static inline eastl::unique_ptr<ConstantBuffer> vrDepthCopyCB;
-
 		// Periphery temporal smooth (ping-pong history at render-res SBS)
 		static inline eastl::unique_ptr<Texture2D> vrTemporalHistory[2];   // SRV+UAV ping-pong
 		static inline winrt::com_ptr<ID3D11ShaderResourceView> vrMvecSRV;  // cached SRV on game's mvec resource
@@ -108,6 +104,10 @@ namespace FoveatedRenderImpl
 		static inline winrt::com_ptr<ID3D11Buffer> vrSubrectBlendCB;
 		static inline winrt::com_ptr<ID3D11ShaderResourceView> vrBlendSrcSRV;
 		static inline ID3D11Resource* vrBlendSrcSRVOwner = nullptr;
+
+		// Depth copy CS: R24_UNORM SRV → R32_FLOAT UAV with independent src/dst offsets
+		static inline winrt::com_ptr<ID3D11ComputeShader> vrDepthCopyCS;
+		static inline winrt::com_ptr<ID3D11Buffer> vrDepthCopyCB;
 
 		// Subrect UV hash for resource recreation detection
 		static inline uint64_t activeSubrectUVHash = 0;

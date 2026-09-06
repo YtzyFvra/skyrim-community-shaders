@@ -150,6 +150,13 @@ namespace FoveatedRenderImpl
 
 		// Crop subrect per-eye from mask-cleared snapshot (not kMAIN which was overwritten by stretch)
 		auto context = globals::d3d::context;
+		auto* depthSRV = globals::game::renderer->GetDepthStencilData()
+		                     .depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kMAIN]
+		                     .depthSRV;
+		if (!depthSRV) {
+			logger::error("[FOVEATED] ExecuteDefaultMode missing kMAIN depth SRV — falling back");
+			return false;
+		}
 		for (uint32_t i = 0; i < 2; ++i) {
 			const auto& uv = *eyeUVs[i];
 			// Per-eye sizing — right eye uses rightUV.w/h, not leftUV.
@@ -164,10 +171,8 @@ namespace FoveatedRenderImpl
 			D3D11_BOX sbsCrop = { sbsX, cropY, 0, sbsX + subInW, cropY + subInH, 1 };
 
 			context->CopySubresourceRegion(Core::vrSubrectColorIn[i]->resource.get(), 0, 0, 0, 0, Core::vrRenderSBS->resource.get(), 0, &sbsCrop);
-			if (!CopyDepthRegionToTexture(p.depthSRV, Core::vrSubrectDepth[i]->uav.get(),
-					sbsX, cropY, subInW, subInH)) {
-				static std::once_flag loggedFailure;
-				std::call_once(loggedFailure, [] { logger::error("[FOVEATED] Failed to convert native depth for subrect eye"); });
+			if (!CopyDepthSubrect(depthSRV, Core::vrSubrectDepth[i]->uav.get(), sbsX, cropY, 0, 0, subInW, subInH)) {
+				logger::error("[FOVEATED] ExecuteDefaultMode depth subrect copy failed for eye {} — falling back", i);
 				return false;
 			}
 			context->CopySubresourceRegion(Core::vrSubrectMotionVectors[i]->resource.get(), 0, 0, 0, 0, p.motionVectors, 0, &sbsCrop);
