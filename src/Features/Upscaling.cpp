@@ -47,6 +47,11 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	sharpnessEnabledDLSS,
 	sharpnessDLSS,
 	presetDLSS,
+	flatAct1ResControl,
+	flatDlssInputIsolation,
+	flatDlssPostInject,
+	flatAct1JitterMode,
+	flatAct2JitterMode,
 	reflexLowLatencyMode,
 	reflexLowLatencyBoost,
 	reflexUseMarkersToOptimize,
@@ -1122,6 +1127,9 @@ void Upscaling::LoadSettings(json& o_json)
 		logger::warn("[Upscaling] Loaded qualityMode {} out of range, clamping to 4", settings.qualityMode);
 		settings.qualityMode = 4;
 	}
+	settings.flatAct1ResControl = std::min(settings.flatAct1ResControl, 2u);
+	settings.flatAct1JitterMode = std::min(settings.flatAct1JitterMode, 1u);
+	settings.flatAct2JitterMode = std::min(settings.flatAct2JitterMode, 1u);
 	if (settings.presetDLSS > 4) {
 		logger::warn("[Upscaling] Loaded presetDLSS {} out of range, resetting to 0 (Default)", settings.presetDLSS);
 		settings.presetDLSS = 0;
@@ -2010,18 +2018,27 @@ void Upscaling::ConfigureUpscaling(RE::BSGraphics::State* a_viewport)
 
 			a_viewport->projectionPosScaleY = 2.0f * jitter.y / static_cast<int>(perfMode.GetRenderEyeHeight());
 		} else {
-			// Boot qualityMode under PerfMode so projection stays coherent
-			// with the engine RTs sized at install.
-			const uint32_t qm = globals::features::upscaling.perfMode.IsHookActive() ? bootSnapshot.Boot(&Settings::qualityMode) : settings.qualityMode;
-			float resolutionScaleBase = 1.0f / GetQualityModeRatio(qm);
-
-			auto renderWidth = static_cast<int>(screenWidth * resolutionScaleBase);
-			auto renderHeight = static_cast<int>(screenHeight * resolutionScaleBase);
+			const bool flatPipeline = IsFlatDlssPostInjectActive();
+			const auto plan = foveatedRender.BuildFlatPipelinePlan(screenWidth, screenHeight);
+			const uint32_t qm = globals::features::upscaling.perfMode.IsHookActive() ?
+				bootSnapshot.Boot(&Settings::qualityMode) : settings.qualityMode;
+			auto renderWidth = flatPipeline ? static_cast<int>(plan.engineWidth) :
+				static_cast<int>(std::lround(screenWidth / GetQualityModeRatio(qm)));
+			auto renderHeight = flatPipeline ? static_cast<int>(plan.engineHeight) :
+				static_cast<int>(std::lround(screenHeight / GetQualityModeRatio(qm)));
 
 			resolutionScale.x = static_cast<float>(renderWidth) / static_cast<float>(screenWidth);
 			resolutionScale.y = static_cast<float>(renderHeight) / static_cast<float>(screenHeight);
 
-			auto phaseCount = GetJitterPhaseCount(renderWidth, screenWidth);
+			int phaseCount = GetJitterPhaseCount(renderWidth, screenWidth);
+			if (flatPipeline) {
+				if (plan.act1Backend != FoveatedRender::FlatAct1Backend::kBypass)
+					phaseCount = std::max(phaseCount, GetJitterPhaseCount(plan.engineWidth, plan.act1OutputWidth));
+				if (plan.nrMode == FoveatedRender::FlatNrMode::kNR &&
+					(plan.act2Backend == FoveatedRender::FlatAct2Backend::kDLSS ||
+						plan.act2Backend == FoveatedRender::FlatAct2Backend::kFSR3))
+					phaseCount = std::max(phaseCount, GetJitterPhaseCount(plan.nrWidth, plan.act2OutputWidth));
+			}
 
 			GetJitterOffset(&jitter.x, &jitter.y, state->frameCount, phaseCount);
 			// Loading screens reset the upscaler every frame; unintegrated jitter only wobbles the image.
@@ -2500,6 +2517,21 @@ bool Upscaling::UsesDLSSGFrameGen() const
 	return d3d12SwapChainActive && dx12SwapChain.useDLSSG;
 }
 
+bool Upscaling::IsFlatDlssPostInjectActive() const
+{
+	const bool hdrConfigured = globals::features::hdrDisplay.loaded &&
+		globals::features::hdrDisplay.settings.enableHDR;
+	return !globals::game::isVR && GetUpscaleMethod() == UpscaleMethod::kDLSS &&
+		foveatedRender.settings.neuralRenderingEnabled &&
+		!IsFrameGenerationConfiguredForSession() && !hdrConfigured;
+}
+
+bool Upscaling::IsFlatAct1BypassActive() const
+{
+	return IsFlatDlssPostInjectActive() &&
+		foveatedRender.settings.flatPipelineAct1Backend == static_cast<uint>(FoveatedRender::FlatAct1Backend::kBypass);
+}
+
 uint Upscaling::GetFrameGenerationMultiplier() const
 {
 	if (!UsesDLSSGFrameGen())
@@ -2519,6 +2551,35 @@ json Upscaling::GetDiagnostics()
 	                                                                   "None";
 	diagnostics["frameGenActive"] = IsFrameGenerationActive();
 	diagnostics["frameGenMultiplier"] = GetFrameGenerationMultiplier();
+	if (!globals::game::isVR) {
+		const bool postInject = bootSnapshot.Boot(&Settings::flatDlssPostInject);
+		const uint32_t act1Mode = postInject ? 0u : bootSnapshot.Boot(&Settings::flatAct1ResControl);
+		const auto& nr = foveatedRender.settings;
+		const char* act2Mode = "FullNR";
+		if (nr.neuralRenderingHalfResolution) {
+			switch (nr.neuralRenderingOutputMode) {
+			case 0: act2Mode = "ReducedFusion"; break;
+			case 1: act2Mode = "ReducedNIS"; break;
+			case 2: act2Mode = "ReducedDLSS"; break;
+			case 3: act2Mode = "ReducedFSR3"; break;
+			default: break;
+			}
+		}
+		const float nrWorkingScale = nr.neuralRenderingWorkingScale == 1 ? 2.0f / 3.0f :
+			(nr.neuralRenderingWorkingScale == 2 ? 0.77f : 0.5f);
+		diagnostics["flatPipeline"] = {
+			{ "injectPoint", postInject ? "PostInjectLDR" : "PrePostHDR" },
+			{ "postInjectActive", IsFlatDlssPostInjectActive() },
+			{ "act1Mode", act1Mode },
+			{ "act2Mode", act2Mode },
+			{ "nrEnabled", nr.neuralRenderingEnabled },
+			{ "nrWorkingScale", nrWorkingScale },
+			{ "renderWidth", lastDlssRenderWidth },
+			{ "renderHeight", lastDlssRenderHeight },
+			{ "displayWidth", globals::state ? static_cast<uint32_t>(globals::state->screenSize.x) : 0u },
+			{ "displayHeight", globals::state ? static_cast<uint32_t>(globals::state->screenSize.y) : 0u },
+		};
+	}
 	if (method == FrameGenMethod::kDLSSG) {
 		diagnostics["dlssgStatus"] = std::string(magic_enum::enum_name(streamlineDX12.lastDLSSGStatus));
 		diagnostics["dlssgFramesPresentedLastQuery"] = streamlineDX12.lastDLSSGFramesPresented;
@@ -2663,6 +2724,10 @@ void Upscaling::Upscale()
 			EnsureVRIntermediateTextures();
 
 		auto renderSize = Util::ConvertToDynamic(globals::state->screenSize);
+		if (!globals::game::isVR) {
+			lastDlssRenderWidth = static_cast<uint32_t>(std::lround(renderSize.x));
+			lastDlssRenderHeight = static_cast<uint32_t>(std::lround(renderSize.y));
+		}
 		uint32_t numEyes = globals::game::isVR ? 2 : 1;
 		uint32_t eyeRenderWidth = (uint32_t)(renderSize.x / numEyes);
 		uint32_t eyeRenderHeight = (uint32_t)renderSize.y;
@@ -2766,6 +2831,9 @@ void Upscaling::Upscale()
 				streamline.DestroyDLSSResources();
 			}
 
+			if (IsFlatDlssPostInjectActive() || IsFlatAct1BypassActive())
+				return;
+
 			const bool routeHandled = tryFoveatedRoute(
 				Util::AsReal(globals::game::renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kMAIN].texture), "DLSS");
 			FoveatedRenderImpl::Bridge::routeHandledThisFrame = routeHandled;
@@ -2796,7 +2864,8 @@ void Upscaling::PerformUpscaling()
 {
 	CS_GPU_PASS("Upscaling::PerformUpscaling");
 	Upscale();
-	UpscaleDepth();
+	if (!IsFlatDlssPostInjectActive() && !IsFlatAct1BypassActive())
+		UpscaleDepth();
 
 	auto& runtimeData = globals::game::graphicsState->GetRuntimeData();
 
@@ -3200,7 +3269,9 @@ void Upscaling::Main_PostProcessing::thunk(RE::ImageSpaceManager* a_this, uint32
 		upscaling.UpscaleDepth();
 	}
 
-	if (upscaleMethod == UpscaleMethod::kDLSS) {
+	if (upscaleMethod == UpscaleMethod::kDLSS && !upscaling.IsFlatDlssPostInjectActive() &&
+		!upscaling.IsFlatAct1BypassActive() &&
+		(globals::game::isVR || !upscaling.foveatedRender.settings.neuralRenderingEnabled)) {
 		// FoveatedRender's DLSS output doesn't land in sharpenerTexture the
 		// way dev's path does (the route writes to its own per-eye intermediates
 		// and copies back to kMAIN/testTexture), so dev's zero-copy

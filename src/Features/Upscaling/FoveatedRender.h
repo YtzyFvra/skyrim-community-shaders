@@ -28,6 +28,30 @@
 
 struct FoveatedRender
 {
+	enum class FlatAct1Backend : uint { kBypass, kDLSS, kFSR3 };
+	enum class FlatNrMode : uint { kNR, kNRSR };
+	enum class FlatAct2Backend : uint { kDLSS, kFSR3, kNIS, kFusion, kLanczos };
+
+	struct FlatPipelinePlan
+	{
+		uint32_t displayWidth = 0;
+		uint32_t displayHeight = 0;
+		uint32_t engineWidth = 0;
+		uint32_t engineHeight = 0;
+		uint32_t act1OutputWidth = 0;
+		uint32_t act1OutputHeight = 0;
+		uint32_t nrWidth = 0;
+		uint32_t nrHeight = 0;
+		uint32_t nrOutputWidth = 0;
+		uint32_t nrOutputHeight = 0;
+		uint32_t act2OutputWidth = 0;
+		uint32_t act2OutputHeight = 0;
+		FlatAct1Backend act1Backend = FlatAct1Backend::kBypass;
+		FlatNrMode nrMode = FlatNrMode::kNR;
+		FlatAct2Backend act2Backend = FlatAct2Backend::kNIS;
+		bool act1Dsr = false;
+		bool nrDsr = false;
+	};
 	// DLSS execution mode for VR
 	enum class DlssMode : uint
 	{
@@ -98,6 +122,22 @@ struct FoveatedRender
 		float subrectFalloffCurve = 1.0f;
 		float subrectDitherStrength = 1.0f;
 		bool neuralRenderingEnabled = false;
+		uint flatPipelineAct1Backend = static_cast<uint>(FlatAct1Backend::kDLSS);
+		uint flatPipelineAct1Quality = 1;
+		bool flatPipelineAct1Dsr = false;
+		uint flatPipelineNrMode = static_cast<uint>(FlatNrMode::kNR);
+		uint flatPipelineNrQuality = 1;
+		bool flatPipelineNrDsr = false;
+		uint flatPipelineAct2Backend = static_cast<uint>(FlatAct2Backend::kNIS);
+		bool flatPipelineSharpen = false;
+		float flatPipelineSharpness = 0.2f;
+		bool flatAct1Enabled = true;
+		uint flatAct1QualityMode = 1;
+		uint flatAct1Preset = 0;
+		float flatAct1Sharpness = 0.0f;
+		uint flatAct2QualityMode = 1;
+		uint flatAct2Preset = 0;
+		float flatAct2Sharpness = 0.0f;
 		uint neuralRenderingPreset = 3;
 		float neuralRenderingIntensity = 0.8f;
 		float neuralRenderingLocalTone = 0.75f;
@@ -106,6 +146,19 @@ struct FoveatedRender
 		uint neuralRenderingStyle = 3;
 		bool neuralRenderingAutoMask = true;
 		bool neuralRenderingUICorrection = false;
+		bool neuralRenderingBypassOutput = false;
+		bool neuralRenderingResetEveryFrame = false;
+		uint neuralRenderingInputPrefilter = 0;
+		uint neuralRenderingMotionVectorMode = 0;
+		bool neuralRenderingHalfResolution = true;
+		uint neuralRenderingWorkingScale = 0;
+		uint neuralRenderingOutputMode = 0;
+		float neuralRenderingNisSharpness = 0.35f;
+		uint neuralRenderingFusionPreset = 2;
+		float neuralRenderingFusionLuma = 0.85f;
+		float neuralRenderingFusionChroma = 0.65f;
+		float neuralRenderingFusionEdgeProtection = 0.25f;
+		float neuralRenderingFusionResidualLimit = 0.16f;
 	};
 
 	inline static constexpr Util::Settings::RestartTable<Settings, 1> kRestartFields{ {
@@ -131,6 +184,8 @@ struct FoveatedRender
 	// BeginDisabled when settings.enabled == 0).
 	void DrawEnable();
 	void DrawSettings();
+	void DrawNeuralRenderingSettings();
+	FlatPipelinePlan BuildFlatPipelinePlan(uint32_t displayWidth, uint32_t displayHeight) const;
 	// Called from Upscaling::SaveSettings / LoadSettings to round-trip JSON.
 	void SaveSettings(json& o_json);
 	void LoadSettings(const json& o_json);

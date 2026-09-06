@@ -61,13 +61,15 @@ namespace NeuralRendering
 		};
 
 		bool Apply(ID3D11Device* device, ID3D11DeviceContext* context, std::uint32_t eyeIndex,
-			ID3D11Resource* color, ID3D11Resource* depth, ID3D11ShaderResourceView* depthSRV,
+			ID3D11Resource* color, ID3D11Resource* output,
+			ID3D11Resource* depth, ID3D11ShaderResourceView* depthSRV,
 			ID3D11Resource* motionVectors,
 			std::uint32_t guideWidth, std::uint32_t guideHeight,
 			std::uint32_t colorWidth, std::uint32_t colorHeight,
-			float motionVectorScaleX, float motionVectorScaleY, const Tuning& tuning)
+			std::uint32_t outputWidth, std::uint32_t outputHeight,
+			float motionVectorScaleX, float motionVectorScaleY, const Tuning& tuning, bool forceReset)
 		{
-			if (failureLatched || !device || !context || eyeIndex >= eyes.size() || !color || !depth || !depthSRV || !motionVectors)
+			if (failureLatched || !device || !context || eyeIndex >= eyes.size() || !color || !output || !depth || !depthSRV || !motionVectors)
 				return false;
 			CS_GPU_PASS("NeuralRendering::Evaluate");
 
@@ -75,7 +77,8 @@ namespace NeuralRendering
 				return false;
 			if (Runtime::Instance().Status() != RuntimeStatus::Initialized && !InitializeRuntime())
 				return false;
-			if (!EnsureResources(eyeIndex, color, depth, motionVectors, guideWidth, guideHeight, colorWidth, colorHeight))
+			if (!EnsureResources(eyeIndex, color, depth, motionVectors, guideWidth, guideHeight,
+					colorWidth, colorHeight, outputWidth, outputHeight))
 				return LatchFailure("shared resource creation", interop.LastError());
 
 			auto& eye = eyes[eyeIndex];
@@ -103,8 +106,9 @@ namespace NeuralRendering
 			commandList->ResourceBarrier(static_cast<UINT>(std::size(barriers)), barriers);
 			const bool succeeded = Runtime::Instance().Execute(commandList, eyeIndex,
 				eye.color.resource12.Get(), eye.depth.resource12.Get(), eye.motionVectors.resource12.Get(),
-				eye.output.resource12.Get(), guideWidth, guideHeight, colorWidth, colorHeight,
-				motionVectorScaleX, motionVectorScaleY, tuning, resetPending[eyeIndex]);
+				eye.output.resource12.Get(), guideWidth, guideHeight,
+				colorWidth, colorHeight, outputWidth, outputHeight,
+				motionVectorScaleX, motionVectorScaleY, tuning, resetPending[eyeIndex] || forceReset);
 			for (auto& barrier : barriers)
 				std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
 			commandList->ResourceBarrier(static_cast<UINT>(std::size(barriers)), barriers);
@@ -113,7 +117,7 @@ namespace NeuralRendering
 			if (!succeeded)
 				return LatchFailure("Feature 18", static_cast<HRESULT>(Runtime::Instance().NgxResult()));
 
-			context->CopyResource(color, eye.output.resource11.Get());
+			context->CopyResource(output, eye.output.resource11.Get());
 			resetPending[eyeIndex] = false;
 			return true;
 		}
@@ -140,7 +144,7 @@ namespace NeuralRendering
 				if (!input.depth || !input.depthSRV || !input.motionVectors)
 					return false;
 				if (!EnsureResources(eyeIndex, color, input.depth, input.motionVectors,
-						guideWidth, guideHeight, colorWidth, colorHeight))
+						guideWidth, guideHeight, colorWidth, colorHeight, colorWidth, colorHeight))
 					return LatchFailure("shared resource creation", interop.LastError());
 
 				D3D11_BOX sourceBox{
@@ -178,7 +182,8 @@ namespace NeuralRendering
 				const auto& input = inputs[eyeIndex];
 				const bool eyeSucceeded = Runtime::Instance().Execute(commandList, eyeIndex,
 					eye.color.resource12.Get(), eye.depth.resource12.Get(), eye.motionVectors.resource12.Get(),
-					eye.output.resource12.Get(), guideWidth, guideHeight, colorWidth, colorHeight,
+					eye.output.resource12.Get(), guideWidth, guideHeight,
+					colorWidth, colorHeight, colorWidth, colorHeight,
 					input.motionVectorScaleX, input.motionVectorScaleY, tuning, resetPending[eyeIndex]);
 				for (auto& barrier : barriers)
 					std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
@@ -268,7 +273,8 @@ namespace NeuralRendering
 
 		bool EnsureResources(std::uint32_t eyeIndex, ID3D11Resource* color, ID3D11Resource* depth,
 			ID3D11Resource* motionVectors, std::uint32_t guideWidth, std::uint32_t guideHeight,
-			std::uint32_t colorWidth, std::uint32_t colorHeight)
+			std::uint32_t colorWidth, std::uint32_t colorHeight,
+			std::uint32_t outputWidth, std::uint32_t outputHeight)
 		{
 			D3D11_TEXTURE2D_DESC colorSource{}, depthSource{}, motionSource{};
 			if (!GetTextureDesc(color, colorSource) || !GetTextureDesc(depth, depthSource) ||
@@ -276,7 +282,7 @@ namespace NeuralRendering
 				return false;
 			const UINT sharedFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
 			auto colorDesc = MakeSharedDesc(colorSource, colorWidth, colorHeight, sharedFlags);
-			auto outputDesc = MakeSharedDesc(colorSource, colorWidth, colorHeight, D3D11_BIND_UNORDERED_ACCESS);
+			auto outputDesc = MakeSharedDesc(colorSource, outputWidth, outputHeight, D3D11_BIND_UNORDERED_ACCESS);
 			auto depthDesc = MakeSharedDesc(depthSource, guideWidth, guideHeight, sharedFlags);
 			depthDesc.Format = DXGI_FORMAT_R32_FLOAT;
 			auto motionDesc = MakeSharedDesc(motionSource, guideWidth, guideHeight, sharedFlags);
@@ -323,10 +329,24 @@ namespace NeuralRendering
 		ID3D11Resource* color, ID3D11Resource* depth, ID3D11ShaderResourceView* depthSRV,
 		ID3D11Resource* motionVectors,
 		std::uint32_t guideWidth, std::uint32_t guideHeight, std::uint32_t colorWidth, std::uint32_t colorHeight,
-		float motionVectorScaleX, float motionVectorScaleY, const Tuning& tuning)
+		float motionVectorScaleX, float motionVectorScaleY, const Tuning& tuning, bool forceReset)
 	{
-		return state_->Apply(device, context, eyeIndex, color, depth, depthSRV, motionVectors,
-			guideWidth, guideHeight, colorWidth, colorHeight, motionVectorScaleX, motionVectorScaleY, tuning);
+		return state_->Apply(device, context, eyeIndex, color, color, depth, depthSRV, motionVectors,
+			guideWidth, guideHeight, colorWidth, colorHeight, colorWidth, colorHeight,
+			motionVectorScaleX, motionVectorScaleY, tuning, forceReset);
+	}
+
+	bool Renderer::ApplyToOutput(ID3D11Device* device, ID3D11DeviceContext* context, std::uint32_t eyeIndex,
+		ID3D11Resource* color, ID3D11Resource* output,
+		ID3D11Resource* depth, ID3D11ShaderResourceView* depthSRV, ID3D11Resource* motionVectors,
+		std::uint32_t guideWidth, std::uint32_t guideHeight,
+		std::uint32_t colorWidth, std::uint32_t colorHeight,
+		std::uint32_t outputWidth, std::uint32_t outputHeight,
+		float motionVectorScaleX, float motionVectorScaleY, const Tuning& tuning, bool forceReset)
+	{
+		return state_->Apply(device, context, eyeIndex, color, output, depth, depthSRV, motionVectors,
+			guideWidth, guideHeight, colorWidth, colorHeight, outputWidth, outputHeight,
+			motionVectorScaleX, motionVectorScaleY, tuning, forceReset);
 	}
 
 	bool Renderer::ApplyStereo(ID3D11Device* device, ID3D11DeviceContext* context, ID3D11Resource* color,

@@ -37,7 +37,16 @@ namespace NeuralRendering
 			ID3D11Resource* motionVectors,
 			std::uint32_t guideWidth, std::uint32_t guideHeight,
 			std::uint32_t colorWidth, std::uint32_t colorHeight,
-			float motionVectorScaleX, float motionVectorScaleY, const Tuning& tuning);
+			float motionVectorScaleX, float motionVectorScaleY, const Tuning& tuning,
+			bool forceReset = false);
+		bool ApplyToOutput(ID3D11Device* device, ID3D11DeviceContext* context, std::uint32_t eyeIndex,
+			ID3D11Resource* color, ID3D11Resource* output,
+			ID3D11Resource* depth, ID3D11ShaderResourceView* depthSRV, ID3D11Resource* motionVectors,
+			std::uint32_t guideWidth, std::uint32_t guideHeight,
+			std::uint32_t colorWidth, std::uint32_t colorHeight,
+			std::uint32_t outputWidth, std::uint32_t outputHeight,
+			float motionVectorScaleX, float motionVectorScaleY, const Tuning& tuning,
+			bool forceReset = false);
 		bool ApplyStereo(ID3D11Device* device, ID3D11DeviceContext* context, ID3D11Resource* color,
 			const std::array<StereoEyeInput, 2>& eyes,
 			std::uint32_t guideWidth, std::uint32_t guideHeight,

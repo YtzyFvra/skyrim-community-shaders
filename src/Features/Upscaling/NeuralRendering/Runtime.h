@@ -19,6 +19,9 @@ namespace NeuralRendering
 		std::uint32_t style = 3;
 		bool useAutoMask = true;
 		bool uiCorrection = false;
+		float jitterOffsetX = 0.0f;
+		float jitterOffsetY = 0.0f;
+		bool motionVectorsJittered = false;
 	};
 
 	enum class RuntimeStatus
@@ -39,7 +42,9 @@ namespace NeuralRendering
 		bool Initialize(ID3D12Device* device, const std::filesystem::path& dataPath = {});
 		bool Execute(ID3D12GraphicsCommandList* commandList, std::uint32_t slot,
 			ID3D12Resource* color, ID3D12Resource* depth, ID3D12Resource* motionVectors, ID3D12Resource* output,
-			std::uint32_t inputWidth, std::uint32_t inputHeight, std::uint32_t outputWidth, std::uint32_t outputHeight,
+			std::uint32_t inputWidth, std::uint32_t inputHeight,
+			std::uint32_t colorWidth, std::uint32_t colorHeight,
+			std::uint32_t outputWidth, std::uint32_t outputHeight,
 			float motionVectorScaleX, float motionVectorScaleY, const Tuning& tuning, bool reset);
 		void ResetFeature(std::uint32_t slot);
 		void ResetFeatures();
@@ -60,6 +65,8 @@ namespace NeuralRendering
 		void* featureHandles_[2]{};
 		std::uint32_t featureInputWidth_[2]{};
 		std::uint32_t featureInputHeight_[2]{};
+		std::uint32_t featureColorWidth_[2]{};
+		std::uint32_t featureColorHeight_[2]{};
 		std::uint32_t featureOutputWidth_[2]{};
 		std::uint32_t featureOutputHeight_[2]{};
 		ID3D12Device* device_ = nullptr;

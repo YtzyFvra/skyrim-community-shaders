@@ -2,6 +2,7 @@
 
 #include "../../Buffer.h"
 #include "../../State.h"
+#include "../../Utils/LazyShader.h"
 
 #include <cstdint>
 #include <d3d11_4.h>
@@ -56,6 +57,8 @@ public:
 
 	sl::ViewportHandle viewport{ 0 };
 	sl::ViewportHandle viewportRight{ 1 };
+	sl::ViewportHandle flatPostInjectViewport{ 2 };
+	sl::ViewportHandle flatAct2Viewport{ 3 };
 	static constexpr uint32_t MAX_RESOLUTION = 8192;
 	HMODULE interposer = NULL;
 
@@ -108,6 +111,26 @@ public:
 		{ UINT32_MAX, UINT32_MAX }
 	};
 
+	bool EnsureFlatAct1Resources(ID3D11Resource* source, uint32_t outputWidth, uint32_t outputHeight);
+	bool ResolveFlatAct1(ID3D11DeviceContext* context, ID3D11UnorderedAccessView* destination,
+		uint32_t destinationWidth, uint32_t destinationHeight);
+	void ResetFlatAct1Resources();
+	bool PrepareFlatInputIsolation(ID3D11DeviceContext* context,
+		ID3D11Resource* color, ID3D11ShaderResourceView* depthSRV, ID3D11Resource* motionVectors,
+		ID3D11Resource* reactiveMask, ID3D11Resource* transparencyMask,
+		uint32_t renderWidth, uint32_t renderHeight);
+	winrt::com_ptr<ID3D11Texture2D> flatAct1Overshoot;
+	winrt::com_ptr<ID3D11ShaderResourceView> flatAct1OvershootSRV;
+	winrt::com_ptr<ID3D11UnorderedAccessView> flatAct1OvershootUAV;
+	Util::LazyShader<ID3D11ComputeShader> flatAct1ResolveCS;
+	winrt::com_ptr<ID3D11Buffer> flatAct1ResolveCB;
+	eastl::unique_ptr<Texture2D> flatIsolatedColor;
+	eastl::unique_ptr<Texture2D> flatIsolatedDepth;
+	eastl::unique_ptr<Texture2D> flatIsolatedMotionVectors;
+	eastl::unique_ptr<Texture2D> flatIsolatedReactiveMask;
+	eastl::unique_ptr<Texture2D> flatIsolatedTransparencyMask;
+	Util::LazyShader<ID3D11ComputeShader> flatIsolatedDepthCopyCS;
+
 	struct ReflexOptionsCache
 	{
 		bool valid = false;
@@ -117,6 +140,11 @@ public:
 	};
 	ReflexOptionsCache reflexOptionsCache{};
 	uint32_t lastReflexSleepFrame = UINT32_MAX;
+	uint32_t lastFlatAct1JitterMode = UINT32_MAX;
+	uint64_t flatAct1SuccessfulFrames = 0;
+	uint64_t flatAct1FailedFrames = 0;
+	uint64_t flatAct2SuccessfulFrames = 0;
+	uint64_t flatAct2FailedFrames = 0;
 
 	/**
 	 * @brief Rate-limits DLSS problem logs to one per kProblemLogIntervalFrames frames, per kind and eye.
@@ -139,7 +167,11 @@ public:
 		ID3D11Resource* colorIn, ID3D11Resource* colorOut, ID3D11Resource* depth,
 		ID3D11Resource* mvec, ID3D11Resource* reactiveMask, ID3D11Resource* transparencyMask,
 		const sl::Extent& extentIn, const sl::Extent& extentOut, uint32_t outputWidth,
-		uint32_t outputHeight = 0);
+		uint32_t outputHeight = 0, std::optional<sl::DLSSMode> modeOverride = std::nullopt,
+		std::optional<bool> hdrOverride = std::nullopt, bool forceReset = false,
+		bool forceZeroJitter = false, float jitterScaleX = 1.0f, float jitterScaleY = 1.0f,
+		std::optional<uint32_t> presetOverride = std::nullopt,
+		std::optional<float> sharpnessOverride = std::nullopt);
 
 	// Cached DLL version info for Streamline plugin directory
 	static std::vector<std::pair<std::string, std::string>> dllVersions;
@@ -190,11 +222,17 @@ public:
 
 	/** @brief Acquires a new frame token from Streamline for the current frame. */
 	bool EnsureFrameToken();
-	bool CheckFrameConstants(sl::ViewportHandle p_viewport, uint32_t eyeIndex = 0);
+	bool CheckFrameConstants(sl::ViewportHandle p_viewport, uint32_t eyeIndex = 0,
+		bool forceReset = false, bool forceZeroJitter = false,
+		float jitterScaleX = 1.0f, float jitterScaleY = 1.0f);
 
 	// height = 0 -> use full per-eye DisplayRes height (default for the standard
 	// upscale path). Non-zero is the subrect height the FoveatedRender route needs.
-	void SetDLSSOptions(sl::ViewportHandle p_viewport, uint32_t width, uint32_t height = 0);
+	void SetDLSSOptions(sl::ViewportHandle p_viewport, uint32_t width, uint32_t height = 0,
+		std::optional<sl::DLSSMode> modeOverride = std::nullopt,
+		std::optional<bool> hdrOverride = std::nullopt,
+		std::optional<uint32_t> presetOverride = std::nullopt,
+		std::optional<float> sharpnessOverride = std::nullopt);
 
 	/** @brief Maps an Upscaling quality mode (0-4) to the corresponding sl::DLSSMode. */
 	static sl::DLSSMode DLSSModeForQualityMode(uint32_t a_qualityMode);

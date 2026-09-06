@@ -29,6 +29,22 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	subrectFalloffCurve,
 	subrectDitherStrength,
 	neuralRenderingEnabled,
+	flatPipelineAct1Backend,
+	flatPipelineAct1Quality,
+	flatPipelineAct1Dsr,
+	flatPipelineNrMode,
+	flatPipelineNrQuality,
+	flatPipelineNrDsr,
+	flatPipelineAct2Backend,
+	flatPipelineSharpen,
+	flatPipelineSharpness,
+	flatAct1Enabled,
+	flatAct1QualityMode,
+	flatAct1Preset,
+	flatAct1Sharpness,
+	flatAct2QualityMode,
+	flatAct2Preset,
+	flatAct2Sharpness,
 	neuralRenderingPreset,
 	neuralRenderingIntensity,
 	neuralRenderingLocalTone,
@@ -36,7 +52,20 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	neuralRenderingSkinStructure,
 	neuralRenderingStyle,
 	neuralRenderingAutoMask,
-	neuralRenderingUICorrection);
+	neuralRenderingUICorrection,
+	neuralRenderingBypassOutput,
+	neuralRenderingResetEveryFrame,
+	neuralRenderingInputPrefilter,
+	neuralRenderingMotionVectorMode,
+	neuralRenderingHalfResolution,
+	neuralRenderingWorkingScale,
+	neuralRenderingOutputMode,
+	neuralRenderingNisSharpness,
+	neuralRenderingFusionPreset,
+	neuralRenderingFusionLuma,
+	neuralRenderingFusionChroma,
+	neuralRenderingFusionEdgeProtection,
+	neuralRenderingFusionResidualLimit);
 
 // ============================================================================
 // Lifecycle
@@ -132,17 +161,89 @@ void FoveatedRender::ClampSettings()
 	settings.subrectFalloffCurve = std::clamp(settings.subrectFalloffCurve, 0.5f, 2.0f);
 	settings.subrectDitherStrength = std::clamp(settings.subrectDitherStrength, 0.0f, 2.0f);
 	settings.neuralRenderingPreset = std::min(settings.neuralRenderingPreset, 4u);
+	settings.flatPipelineAct1Backend = std::min(settings.flatPipelineAct1Backend, 2u);
+	settings.flatPipelineAct1Quality = std::min(settings.flatPipelineAct1Quality, 4u);
+	settings.flatPipelineNrMode = std::min(settings.flatPipelineNrMode, 1u);
+	settings.flatPipelineNrQuality = std::min(settings.flatPipelineNrQuality, 4u);
+	settings.flatPipelineAct2Backend = std::min(settings.flatPipelineAct2Backend, 4u);
+	settings.flatPipelineSharpness = std::clamp(settings.flatPipelineSharpness, 0.0f, 1.0f);
+	settings.flatAct1QualityMode = std::min(settings.flatAct1QualityMode, 4u);
+	settings.flatAct1Preset = std::min(settings.flatAct1Preset, 4u);
+	settings.flatAct1Sharpness = std::clamp(settings.flatAct1Sharpness, 0.0f, 1.0f);
+	settings.flatAct2QualityMode = std::min(settings.flatAct2QualityMode, 4u);
+	settings.flatAct2Preset = std::min(settings.flatAct2Preset, 4u);
+	settings.flatAct2Sharpness = std::clamp(settings.flatAct2Sharpness, 0.0f, 1.0f);
 	settings.neuralRenderingIntensity = std::clamp(settings.neuralRenderingIntensity, 0.0f, 2.0f);
 	settings.neuralRenderingLocalTone = std::clamp(settings.neuralRenderingLocalTone, 0.0f, 2.0f);
 	settings.neuralRenderingLocalStructure = std::clamp(settings.neuralRenderingLocalStructure, 0.0f, 2.0f);
 	settings.neuralRenderingSkinStructure = std::clamp(settings.neuralRenderingSkinStructure, 0.0f, 2.0f);
 	settings.neuralRenderingStyle = std::min(settings.neuralRenderingStyle, 3u);
+	settings.neuralRenderingInputPrefilter = std::min(settings.neuralRenderingInputPrefilter, 3u);
+	settings.neuralRenderingMotionVectorMode = std::min(settings.neuralRenderingMotionVectorMode, 5u);
+	settings.neuralRenderingWorkingScale = std::min(settings.neuralRenderingWorkingScale, 2u);
+	settings.neuralRenderingOutputMode = std::min(settings.neuralRenderingOutputMode, 3u);
+	settings.neuralRenderingNisSharpness = std::clamp(settings.neuralRenderingNisSharpness, 0.0f, 1.0f);
+	settings.neuralRenderingFusionPreset = std::min(settings.neuralRenderingFusionPreset, 4u);
+	settings.neuralRenderingFusionLuma = std::clamp(settings.neuralRenderingFusionLuma, 0.0f, 1.5f);
+	settings.neuralRenderingFusionChroma = std::clamp(settings.neuralRenderingFusionChroma, 0.0f, 1.5f);
+	settings.neuralRenderingFusionEdgeProtection = std::clamp(settings.neuralRenderingFusionEdgeProtection, 0.0f, 1.0f);
+	settings.neuralRenderingFusionResidualLimit = std::clamp(settings.neuralRenderingFusionResidualLimit, 0.01f, 0.5f);
 	// Preset clamping reads from Upscaling::Settings now.
 	auto& sharedPreset = globals::features::upscaling.settings.presetDLSS;
 	sharedPreset = std::min(sharedPreset, 5u);
 	if (!IsPresetCompatibleWithMode(sharedPreset)) {
 		sharedPreset = 3;  // Fall back to L
 	}
+}
+
+FoveatedRender::FlatPipelinePlan FoveatedRender::BuildFlatPipelinePlan(
+	uint32_t displayWidth, uint32_t displayHeight) const
+{
+	FlatPipelinePlan plan{};
+	plan.displayWidth = displayWidth;
+	plan.displayHeight = displayHeight;
+	plan.act1Backend = static_cast<FlatAct1Backend>(std::min(settings.flatPipelineAct1Backend, 2u));
+	plan.nrMode = static_cast<FlatNrMode>(std::min(settings.flatPipelineNrMode, 1u));
+	plan.act2Backend = static_cast<FlatAct2Backend>(std::min(settings.flatPipelineAct2Backend, 4u));
+	plan.act1Dsr = settings.flatPipelineAct1Dsr && plan.act1Backend != FlatAct1Backend::kBypass;
+	plan.nrDsr = settings.flatPipelineNrDsr;
+
+	const auto scaled = [](uint32_t value, uint quality, bool dsr) {
+		const float multiplier = dsr ? 2.0f : 1.0f;
+		return std::max(1u, static_cast<uint32_t>(std::lround(
+			value * multiplier / Upscaling::GetQualityModeRatio(std::min(quality, 4u)))));
+	};
+
+	if (plan.act1Backend == FlatAct1Backend::kBypass) {
+		plan.engineWidth = displayWidth;
+		plan.engineHeight = displayHeight;
+		plan.act1OutputWidth = displayWidth;
+		plan.act1OutputHeight = displayHeight;
+	} else {
+		const uint act1Quality = plan.act1Dsr ? 4u : settings.flatPipelineAct1Quality;
+		plan.engineWidth = std::min(displayWidth, scaled(displayWidth, act1Quality, plan.act1Dsr));
+		plan.engineHeight = std::min(displayHeight, scaled(displayHeight, act1Quality, plan.act1Dsr));
+		plan.act1OutputWidth = displayWidth * (plan.act1Dsr ? 2u : 1u);
+		plan.act1OutputHeight = displayHeight * (plan.act1Dsr ? 2u : 1u);
+	}
+
+	const uint nrQuality = plan.nrDsr ? 4u : settings.flatPipelineNrQuality;
+	plan.nrWidth = std::min(plan.act1OutputWidth, scaled(displayWidth, nrQuality, plan.nrDsr));
+	plan.nrHeight = std::min(plan.act1OutputHeight, scaled(displayHeight, nrQuality, plan.nrDsr));
+	if (plan.nrMode == FlatNrMode::kNRSR) {
+		plan.nrOutputWidth = displayWidth;
+		plan.nrOutputHeight = displayHeight;
+		plan.act2OutputWidth = displayWidth;
+		plan.act2OutputHeight = displayHeight;
+	} else {
+		plan.nrOutputWidth = plan.nrWidth;
+		plan.nrOutputHeight = plan.nrHeight;
+		const bool temporalDsr = plan.nrDsr &&
+			(plan.act2Backend == FlatAct2Backend::kDLSS || plan.act2Backend == FlatAct2Backend::kFSR3);
+		plan.act2OutputWidth = displayWidth * (temporalDsr ? 2u : 1u);
+		plan.act2OutputHeight = displayHeight * (temporalDsr ? 2u : 1u);
+	}
+	return plan;
 }
 
 // ============================================================================
@@ -362,13 +463,24 @@ const char* FoveatedRender::SubrectMaskModeName(SubrectMaskMode mode)
 	           T(TKEY("foveated_mask_rectangle"), "Rectangle");
 }
 
-void FoveatedRender::DrawSettings()
+void FoveatedRender::DrawNeuralRenderingSettings()
 {
 	ClampSettings();
 
-	Util::Text::WrappedInfo("%s", T(TKEY("foveated_shared_panel_note"), "Quality and Sharpness are on the main Upscaling panel — changes there apply to foveated rendering too. DLSS Preset also applies there when DLSS is the selected upscaler."));
-
 	if (ImGui::CollapsingHeader(T(TKEY("neural_rendering_header"), "DLSS Neural Rendering"), ImGuiTreeNodeFlags_DefaultOpen)) {
+		auto& upscaling = globals::features::upscaling;
+		static const char* qualityModes[] = { "DLAA / Native", "Quality", "Balanced", "Performance", "Ultra Performance" };
+		if (!globals::game::isVR) {
+			static const char* act1Backends[] = { "Bypass", "DLSS", "FSR3" };
+			ImGui::TextUnformatted("ACT1 - LDR Reconstruction");
+			ImGui::Combo("ACT1 Backend", reinterpret_cast<int*>(&settings.flatPipelineAct1Backend), act1Backends, IM_ARRAYSIZE(act1Backends));
+			if (settings.flatPipelineAct1Backend != 0) {
+				ImGui::Combo("ACT1 Quality", reinterpret_cast<int*>(&settings.flatPipelineAct1Quality), qualityModes, IM_ARRAYSIZE(qualityModes));
+				ImGui::Checkbox("ACT1 DSR 2x", &settings.flatPipelineAct1Dsr);
+			}
+			ImGui::Separator();
+		}
+
 		const bool supportedRoute = globals::features::upscaling.GetUpscaleMethod() == Upscaling::UpscaleMethod::kDLSS &&
 			!globals::features::upscaling.IsFrameGenerationConfiguredForSession() &&
 			(!globals::game::isVR || (GetDlssMode() == DlssMode::kDefault &&
@@ -381,9 +493,33 @@ void FoveatedRender::DrawSettings()
 					"Requires DLSS. VR additionally requires Foveated Default mode and active PerfMode."));
 			ImGui::BeginDisabled();
 		}
+		ImGui::TextUnformatted("Neural Rendering");
 		ImGui::Checkbox(T(TKEY("neural_rendering_enable"), "Enable DLSS Neural Rendering"), &settings.neuralRenderingEnabled);
 
 		if (settings.neuralRenderingEnabled) {
+			if (!globals::game::isVR) {
+				ImGui::Separator();
+				static const char* nrModes[] = { "NR (N -> N)", "NRSR Experimental (N -> D)" };
+				ImGui::TextUnformatted("NR");
+				ImGui::Combo("NR Mode", reinterpret_cast<int*>(&settings.flatPipelineNrMode), nrModes, IM_ARRAYSIZE(nrModes));
+				ImGui::Combo("NR Quality", reinterpret_cast<int*>(&settings.flatPipelineNrQuality), qualityModes, IM_ARRAYSIZE(qualityModes));
+				ImGui::Checkbox("NR DSR 2x", &settings.flatPipelineNrDsr);
+				if (settings.flatPipelineNrMode == 1)
+					Util::Text::Warning("Experimental: Feature 18 may only write the top-left N region even when evaluation succeeds.");
+				if (settings.flatPipelineNrMode == 0) {
+					static const char* act2Backends[] = { "DLSS", "FSR3", "NIS", "Fusion", "HQ Lanczos" };
+					ImGui::Separator();
+					ImGui::TextUnformatted("ACT2");
+					ImGui::Combo("ACT2 Backend", reinterpret_cast<int*>(&settings.flatPipelineAct2Backend), act2Backends, IM_ARRAYSIZE(act2Backends));
+				}
+				ImGui::Separator();
+				ImGui::TextUnformatted("Final Sharpen");
+				ImGui::Checkbox("Enable RCAS", &settings.flatPipelineSharpen);
+				if (settings.flatPipelineSharpen)
+					ImGui::SliderFloat("RCAS Sharpness", &settings.flatPipelineSharpness, 0.0f, 1.0f, "%.2f");
+			}
+			ImGui::Separator();
+			ImGui::TextUnformatted("NR Tuning");
 			static const char* presets[] = { "Custom", "Balanced", "Fabric Detail", "Natural", "Strong" };
 			int preset = static_cast<int>(settings.neuralRenderingPreset);
 			if (ImGui::Combo(T(TKEY("neural_rendering_preset"), "Tuning Preset"), &preset, presets, IM_ARRAYSIZE(presets))) {
@@ -412,6 +548,41 @@ void FoveatedRender::DrawSettings()
 			if (custom)
 				settings.neuralRenderingPreset = 0;
 
+			if (ImGui::TreeNodeEx("Diagnostics")) {
+				const auto stats = NeuralRendering::GetAct2BackendStats();
+				ImGui::TextDisabled("Actual jitter: %.4f, %.4f", upscaling.jitter.x, upscaling.jitter.y);
+				ImGui::TextDisabled("ACT1 submits: %s | ACT2 submits: %s",
+					upscaling.settings.flatAct1JitterMode == 0 ? "Actual" : "Zero",
+					upscaling.settings.flatAct2JitterMode == 0 ? "Actual" : "Zero");
+				ImGui::TextDisabled("ACT1 DLSS successful frames: %llu",
+					static_cast<unsigned long long>(Upscaling::streamline.flatAct1SuccessfulFrames));
+				ImGui::TextDisabled("ACT2 successful frames: NIS %llu | DLSS %llu | FSR3 %llu",
+					static_cast<unsigned long long>(stats.nisSucceeded),
+					static_cast<unsigned long long>(stats.dlssSucceeded),
+					static_cast<unsigned long long>(stats.fsrSucceeded));
+				ImGui::Checkbox("Bypass NR Output (SR Comparison)", &settings.neuralRenderingBypassOutput);
+				if (!globals::game::isVR) {
+					ImGui::Checkbox("Flat DLSS Input Isolation", &upscaling.settings.flatDlssInputIsolation);
+					Util::UI::RestartGatedAnnotate(upscaling.bootSnapshot, upscaling.settings,
+						&Upscaling::Settings::flatDlssInputIsolation,
+						"Copies the active viewport into exact RenderRes inputs. Restart required.");
+					ImGui::Checkbox("Reset NR History Every Frame", &settings.neuralRenderingResetEveryFrame);
+					if (globals::state && globals::state->IsDeveloperMode()) {
+						static const char* inputPrefilters[] = { "Off", "77% Roundtrip", "66% Roundtrip", "50% Roundtrip" };
+						int inputPrefilter = static_cast<int>(settings.neuralRenderingInputPrefilter);
+						if (ImGui::Combo("Full NR Input Prefilter", &inputPrefilter, inputPrefilters, IM_ARRAYSIZE(inputPrefilters)))
+							settings.neuralRenderingInputPrefilter = static_cast<uint>(inputPrefilter);
+						static const char* motionVectorModes[] = {
+							"Dilated", "Raw Engine MV", "Zero MV", "Inverted MV", "0.5x MV", "2.0x MV"
+						};
+						int motionVectorMode = static_cast<int>(settings.neuralRenderingMotionVectorMode);
+						if (ImGui::Combo("NR Motion Vector Test", &motionVectorMode, motionVectorModes, IM_ARRAYSIZE(motionVectorModes)))
+							settings.neuralRenderingMotionVectorMode = static_cast<uint>(motionVectorMode);
+					}
+				}
+				ImGui::TreePop();
+			}
+
 			auto& neuralRenderer = NeuralRendering::Renderer::Instance();
 			if (neuralRenderer.IsFailureLatched()) {
 				Util::Text::Warning("DLSS Neural Rendering failed and is disabled for this session. Check CommunityShaders.log.");
@@ -427,6 +598,14 @@ void FoveatedRender::DrawSettings()
 		if (!supportedRoute)
 			ImGui::EndDisabled();
 	}
+}
+
+void FoveatedRender::DrawSettings()
+{
+	ClampSettings();
+
+	Util::Text::WrappedInfo("%s", T(TKEY("foveated_shared_panel_note"), "Quality and Sharpness are on the main Upscaling panel — changes there apply to foveated rendering too. DLSS Preset also applies there when DLSS is the selected upscaler."));
+
 	// ── VR-only knobs ──
 	if (globals::game::isVR) {
 		ImGui::Separator();

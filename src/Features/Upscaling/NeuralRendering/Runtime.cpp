@@ -285,7 +285,9 @@ namespace NeuralRendering
 
 	bool Runtime::Execute(ID3D12GraphicsCommandList* commandList, std::uint32_t slot,
 		ID3D12Resource* color, ID3D12Resource* depth, ID3D12Resource* motionVectors, ID3D12Resource* output,
-		std::uint32_t inputWidth, std::uint32_t inputHeight, std::uint32_t outputWidth, std::uint32_t outputHeight,
+		std::uint32_t inputWidth, std::uint32_t inputHeight,
+		std::uint32_t colorWidth, std::uint32_t colorHeight,
+		std::uint32_t outputWidth, std::uint32_t outputHeight,
 		float motionVectorScaleX, float motionVectorScaleY, const Tuning& tuning, bool reset)
 	{
 		if (status_ != RuntimeStatus::Initialized || !commandList || slot >= 2 || !color || !depth || !motionVectors || !output)
@@ -299,6 +301,7 @@ namespace NeuralRendering
 			return false;
 
 		const bool dimensionsChanged = featureInputWidth_[slot] != inputWidth || featureInputHeight_[slot] != inputHeight ||
+			featureColorWidth_[slot] != colorWidth || featureColorHeight_[slot] != colorHeight ||
 			featureOutputWidth_[slot] != outputWidth || featureOutputHeight_[slot] != outputHeight;
 		if (featureHandles_[slot] && dimensionsChanged) {
 			release(static_cast<NVSDK_NGX_Handle*>(featureHandles_[slot]));
@@ -332,8 +335,13 @@ namespace NeuralRendering
 			featureHandles_[slot] = handle;
 			featureInputWidth_[slot] = inputWidth;
 			featureInputHeight_[slot] = inputHeight;
+			featureColorWidth_[slot] = colorWidth;
+			featureColorHeight_[slot] = colorHeight;
 			featureOutputWidth_[slot] = outputWidth;
 			featureOutputHeight_[slot] = outputHeight;
+			logger::info("[DLSSNR] Feature contract slot={} input={}x{} output={}x{} scalingRatio={:.4f}",
+				slot, inputWidth, inputHeight, outputWidth, outputHeight,
+				static_cast<float>(outputWidth) / inputWidth);
 			reset = true;
 		}
 
@@ -344,8 +352,8 @@ namespace NeuralRendering
 		parameters->Set("DLSSNR.Output", output);
 		parameters->Set("DLSSNR.ColorSubrectBaseX", 0u);
 		parameters->Set("DLSSNR.ColorSubrectBaseY", 0u);
-		parameters->Set("DLSSNR.ColorSubrectWidth", outputWidth);
-		parameters->Set("DLSSNR.ColorSubrectHeight", outputHeight);
+		parameters->Set("DLSSNR.ColorSubrectWidth", colorWidth);
+		parameters->Set("DLSSNR.ColorSubrectHeight", colorHeight);
 		parameters->Set("DLSSNR.DepthSubrectBaseX", 0u);
 		parameters->Set("DLSSNR.DepthSubrectBaseY", 0u);
 		parameters->Set("DLSSNR.DepthSubrectWidth", inputWidth);
@@ -360,6 +368,10 @@ namespace NeuralRendering
 		parameters->Set("DLSSNR.OutputSubrectHeight", outputHeight);
 		parameters->Set("DLSSNR.MVecScaleX", motionVectorScaleX);
 		parameters->Set("DLSSNR.MVecScaleY", motionVectorScaleY);
+		parameters->Set(NVSDK_NGX_Parameter_MV_Scale_X, motionVectorScaleX);
+		parameters->Set(NVSDK_NGX_Parameter_MV_Scale_Y, motionVectorScaleY);
+		parameters->Set(NVSDK_NGX_Parameter_Jitter_Offset_X, tuning.jitterOffsetX);
+		parameters->Set(NVSDK_NGX_Parameter_Jitter_Offset_Y, tuning.jitterOffsetY);
 		parameters->Set("DLSSNR.DepthInverted", 0u);
 		parameters->Set("DLSSNR.Enabled", 1u);
 		parameters->Set("DLSSNR.Reset", reset ? 1u : 0u);

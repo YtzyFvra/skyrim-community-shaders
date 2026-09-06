@@ -1,5 +1,7 @@
 #include "Streamline.h"
 
+#include "../../GpuPass.h"
+
 #include <algorithm>
 #include <bit>
 #include <cmath>
@@ -428,7 +430,8 @@ bool Streamline::EnsureFrameToken()
 	return frameToken != nullptr;
 }
 
-bool Streamline::CheckFrameConstants(sl::ViewportHandle p_viewport, uint32_t eyeIndex)
+bool Streamline::CheckFrameConstants(sl::ViewportHandle p_viewport, uint32_t eyeIndex,
+	bool forceReset, bool forceZeroJitter, float jitterScaleX, float jitterScaleY)
 {
 	if (!initialized)
 		return false;
@@ -473,11 +476,13 @@ bool Streamline::CheckFrameConstants(sl::ViewportHandle p_viewport, uint32_t eye
 	slConstants.depthInverted = sl::Boolean::eFalse;
 
 	auto& upscaling = globals::features::upscaling;
-	auto jitter = upscaling.jitter;
+	auto jitter = forceZeroJitter ? float2{ 0.0f, 0.0f } : upscaling.jitter;
+	jitter.x *= jitterScaleX;
+	jitter.y *= jitterScaleY;
 	slConstants.jitterOffset = { -jitter.x, -jitter.y };
 	// Menus render no motion vectors; camera-derived MVs restore valid reprojection there.
 	// Reset only when that fill couldn't run — accumulating against zero MVs ghosts.
-	slConstants.reset = (state->IsMainOrLoadingMenuOpen() && !upscaling.menuCameraMVsValid) ?
+	slConstants.reset = (forceReset || (state->IsMainOrLoadingMenuOpen() && !upscaling.menuCameraMVsValid)) ?
 	                        sl::Boolean::eTrue :
 	                        sl::Boolean::eFalse;
 
@@ -554,7 +559,9 @@ void Streamline::ClampToDLSSRenderRange(uint32_t a_qualityMode, uint32_t a_outpu
 	a_renderHeight = clampedH;
 }
 
-void Streamline::SetDLSSOptions(sl::ViewportHandle p_viewport, uint32_t width, uint32_t height)
+void Streamline::SetDLSSOptions(sl::ViewportHandle p_viewport, uint32_t width, uint32_t height,
+	std::optional<sl::DLSSMode> modeOverride, std::optional<bool> hdrOverride,
+	std::optional<uint32_t> presetOverride, std::optional<float> sharpnessOverride)
 {
 	sl::DLSSOptions dlssOptions{};
 
@@ -562,7 +569,10 @@ void Streamline::SetDLSSOptions(sl::ViewportHandle p_viewport, uint32_t width, u
 	// not the live preset.
 	auto& perfModeRef = globals::features::upscaling.perfMode;
 	const uint32_t qualityMode = perfModeRef.IsHookActive() ? perfModeRef.GetLatchedQualityMode() : globals::features::upscaling.settings.qualityMode;
-	dlssOptions.mode = DLSSModeForQualityMode(qualityMode);
+	const uint32_t act1Mode = !globals::game::isVR ?
+		globals::features::upscaling.bootSnapshot.Boot(&Upscaling::Settings::flatAct1ResControl) : 0u;
+	dlssOptions.mode = modeOverride.value_or(act1Mode == 1 ? sl::DLSSMode::eMaxPerformance :
+		(act1Mode == 2 ? sl::DLSSMode::eUltraPerformance : DLSSModeForQualityMode(qualityMode)));
 
 	auto state = globals::state;
 
@@ -585,13 +595,14 @@ void Streamline::SetDLSSOptions(sl::ViewportHandle p_viewport, uint32_t width, u
 		auto& main = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN];
 		D3D11_TEXTURE2D_DESC mainDesc;
 		Util::AsReal(main.texture)->GetDesc(&mainDesc);
-		bool isHDR = mainDesc.Format != DXGI_FORMAT_R8G8B8A8_UNORM;
+		bool isHDR = hdrOverride.value_or(mainDesc.Format != DXGI_FORMAT_R8G8B8A8_UNORM);
 		dlssOptions.colorBuffersHDR = isHDR ? sl::Boolean::eTrue : sl::Boolean::eFalse;
 	}
 	dlssOptions.useAutoExposure = sl::Boolean::eTrue;
 
 	std::optional<sl::DLSSPreset> customPreset;
-	switch (globals::features::upscaling.settings.presetDLSS) {
+	const uint32_t preset = presetOverride.value_or(globals::features::upscaling.settings.presetDLSS);
+	switch (preset) {
 	case 1:
 		customPreset = sl::DLSSPreset::ePresetJ;
 		break;
@@ -617,18 +628,211 @@ void Streamline::SetDLSSOptions(sl::ViewportHandle p_viewport, uint32_t width, u
 	}
 
 	dlssOptions.preExposure = 1.0f;
-	dlssOptions.sharpness = 0.0f;
+	dlssOptions.sharpness = std::clamp(sharpnessOverride.value_or(0.0f), 0.0f, 1.0f);
 
 	if (SL_FAILED(result, slDLSSSetOptions(p_viewport, dlssOptions))) {
 		logger::critical("[Streamline DX11] Could not enable DLSS");
 	}
 }
 
+bool Streamline::EnsureFlatAct1Resources(ID3D11Resource* source, uint32_t outputWidth, uint32_t outputHeight)
+{
+	winrt::com_ptr<ID3D11Texture2D> sourceTexture;
+	if (!source || FAILED(source->QueryInterface(sourceTexture.put())))
+		return false;
+	D3D11_TEXTURE2D_DESC sourceDesc{};
+	sourceTexture->GetDesc(&sourceDesc);
+	if (flatAct1Overshoot) {
+		D3D11_TEXTURE2D_DESC currentDesc{};
+		flatAct1Overshoot->GetDesc(&currentDesc);
+		if (currentDesc.Width == outputWidth && currentDesc.Height == outputHeight && currentDesc.Format == sourceDesc.Format)
+			return true;
+		ResetFlatAct1Resources();
+		DestroyDLSSResources();
+	}
+
+	D3D11_TEXTURE2D_DESC desc = sourceDesc;
+	desc.Width = outputWidth;
+	desc.Height = outputHeight;
+	desc.MipLevels = 1;
+	desc.ArraySize = 1;
+	desc.SampleDesc.Count = 1;
+	desc.SampleDesc.Quality = 0;
+	desc.Usage = D3D11_USAGE_DEFAULT;
+	desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+	desc.CPUAccessFlags = 0;
+	desc.MiscFlags = 0;
+	auto* device = globals::d3d::device;
+	if (!device || FAILED(device->CreateTexture2D(&desc, nullptr, flatAct1Overshoot.put())) ||
+		FAILED(device->CreateShaderResourceView(flatAct1Overshoot.get(), nullptr, flatAct1OvershootSRV.put())) ||
+		FAILED(device->CreateUnorderedAccessView(flatAct1Overshoot.get(), nullptr, flatAct1OvershootUAV.put()))) {
+		ResetFlatAct1Resources();
+		return false;
+	}
+	Util::SetResourceName(flatAct1Overshoot.get(), "Upscaling::FlatAct1Overshoot");
+
+	D3D11_BUFFER_DESC bufferDesc{};
+	bufferDesc.ByteWidth = 16;
+	bufferDesc.Usage = D3D11_USAGE_DYNAMIC;
+	bufferDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+	bufferDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+	if (FAILED(device->CreateBuffer(&bufferDesc, nullptr, flatAct1ResolveCB.put()))) {
+		ResetFlatAct1Resources();
+		return false;
+	}
+	logger::info("[ACT1] Created DLSS overshoot texture {}x{} format={}", outputWidth, outputHeight,
+		static_cast<uint32_t>(sourceDesc.Format));
+	return true;
+}
+
+bool Streamline::ResolveFlatAct1(ID3D11DeviceContext* context, ID3D11UnorderedAccessView* destination,
+	uint32_t destinationWidth, uint32_t destinationHeight)
+{
+	auto* shader = flatAct1ResolveCS.Get(
+		L"Data\\Shaders\\Upscaling\\NeuralRendering\\Act1LanczosResolveCS.hlsl", {}, "cs_5_0",
+		"main", "Upscaling::FlatAct1LanczosResolveCS");
+	if (!context || !shader || !destination || !flatAct1Overshoot || !flatAct1OvershootSRV || !flatAct1ResolveCB)
+		return false;
+	D3D11_TEXTURE2D_DESC sourceDesc{};
+	flatAct1Overshoot->GetDesc(&sourceDesc);
+	struct Constants
+	{
+		uint32_t sourceWidth;
+		uint32_t sourceHeight;
+		uint32_t destinationWidth;
+		uint32_t destinationHeight;
+	} constants{ sourceDesc.Width, sourceDesc.Height, destinationWidth, destinationHeight };
+	D3D11_MAPPED_SUBRESOURCE mapped{};
+	if (FAILED(context->Map(flatAct1ResolveCB.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
+		return false;
+	std::memcpy(mapped.pData, &constants, sizeof(constants));
+	context->Unmap(flatAct1ResolveCB.get(), 0);
+
+	CS_GPU_PASS("Upscaling::FlatAct1LanczosResolve");
+	context->CSSetShader(shader, nullptr, 0);
+	ID3D11Buffer* buffers[]{ flatAct1ResolveCB.get() };
+	context->CSSetConstantBuffers(0, 1, buffers);
+	ID3D11ShaderResourceView* srvs[]{ flatAct1OvershootSRV.get() };
+	context->CSSetShaderResources(0, 1, srvs);
+	context->CSSetUnorderedAccessViews(0, 1, &destination, nullptr);
+	context->Dispatch((destinationWidth + 7) / 8, (destinationHeight + 7) / 8, 1);
+	ID3D11Buffer* nullBuffer[]{ nullptr };
+	ID3D11ShaderResourceView* nullSRV[]{ nullptr };
+	ID3D11UnorderedAccessView* nullUAV[]{ nullptr };
+	context->CSSetConstantBuffers(0, 1, nullBuffer);
+	context->CSSetShaderResources(0, 1, nullSRV);
+	context->CSSetUnorderedAccessViews(0, 1, nullUAV, nullptr);
+	context->CSSetShader(nullptr, nullptr, 0);
+	return true;
+}
+
+void Streamline::ResetFlatAct1Resources()
+{
+	flatAct1OvershootUAV = nullptr;
+	flatAct1OvershootSRV = nullptr;
+	flatAct1Overshoot = nullptr;
+	flatAct1ResolveCB = nullptr;
+	flatAct1ResolveCS.Reset();
+}
+
+bool Streamline::PrepareFlatInputIsolation(ID3D11DeviceContext* context,
+	ID3D11Resource* color, ID3D11ShaderResourceView* depthSRV, ID3D11Resource* motionVectors,
+	ID3D11Resource* reactiveMask, ID3D11Resource* transparencyMask,
+	uint32_t renderWidth, uint32_t renderHeight)
+{
+	if (!context || !color || !depthSRV || !motionVectors || !reactiveMask || !transparencyMask ||
+		renderWidth == 0 || renderHeight == 0)
+		return false;
+
+	auto matches = [renderWidth, renderHeight](Texture2D* texture, ID3D11Resource* source) {
+		if (!texture || !source)
+			return false;
+		D3D11_TEXTURE2D_DESC actual{}, expected{};
+		texture->resource->GetDesc(&actual);
+		static_cast<ID3D11Texture2D*>(source)->GetDesc(&expected);
+		return actual.Width == renderWidth && actual.Height == renderHeight && actual.Format == expected.Format;
+	};
+	bool recreate = !matches(flatIsolatedColor.get(), color) ||
+		!matches(flatIsolatedMotionVectors.get(), motionVectors) ||
+		!matches(flatIsolatedReactiveMask.get(), reactiveMask) ||
+		!matches(flatIsolatedTransparencyMask.get(), transparencyMask);
+	if (flatIsolatedDepth) {
+		D3D11_TEXTURE2D_DESC desc{};
+		flatIsolatedDepth->resource->GetDesc(&desc);
+		recreate = recreate || desc.Width != renderWidth || desc.Height != renderHeight ||
+			desc.Format != DXGI_FORMAT_R32_FLOAT;
+	} else {
+		recreate = true;
+	}
+
+	if (recreate) {
+		flatIsolatedColor = Upscaling::CreateTextureFromSource(color, renderWidth, renderHeight, false, true, false,
+			"Upscaling::FlatIsolatedColor");
+		flatIsolatedMotionVectors = Upscaling::CreateTextureFromSource(motionVectors, renderWidth, renderHeight, false, true, false,
+			"Upscaling::FlatIsolatedMotionVectors");
+		flatIsolatedReactiveMask = Upscaling::CreateTextureFromSource(reactiveMask, renderWidth, renderHeight, false, true, false,
+			"Upscaling::FlatIsolatedReactiveMask");
+		flatIsolatedTransparencyMask = Upscaling::CreateTextureFromSource(transparencyMask, renderWidth, renderHeight, false, true, false,
+			"Upscaling::FlatIsolatedTransparencyMask");
+
+		D3D11_TEXTURE2D_DESC depthDesc{};
+		depthDesc.Width = renderWidth;
+		depthDesc.Height = renderHeight;
+		depthDesc.MipLevels = 1;
+		depthDesc.ArraySize = 1;
+		depthDesc.Format = DXGI_FORMAT_R32_FLOAT;
+		depthDesc.SampleDesc.Count = 1;
+		depthDesc.Usage = D3D11_USAGE_DEFAULT;
+		depthDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+		flatIsolatedDepth = eastl::make_unique<Texture2D>(depthDesc, "Upscaling::FlatIsolatedDepth");
+		D3D11_SHADER_RESOURCE_VIEW_DESC depthSRVDesc{};
+		depthSRVDesc.Format = DXGI_FORMAT_R32_FLOAT;
+		depthSRVDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+		depthSRVDesc.Texture2D.MipLevels = 1;
+		flatIsolatedDepth->CreateSRV(depthSRVDesc);
+		D3D11_UNORDERED_ACCESS_VIEW_DESC depthUAVDesc{};
+		depthUAVDesc.Format = DXGI_FORMAT_R32_FLOAT;
+		depthUAVDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+		flatIsolatedDepth->CreateUAV(depthUAVDesc);
+
+		if (!flatIsolatedColor || !flatIsolatedMotionVectors || !flatIsolatedReactiveMask ||
+			!flatIsolatedTransparencyMask || !flatIsolatedDepth || !flatIsolatedDepth->srv || !flatIsolatedDepth->uav)
+			return false;
+		DestroyDLSSResources();
+		logger::info("[DLSS Isolation] Created exact RenderRes inputs {}x{}", renderWidth, renderHeight);
+	}
+
+	D3D11_BOX region{ 0, 0, 0, renderWidth, renderHeight, 1 };
+	context->CopySubresourceRegion(flatIsolatedColor->resource.get(), 0, 0, 0, 0, color, 0, &region);
+	context->CopySubresourceRegion(flatIsolatedMotionVectors->resource.get(), 0, 0, 0, 0, motionVectors, 0, &region);
+	context->CopySubresourceRegion(flatIsolatedReactiveMask->resource.get(), 0, 0, 0, 0, reactiveMask, 0, &region);
+	context->CopySubresourceRegion(flatIsolatedTransparencyMask->resource.get(), 0, 0, 0, 0, transparencyMask, 0, &region);
+
+	auto* depthShader = flatIsolatedDepthCopyCS.Get(
+		L"Data\\Shaders\\Upscaling\\NeuralRendering\\CopyDepthGuideCS.hlsl", {}, "cs_5_0",
+		"main", "Upscaling::FlatIsolatedDepthCopyCS");
+	if (!depthShader)
+		return false;
+	context->CSSetShader(depthShader, nullptr, 0);
+	context->CSSetShaderResources(0, 1, &depthSRV);
+	ID3D11UnorderedAccessView* depthUAV = flatIsolatedDepth->uav.get();
+	context->CSSetUnorderedAccessViews(0, 1, &depthUAV, nullptr);
+	context->Dispatch((renderWidth + 7) / 8, (renderHeight + 7) / 8, 1);
+	ID3D11ShaderResourceView* nullSRV = nullptr;
+	ID3D11UnorderedAccessView* nullUAV = nullptr;
+	context->CSSetShaderResources(0, 1, &nullSRV);
+	context->CSSetUnorderedAccessViews(0, 1, &nullUAV, nullptr);
+	context->CSSetShader(nullptr, nullptr, 0);
+	return true;
+}
+
 bool Streamline::EvaluateDLSS(sl::ViewportHandle vp, uint32_t eyeIndex,
 	ID3D11Resource* colorIn, ID3D11Resource* colorOut, ID3D11Resource* depth,
 	ID3D11Resource* mvec, ID3D11Resource* reactiveMask, ID3D11Resource* transparencyMask,
 	const sl::Extent& extentIn, const sl::Extent& extentOut, uint32_t outputWidth,
-	uint32_t outputHeight)
+	uint32_t outputHeight, std::optional<sl::DLSSMode> modeOverride, std::optional<bool> hdrOverride,
+	bool forceReset, bool forceZeroJitter, float jitterScaleX, float jitterScaleY,
+	std::optional<uint32_t> presetOverride, std::optional<float> sharpnessOverride)
 {
 	auto context = globals::d3d::context;
 
@@ -639,7 +843,7 @@ bool Streamline::EvaluateDLSS(sl::ViewportHandle vp, uint32_t eyeIndex,
 	sl::Resource reactiveMaskRes = { sl::ResourceType::eTex2d, reactiveMask, 0 };
 	sl::Resource transparencyMaskRes = { sl::ResourceType::eTex2d, transparencyMask, 0 };
 
-	if (!CheckFrameConstants(vp, eyeIndex))
+	if (!CheckFrameConstants(vp, eyeIndex, forceReset, forceZeroJitter, jitterScaleX, jitterScaleY))
 		return false;
 
 	const bool emitPCLMarkers =
@@ -666,7 +870,7 @@ bool Streamline::EvaluateDLSS(sl::ViewportHandle vp, uint32_t eyeIndex,
 		}
 	};
 
-	SetDLSSOptions(vp, outputWidth, outputHeight);
+	SetDLSSOptions(vp, outputWidth, outputHeight, modeOverride, hdrOverride, presetOverride, sharpnessOverride);
 
 	sl::ResourceTag tags[] = {
 		{ &colorInRes, sl::kBufferTypeScalingInputColor, sl::ResourceLifecycle::eOnlyValidNow, &extentIn },
@@ -709,9 +913,21 @@ bool Streamline::EvaluateDLSS(sl::ViewportHandle vp, uint32_t eyeIndex,
 	}
 
 	if (evalResult != sl::Result::eOk) {
+		if (!globals::game::isVR) {
+			if (vp == flatAct2Viewport)
+				++flatAct2FailedFrames;
+			else if (vp == viewport || vp == flatPostInjectViewport)
+				++flatAct1FailedFrames;
+		}
 		if (ShouldLogDLSSProblem(DLSSLogKind::kEvaluateError, logEye, frame))
 			logger::error("[Streamline {}] slEvaluateFeature failed{} frame={} result={} ({})", instanceTag, globals::game::isVR ? std::format(" for eye {}", eyeIndex) : "", frame, static_cast<int>(evalResult), magic_enum::enum_name(evalResult));
 		return false;
+	}
+	if (!globals::game::isVR) {
+		if (vp == flatAct2Viewport)
+			++flatAct2SuccessfulFrames;
+		else if (vp == viewport || vp == flatPostInjectViewport)
+			++flatAct1SuccessfulFrames;
 	}
 
 	return true;
@@ -737,6 +953,10 @@ void Streamline::Upscale(ID3D11Resource* a_upscalingTexture, ID3D11Resource* a_r
 
 	auto screenSize = state->screenSize;
 	auto renderSize = Util::ConvertToDynamic(screenSize);
+	if (!globals::game::isVR) {
+		globals::features::upscaling.lastDlssRenderWidth = static_cast<uint32_t>(std::lround(renderSize.x));
+		globals::features::upscaling.lastDlssRenderHeight = static_cast<uint32_t>(std::lround(renderSize.y));
+	}
 
 	// PerfMode bridge: when the BSOpenVR size hook is live, state->screenSize
 	// is polluted to RenderRes (the spoofed HMD recommended size). DLSS must
@@ -751,13 +971,26 @@ void Streamline::Upscale(ID3D11Resource* a_upscalingTexture, ID3D11Resource* a_r
 	auto& perfMode = globals::features::upscaling.perfMode;
 	const bool dlssperfActive = perfMode.IsPresentingTestTexture();
 	const auto displaySize = dlssperfActive ? perfMode.GetDisplayScreenSize() : screenSize;
+	const uint32_t act1Mode = !globals::game::isVR ?
+		upscaling.bootSnapshot.Boot(&Upscaling::Settings::flatAct1ResControl) : 0u;
+	const uint32_t act1OutputWidth = static_cast<uint32_t>(displaySize.x) * 2;
+	const uint32_t act1OutputHeight = static_cast<uint32_t>(displaySize.y) * 2;
 
 	// Sharpening active -> write to the RCAS read source (sharpenerTexture, or PerfMode's
 	// refraTempTex) directly so RCAS can sharpen with no CopyResource round-trip.
 	const bool dlssperfSharpen = upscaling.IsPerfModeSharpenRedirectActive();
+	const bool stagedFlatPipeline = !globals::game::isVR && upscaling.foveatedRender.settings.neuralRenderingEnabled;
 	ID3D11Resource* colorOut =
 		dlssperfActive ? (dlssperfSharpen ? static_cast<ID3D11Resource*>(perfMode.GetRefraTempTex()) : static_cast<ID3D11Resource*>(perfMode.GetTestTexture())) :
-						 ((upscaling.settings.sharpnessEnabledDLSS && upscaling.settings.sharpnessDLSS > 0.0f && upscaling.sharpenerTexture) ? upscaling.sharpenerTexture->resource.get() : a_upscalingTexture);
+						 ((!stagedFlatPipeline && upscaling.settings.sharpnessEnabledDLSS && upscaling.settings.sharpnessDLSS > 0.0f && upscaling.sharpenerTexture) ? upscaling.sharpenerTexture->resource.get() : a_upscalingTexture);
+	if (act1Mode != 0) {
+		if (!EnsureFlatAct1Resources(a_upscalingTexture, act1OutputWidth, act1OutputHeight)) {
+			logger::error("[ACT1] Failed to create {}x{} overshoot resources; skipping DLSS evaluate",
+				act1OutputWidth, act1OutputHeight);
+			return;
+		}
+		colorOut = flatAct1Overshoot.get();
+	}
 
 	// VR stereo DLSS: NGX D3D11 only accepts zero-offset subrects. Non-zero offsets return
 	// FAIL_InvalidParameter because Streamline's dlssEntry.cpp never sets
@@ -830,13 +1063,61 @@ void Streamline::Upscale(ID3D11Resource* a_upscalingTexture, ID3D11Resource* a_r
 		}
 	} else {
 		// Non-VR: Simple full-texture upscale.
-		sl::Extent extentIn{ 0, 0, (uint)renderSize.x, (uint)renderSize.y };
-		sl::Extent extentOut{ 0, 0, (uint)displaySize.x, (uint)displaySize.y };
+		const uint32_t flatRenderWidth = upscaling.lastDlssRenderWidth;
+		const uint32_t flatRenderHeight = upscaling.lastDlssRenderHeight;
+		sl::Extent extentIn{ 0, 0, flatRenderWidth, flatRenderHeight };
+		const uint32_t outputWidth = act1Mode != 0 ? act1OutputWidth : static_cast<uint32_t>(displaySize.x);
+		const uint32_t outputHeight = act1Mode != 0 ? act1OutputHeight : static_cast<uint32_t>(displaySize.y);
+		sl::Extent extentOut{ 0, 0, outputWidth, outputHeight };
+		ID3D11Resource* colorIn = a_upscalingTexture;
+		ID3D11Resource* depthIn = depthTexture.texture;
+		ID3D11Resource* motionIn = a_motionVectors;
+		ID3D11Resource* reactiveIn = a_reactiveMask;
+		ID3D11Resource* transparencyIn = a_transparencyCompositionMask;
+		const bool isolateInputs = upscaling.bootSnapshot.Boot(&Upscaling::Settings::flatDlssInputIsolation);
+		if (isolateInputs) {
+			if (!PrepareFlatInputIsolation(globals::d3d::context, a_upscalingTexture, depthTexture.depthSRV,
+					a_motionVectors, a_reactiveMask, a_transparencyCompositionMask,
+					flatRenderWidth, flatRenderHeight)) {
+				logger::error("[DLSS Isolation] Failed to prepare exact RenderRes inputs {}x{}",
+					flatRenderWidth, flatRenderHeight);
+				return;
+			}
+			colorIn = flatIsolatedColor->resource.get();
+			depthIn = flatIsolatedDepth->resource.get();
+			motionIn = flatIsolatedMotionVectors->resource.get();
+			reactiveIn = flatIsolatedReactiveMask->resource.get();
+			transparencyIn = flatIsolatedTransparencyMask->resource.get();
+		}
 
-		EvaluateDLSS(viewport, 0,
-			a_upscalingTexture, colorOut,
-			Util::AsReal(depthTexture.texture), a_motionVectors, a_reactiveMask, a_transparencyCompositionMask,
-			extentIn, extentOut, (uint)displaySize.x);
+		const bool act1JitterChanged = lastFlatAct1JitterMode != upscaling.settings.flatAct1JitterMode;
+		const bool evaluated = EvaluateDLSS(viewport, 0,
+			colorIn, colorOut,
+			depthIn, motionIn, reactiveIn, transparencyIn,
+			extentIn, extentOut, outputWidth, outputHeight,
+			Streamline::DLSSModeForQualityMode(upscaling.foveatedRender.settings.flatAct1QualityMode),
+			std::nullopt, act1JitterChanged, upscaling.settings.flatAct1JitterMode == 1,
+			1.0f, 1.0f, upscaling.foveatedRender.settings.flatAct1Preset,
+			upscaling.foveatedRender.settings.flatAct1Sharpness);
+		lastFlatAct1JitterMode = upscaling.settings.flatAct1JitterMode;
+		if (act1Mode != 0) {
+			auto& main = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN];
+			if (!evaluated || !main.UAV || !ResolveFlatAct1(globals::d3d::context, main.UAV,
+					static_cast<uint32_t>(displaySize.x), static_cast<uint32_t>(displaySize.y))) {
+				logger::error("[ACT1] DLSS overshoot or Lanczos resolve failed mode={} input={}x{} output={}x{}",
+					act1Mode, flatRenderWidth, flatRenderHeight,
+					outputWidth, outputHeight);
+			} else {
+				static bool logged = false;
+				if (!logged) {
+					logger::info("[ACT1] Active mode={} DLSS {}x{} -> {}x{} -> Lanczos {}x{}",
+						act1Mode, flatRenderWidth, flatRenderHeight,
+						outputWidth, outputHeight, static_cast<uint32_t>(displaySize.x),
+						static_cast<uint32_t>(displaySize.y));
+					logged = true;
+				}
+			}
+		}
 	}
 }
 
@@ -1052,5 +1333,11 @@ void Streamline::DestroyDLSSResources()
 	if (globals::game::isVR) {
 		slDLSSSetOptions(viewportRight, dlssOptions);
 		slFreeResources(sl::kFeatureDLSS, viewportRight);
+	} else {
+		slDLSSSetOptions(flatPostInjectViewport, dlssOptions);
+		slFreeResources(sl::kFeatureDLSS, flatPostInjectViewport);
+		slDLSSSetOptions(flatAct2Viewport, dlssOptions);
+		slFreeResources(sl::kFeatureDLSS, flatAct2Viewport);
 	}
+	lastFlatAct1JitterMode = UINT32_MAX;
 }

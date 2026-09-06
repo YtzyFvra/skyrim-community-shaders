@@ -97,6 +97,11 @@ public:
 		bool sharpnessEnabledDLSS = false;
 		float sharpnessDLSS = 0.8f;
 		uint presetDLSS = 0;  // 0=Default, 1=J, 2=K, 3=L, 4=M
+		uint flatAct1ResControl = 0;  // 0=Off, 1=1.0D->2.0D->D, 2=0.5D->2.0D->D
+		bool flatDlssInputIsolation = true;
+		bool flatDlssPostInject = false;  // Run LDR DLSS-SR immediately before flat NR instead of pre-Post HDR SR.
+		uint flatAct1JitterMode = 0;  // 0=actual projection jitter, 1=zero.
+		uint flatAct2JitterMode = 1;  // 0=actual projection jitter, 1=zero.
 		bool reflexLowLatencyMode = false;
 		bool reflexLowLatencyBoost = false;
 		bool reflexUseMarkersToOptimize = false;
@@ -135,7 +140,7 @@ public:
 	// presetDLSS is deliberately NOT here: Streamline::SetDLSSOptions reads
 	// settings.presetDLSS per-frame and applies it via slDLSSSetOptions, so
 	// it's already runtime-effective.
-	inline static constexpr Util::Settings::RestartTable<Settings, 9> kRestartFields{ {
+	inline static constexpr Util::Settings::RestartTable<Settings, 12> kRestartFields{ {
 		UTIL_RESTART_FIELD(Settings, frameGenerationMode, "Frame Generation"),
 		UTIL_RESTART_FIELD(Settings, frameGenerationForceEnable, "Force Enable Frame Generation"),
 		UTIL_RESTART_FIELD(Settings, preferFSRFrameGen, "Prefer AMD FSR Frame Generation"),
@@ -143,6 +148,9 @@ public:
 		UTIL_RESTART_FIELD(Settings, streamlineLogLevel, "Streamline Logging"),
 		UTIL_RESTART_FIELD(Settings, upscaleMethod, "Upscaling Method"),
 		UTIL_RESTART_FIELD(Settings, qualityMode, "Upscale Preset"),
+		UTIL_RESTART_FIELD(Settings, flatAct1ResControl, "Flat ACT1 ResControl"),
+		UTIL_RESTART_FIELD(Settings, flatDlssInputIsolation, "Flat DLSS Input Isolation"),
+		UTIL_RESTART_FIELD(Settings, flatDlssPostInject, "Flat DLSS Inject Point"),
 		UTIL_RESTART_FIELD(Settings, vrRenderScale, "VR Render Scale"),
 		// CreateUpscalingTextureResources (which allocates runtimeFsrDepthTexture)
 		// only runs on an upscale-method change, not on this toggle -- restart-gate
@@ -190,6 +198,8 @@ public:
 	// Timing and scaling
 	double refreshRate = 0.0f;
 	float2 resolutionScale = { 1.0f, 1.0f };
+	uint32_t lastDlssRenderWidth = 0;
+	uint32_t lastDlssRenderHeight = 0;
 	LARGE_INTEGER qpf;
 
 	// FG FPS Measurement for Overlay
@@ -204,6 +214,8 @@ public:
 	/** @brief Returns the prepared frame's generation decision until its buffers are cleared after Present. */
 	bool ShouldUseFrameGenerationThisFrame() const;
 	bool IsUpscalingActive() const;
+	bool IsFlatDlssPostInjectActive() const;
+	bool IsFlatAct1BypassActive() const;
 
 	// Feature interface overrides
 	std::span<const Util::Settings::RestartFieldInfo> GetRestartRequiredFields() const override
