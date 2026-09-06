@@ -2,98 +2,109 @@
 
 #include "../../Globals.h"
 #include "../../I18n/I18n.h"
+#include "../../Utils/D3D.h"
 #include "../../Utils/Subrect.h"
 #include "../../Utils/UI.h"
 #include "../FoveatedCommon.h"
 #include "../Upscaling.h"
 #include "FoveatedRender/Core.h"
+#include "GpuPass.h"
 #include "NeuralRendering/Integration.h"
 #include "NeuralRendering/ArisePipeline.h"
 #include "NeuralRendering/Renderer.h"
 #include "Profiler.h"
 
 #include <algorithm>
+#include <cmath>
 
 #define I18N_KEY_PREFIX "feature.upscaling."
 
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
-	FoveatedRender::UnifiedPipelineSettings,
-	act1Srss,
-	act1SrssQuality,
-	act1SrssPreset,
-	guidanceScale,
-	act1Downsample,
-	act2SrBackend,
-	act2Upsample,
-	fusionEnabled);
+#define OS_FOV_SETTINGS_FIELD(X)                  \
+	X(enabled)                                    \
+	X(dlssMode)                                   \
+	X(stretchMode)                                \
+	X(peripheryBlurRadius)                        \
+	X(debugVisualize)                             \
+	X(peripheryAAMode)                            \
+	X(peripheryTemporalAlpha)                     \
+	X(subrectBlendMode)                           \
+	X(subrectMaskMode)                            \
+	X(subrectFeatherWidth)                        \
+	X(subrectFalloffCurve)                        \
+	X(subrectDitherStrength)                      \
+	X(neuralRenderingEnabled)                     \
+	X(ariseShadowScheduler)                       \
+	X(ariseVisualValidation)                      \
+	X(ariseWorkerNr)                              \
+	X(ariseModel3)                                \
+	X(singleThreadPerfMode)                       \
+	X(ariseBufferCount)                           \
+	X(flatPipelineAct1Backend)                    \
+	X(flatPipelineAct1Quality)                    \
+	X(flatPipelineAct1Preset)                     \
+	X(flatPipelineAct1Jitter)                     \
+	X(flatPipelineAct1Dsr)                        \
+	X(flatPipelineNrScale)                        \
+	X(flatPipelineAct2Backend)                    \
+	X(unifiedPipeline)                            \
+	X(flatPipelineAct2Preset)                     \
+	X(flatPipelineAct2Jitter)                     \
+	X(flatPipelineFusionDirection)                \
+	X(flatPipelineFusionDenoise)                  \
+	X(flatPipelineFusionDenoiseStrength)          \
+	X(flatPipelineFusionSoftness)                 \
+	X(flatPipelineFusionEnhancedGuidance)         \
+	X(flatPipelineFusionFrequencyGuidance)        \
+	X(flatPipelineFusionDepthGuidance)            \
+	X(flatPipelineFusionColorGuidance)            \
+	X(flatPipelineSharpen)                        \
+	X(flatPipelineSharpness)                      \
+	X(flatAct1Enabled)                            \
+	X(flatAct1QualityMode)                        \
+	X(flatAct1Preset)                             \
+	X(flatAct1Sharpness)                          \
+	X(flatAct2QualityMode)                        \
+	X(flatAct2Preset)                             \
+	X(flatAct2Sharpness)                          \
+	X(neuralRenderingPreset)                      \
+	X(neuralRenderingIntensity)                   \
+	X(neuralRenderingLocalTone)                   \
+	X(neuralRenderingLocalStructure)              \
+	X(neuralRenderingSkinStructure)               \
+	X(neuralRenderingStyle)                       \
+	X(neuralRenderingAutoMask)                    \
+	X(neuralRenderingUICorrection)                \
+	X(neuralRenderingBypassOutput)                \
+	X(neuralRenderingResetEveryFrame)             \
+	X(neuralRenderingInputPrefilter)              \
+	X(neuralRenderingMotionVectorMode)            \
+	X(neuralRenderingHalfResolution)              \
+	X(neuralRenderingWorkingScale)                \
+	X(neuralRenderingOutputMode)                  \
+	X(neuralRenderingNisSharpness)                \
+	X(neuralRenderingFusionPreset)                \
+	X(neuralRenderingFusionLuma)                  \
+	X(neuralRenderingFusionChroma)                \
+	X(neuralRenderingFusionEdgeProtection)        \
+	X(neuralRenderingFusionResidualLimit)
 
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
-	FoveatedRender::Settings,
-	enabled,
-	dlssMode,
-	stretchMode,
-	peripheryBlurRadius,
-	debugVisualize,
-	peripheryAAMode,
-	peripheryTemporalAlpha,
-	subrectBlendMode,
-	subrectMaskMode,
-	subrectFeatherWidth,
-	subrectFalloffCurve,
-	subrectDitherStrength,
-	neuralRenderingEnabled,
-	ariseShadowScheduler,
-	ariseVisualValidation,
-	ariseWorkerNr,
-	ariseModel3,
-	ariseBufferCount,
-	flatPipelineAct1Backend,
-	flatPipelineAct1Quality,
-	flatPipelineAct1Preset,
-	flatPipelineAct1Jitter,
-	flatPipelineAct1Dsr,
-	flatPipelineNrScale,
-	flatPipelineAct2Backend,
-	flatPipelineAct2Preset,
-	flatPipelineAct2Jitter,
-	flatPipelineFusionDirection,
-	flatPipelineFusionDenoise,
-	flatPipelineFusionDenoiseStrength,
-	flatPipelineFusionSoftness,
-	flatPipelineFusionEnhancedGuidance,
-	flatPipelineFusionFrequencyGuidance,
-	flatPipelineFusionDepthGuidance,
-	flatPipelineFusionColorGuidance,
-	flatPipelineSharpen,
-	flatPipelineSharpness,
-	flatAct1Enabled,
-	flatAct1QualityMode,
-	flatAct1Preset,
-	flatAct1Sharpness,
-	flatAct2QualityMode,
-	flatAct2Preset,
-	flatAct2Sharpness,
-	neuralRenderingPreset,
-	neuralRenderingIntensity,
-	neuralRenderingLocalTone,
-	neuralRenderingLocalStructure,
-	neuralRenderingSkinStructure,
-	neuralRenderingStyle,
-	neuralRenderingAutoMask,
-	neuralRenderingUICorrection,
-	neuralRenderingBypassOutput,
-	neuralRenderingResetEveryFrame,
-	neuralRenderingInputPrefilter,
-	neuralRenderingMotionVectorMode,
-	neuralRenderingHalfResolution,
-	neuralRenderingWorkingScale,
-	neuralRenderingOutputMode,
-	neuralRenderingNisSharpness,
-	neuralRenderingFusionPreset,
-	neuralRenderingFusionLuma,
-	neuralRenderingFusionChroma,
-	neuralRenderingFusionEdgeProtection,
-	neuralRenderingFusionResidualLimit);
+void to_json(nlohmann::json& j, const FoveatedRender::Settings& s)
+{
+	j = nlohmann::json::object();
+#define OS_FOV_WRITE(field) j[#field] = s.field;
+	OS_FOV_SETTINGS_FIELD(OS_FOV_WRITE)
+#undef OS_FOV_WRITE
+}
+
+void from_json(const nlohmann::json& j, FoveatedRender::Settings& s)
+{
+	const FoveatedRender::Settings defaults{};
+#define OS_FOV_READ(field) s.field = j.value(#field, defaults.field);
+	OS_FOV_SETTINGS_FIELD(OS_FOV_READ)
+#undef OS_FOV_READ
+}
+
+#undef OS_FOV_SETTINGS_FIELD
 
 // ============================================================================
 // Lifecycle
@@ -140,8 +151,15 @@ void FoveatedRender::PostPostLoad()
 	NeuralRendering::ARISE::Pipeline::Instance().SetWorkerNrEnabled(settings.ariseWorkerNr);
 	NeuralRendering::ARISE::Pipeline::Instance().SetEnabled(settings.ariseShadowScheduler);
 	stl::write_vfunc<0x1, UICompositeRenderHook>(RE::VTABLE_BSImagespaceShaderCopyDynamicFetchDisabled[3]);
-	if (!globals::game::isVR && WantsLogicalPerfMode())
-		stl::write_vfunc<0x1, MenuCopyRenderHook>(RE::VTABLE_BSImagespaceShaderCopy[3]);
+	if (!globals::game::isVR && WantsLogicalPerfMode()) {
+		// Title/loading blit + Map/ISHDR scopes. ESC/TAB stay unpatched — see docs/development/flat-arise-menu.md.
+		stl::write_vfunc<0x1, MapRenderHook>(RE::VTABLE_BSImagespaceShaderMap[3]);
+		stl::write_vfunc<0x1, WorldMapRenderHook>(RE::VTABLE_BSImagespaceShaderWorldMap[3]);
+		stl::write_vfunc<0x1, WorldMapNoSkyBlurRenderHook>(RE::VTABLE_BSImagespaceShaderWorldMapNoSkyBlur[3]);
+		stl::write_vfunc<0x1, HDRTonemapRenderHook>(RE::VTABLE_BSImagespaceShaderHDRTonemapBlendCinematic[3]);
+		stl::write_vfunc<0x1, HDRTonemapFadeRenderHook>(RE::VTABLE_BSImagespaceShaderHDRTonemapBlendCinematicFade[3]);
+		stl::detour_thunk<RendererUpdateViewPortHook>(REL::RelocationID(75455, 77240));
+	}
 	stl::write_vfunc<0x1, DistantBlurRenderHook>(RE::VTABLE_BSImagespaceShaderDistantBlur[3]);
 	stl::write_vfunc<0x1, DistantBlurFoggedRenderHook>(RE::VTABLE_BSImagespaceShaderDistantBlurFogged[3]);
 	stl::write_vfunc<0x1, DistantBlurMaskedFoggedRenderHook>(RE::VTABLE_BSImagespaceShaderDistantBlurMaskedFogged[3]);
@@ -164,6 +182,248 @@ namespace
 		~LogicalTargetRenderScope() { --logicalTargetRenderDepth; }
 	};
 
+	bool ViewportMatchesExtent(const D3D11_VIEWPORT& viewport, UINT width, UINT height)
+	{
+		return std::abs(viewport.Width - static_cast<float>(width)) <= 1.0f &&
+		       std::abs(viewport.Height - static_cast<float>(height)) <= 1.0f;
+	}
+
+	bool TryLogicalViewportFromPhysicalLeak(D3D11_VIEWPORT& viewport)
+	{
+		auto& swapChain = globals::features::upscaling.dx12SwapChain;
+		if (!swapChain.useArise ||
+			(swapChain.PhysicalWidth() == swapChain.LogicalWidth() &&
+				swapChain.PhysicalHeight() == swapChain.LogicalHeight()))
+			return false;
+		if (!ViewportMatchesExtent(viewport, swapChain.PhysicalWidth(), swapChain.PhysicalHeight()))
+			return false;
+		viewport.TopLeftX = 0.0f;
+		viewport.TopLeftY = 0.0f;
+		viewport.Width = static_cast<float>(swapChain.LogicalWidth());
+		viewport.Height = static_cast<float>(swapChain.LogicalHeight());
+		return true;
+	}
+
+	struct NamedExtent
+	{
+		const char* name = "other";
+		UINT width = 0;
+		UINT height = 0;
+	};
+
+	NamedExtent DescribeResource(ID3D11Resource* resource)
+	{
+		NamedExtent result;
+		if (!resource)
+			return { "null", 0, 0 };
+		winrt::com_ptr<ID3D11Texture2D> texture;
+		if (SUCCEEDED(resource->QueryInterface(texture.put()))) {
+			D3D11_TEXTURE2D_DESC desc{};
+			texture->GetDesc(&desc);
+			result.width = desc.Width;
+			result.height = desc.Height;
+		}
+		auto& swapChain = globals::features::upscaling.dx12SwapChain;
+		if (swapChain.swapChainBufferWrapped && resource == swapChain.swapChainBufferWrapped->resource11)
+			result.name = "SwapChainBuffer";
+		else if (swapChain.uiBufferWrapped && resource == swapChain.uiBufferWrapped->resource11)
+			result.name = "UIBuffer";
+		else if (auto* renderer = globals::game::renderer) {
+			auto& targets = renderer->GetRuntimeData().renderTargets;
+			const struct
+			{
+				RE::RENDER_TARGET id;
+				const char* name;
+			} slots[] = {
+				{ RE::RENDER_TARGET::kFRAMEBUFFER, "kFRAMEBUFFER" },
+				{ RE::RENDER_TARGET::kMENUBG, "kMENUBG" },
+				{ RE::RENDER_TARGET::kMAIN, "kMAIN" },
+				{ RE::RENDER_TARGET::kMAIN_COPY, "kMAIN_COPY" },
+				{ RE::RENDER_TARGET::kIMAGESPACE_TEMP_COPY, "kIMAGESPACE_TEMP_COPY" },
+				{ RE::RENDER_TARGET::kTOTAL, "kTOTAL" },
+			};
+			for (const auto& slot : slots) {
+				if (targets[slot.id].texture == resource) {
+					result.name = slot.name;
+					break;
+				}
+			}
+		}
+		return result;
+	}
+
+	NamedExtent DescribeRTV(ID3D11RenderTargetView* view)
+	{
+		if (!view)
+			return { "null", 0, 0 };
+		winrt::com_ptr<ID3D11Resource> resource;
+		view->GetResource(resource.put());
+		return DescribeResource(resource.get());
+	}
+
+	NamedExtent DescribeEngineSlot(RE::RENDER_TARGET id)
+	{
+		auto* renderer = globals::game::renderer;
+		if (!renderer)
+			return { "null", 0, 0 };
+		auto& target = renderer->GetRuntimeData().renderTargets[id];
+		if (target.texture)
+			return DescribeResource(target.texture);
+		return DescribeRTV(target.RTV);
+	}
+
+	void LogMenuPipelineImpl(const char* stage)
+	{
+		auto& upscaling = globals::features::upscaling;
+		auto& swapChain = upscaling.dx12SwapChain;
+		auto* state = globals::state;
+		auto* context = globals::d3d::context;
+		auto* viewport = globals::game::graphicsState;
+		winrt::com_ptr<ID3D11RenderTargetView> destView;
+		winrt::com_ptr<ID3D11ShaderResourceView> sourceView;
+		if (context) {
+			context->OMGetRenderTargets(1, destView.put(), nullptr);
+			ID3D11ShaderResourceView* rawSource = nullptr;
+			context->PSGetShaderResources(0, 1, &rawSource);
+			sourceView.attach(rawSource);
+		}
+		const auto dest = DescribeRTV(destView.get());
+		NamedExtent source{ "none", 0, 0 };
+		if (sourceView) {
+			winrt::com_ptr<ID3D11Resource> sourceResource;
+			sourceView->GetResource(sourceResource.put());
+			source = DescribeResource(sourceResource.get());
+		}
+		UINT viewportCount = 1;
+		D3D11_VIEWPORT currentViewport{};
+		if (context)
+			context->RSGetViewports(&viewportCount, &currentViewport);
+		const auto framebuffer = DescribeEngineSlot(RE::RENDER_TARGET::kFRAMEBUFFER);
+		const auto menuBackground = DescribeEngineSlot(RE::RENDER_TARGET::kMENUBG);
+		const auto mainColor = DescribeEngineSlot(RE::RENDER_TARGET::kMAIN);
+		NamedExtent framebufferRTV{ "null", 0, 0 };
+		if (auto* renderer = globals::game::renderer)
+			framebufferRTV = DescribeRTV(renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGET::kFRAMEBUFFER].RTV);
+		const bool uiBufferRedirect = swapChain.useArise ||
+			(upscaling.ShouldUseFrameGenerationThisFrame() && !upscaling.UsesDLSSGFrameGen());
+		logger::info(
+			"[MENUCOPY] stage={} frame={} dest={} {}x{} src={} {}x{} vp={:.0f}x{:.0f} gfx={}x{} screenSize={:.0f}x{:.0f} R={}x{} D={}x{} fbTex={} {}x{} fbRTV={} {}x{} menuBG={} {}x{} main={} {}x{} fgAllow={} fgThis={} fgActive={} useArise={} useDLSSG={} uiBuf={} world={} mainMenu={} load={} paused={}",
+			stage,
+			state ? state->frameCount : 0u,
+			dest.name, dest.width, dest.height,
+			source.name, source.width, source.height,
+			currentViewport.Width, currentViewport.Height,
+			viewport ? viewport->screenWidth : 0u, viewport ? viewport->screenHeight : 0u,
+			state ? state->screenSize.x : 0.0f, state ? state->screenSize.y : 0.0f,
+			swapChain.LogicalWidth(), swapChain.LogicalHeight(),
+			swapChain.PhysicalWidth(), swapChain.PhysicalHeight(),
+			framebuffer.name, framebuffer.width, framebuffer.height,
+			framebufferRTV.name, framebufferRTV.width, framebufferRTV.height,
+			menuBackground.name, menuBackground.width, menuBackground.height,
+			mainColor.name, mainColor.width, mainColor.height,
+			upscaling.settings.frameGenerationAllowInMenus ? 1 : 0,
+			upscaling.ShouldUseFrameGenerationThisFrame() ? 1 : 0,
+			upscaling.IsFrameGenerationActive() ? 1 : 0,
+			swapChain.useArise ? 1 : 0,
+			swapChain.useDLSSG ? 1 : 0,
+			uiBufferRedirect ? 1 : 0,
+			state && state->worldRenderedThisFrame ? 1 : 0,
+			state && state->isMainMenuOpen ? 1 : 0,
+			state && state->isLoadingMenuOpen ? 1 : 0,
+			state && state->IsPausedOrMenuOpen(globals::game::ui) ? 1 : 0);
+	}
+
+	ID3D11PixelShader* MenuBackgroundBlitPS()
+	{
+		static winrt::com_ptr<ID3D11PixelShader> blitPS;
+		if (!blitPS) {
+			blitPS.attach(static_cast<ID3D11PixelShader*>(
+				Util::CompileShader(L"Data/Shaders/Upscaling/PerfMode/MenuBGBlitPS.hlsl",
+					{ { "PSHADER", "" } }, "ps_5_0")));
+		}
+		return blitPS.get();
+	}
+
+	ID3D11SamplerState* MenuBackgroundBlitSampler()
+	{
+		static winrt::com_ptr<ID3D11SamplerState> linearSampler;
+		if (!linearSampler && globals::d3d::device) {
+			D3D11_SAMPLER_DESC samplerDesc{};
+			samplerDesc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+			samplerDesc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+			samplerDesc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+			samplerDesc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+			samplerDesc.MaxAnisotropy = 1;
+			samplerDesc.MaxLOD = D3D11_FLOAT32_MAX;
+			globals::d3d::device->CreateSamplerState(&samplerDesc, linearSampler.put());
+		}
+		return linearSampler.get();
+	}
+
+	void BlitSrvToSwapChain(ID3D11ShaderResourceView* source)
+	{
+		auto* context = globals::d3d::context;
+		auto& swapChain = globals::features::upscaling.dx12SwapChain;
+		auto* destination = swapChain.swapChainBufferWrapped ? swapChain.swapChainBufferWrapped->rtv : nullptr;
+		auto* vertexShader = globals::features::upscaling.GetUpscaleVS();
+		auto* pixelShader = MenuBackgroundBlitPS();
+		auto* sampler = MenuBackgroundBlitSampler();
+		D3D11_TEXTURE2D_DESC destinationDesc{};
+		if (!context || !source || !destination || !vertexShader || !pixelShader || !sampler ||
+			!Util::GetTexture2DDesc(destination, destinationDesc))
+			return;
+
+		CS_GPU_PASS("FoveatedRender::SwapChainBackgroundBlit");
+		Util::FullscreenPassScope stateScope(context);
+		D3D11_VIEWPORT viewport{};
+		viewport.Width = static_cast<float>(destinationDesc.Width);
+		viewport.Height = static_cast<float>(destinationDesc.Height);
+		viewport.MaxDepth = 1.0f;
+		context->RSSetViewports(1, &viewport);
+		context->IASetInputLayout(nullptr);
+		context->IASetVertexBuffers(0, 0, nullptr, nullptr, nullptr);
+		context->IASetIndexBuffer(nullptr, DXGI_FORMAT_UNKNOWN, 0);
+		context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+		context->VSSetShader(vertexShader, nullptr, 0);
+		context->PSSetShader(pixelShader, nullptr, 0);
+		context->OMSetBlendState(nullptr, nullptr, 0xffffffff);
+		context->OMSetDepthStencilState(nullptr, 0);
+		context->RSSetState(nullptr);
+		ID3D11ShaderResourceView* views[] = { source };
+		ID3D11SamplerState* samplers[] = { sampler };
+		context->PSSetShaderResources(0, 1, views);
+		context->PSSetSamplers(0, 1, samplers);
+		context->OMSetRenderTargets(1, &destination, nullptr);
+		context->Draw(3, 0);
+	}
+
+	bool LeavePausedMenuUnpatched()
+	{
+		auto* state = globals::state;
+		if (!state || state->IsMainOrLoadingMenuOpen() || state->isMapMenuOpen)
+			return false;
+		if (state->isStatsMenuOpen)
+			return true;
+		auto* ui = globals::game::ui;
+		return ui && ui->GameIsPaused();
+	}
+
+	template <class Hook>
+	void RunImagespaceAtDestinationViewport(void* imageSpaceShader, RE::BSTriShape* shape, RE::ImageSpaceEffectParam* param)
+	{
+		if (LeavePausedMenuUnpatched()) {
+			Hook::func(imageSpaceShader, shape, param);
+			return;
+		}
+		auto& foveated = globals::features::upscaling.foveatedRender;
+		foveated.LogMenuPipeline("preCopy");
+		{
+			LogicalTargetRenderScope scope;
+			Hook::func(imageSpaceShader, shape, param);
+		}
+		foveated.LogMenuPipeline("postCopy");
+	}
+
 	template <class Original>
 	void RunDistantBlurAtLogicalTarget(Original& original, void* imageSpaceShader,
 		RE::BSTriShape* shape, RE::ImageSpaceEffectParam* param)
@@ -179,17 +439,74 @@ namespace
 	}
 }
 
-void FoveatedRender::MenuCopyRenderHook::thunk(
-	void* imageSpaceShader, RE::BSTriShape* shape, RE::ImageSpaceEffectParam* param)
+void FoveatedRender::LogMenuPipeline(const char* stage) const
+{
+	if (!menuCopyDiagnostics.load(std::memory_order_acquire))
+		return;
+	LogMenuPipelineImpl(stage);
+}
+
+void FoveatedRender::BlitTitleBackgroundToSwapChain() const
 {
 	auto* state = globals::state;
-	if (!state || (state->worldRenderedThisFrame && !state->IsPausedOrMenuOpen(RE::UI::GetSingleton()))) {
-		func(imageSpaceShader, shape, param);
+	if (globals::game::isVR || !WantsLogicalPerfMode() || !state ||
+		state->worldRenderedThisFrame || !state->IsMainOrLoadingMenuOpen())
 		return;
-	}
 
-	LogicalTargetRenderScope scope;
-	func(imageSpaceShader, shape, param);
+	auto* context = globals::d3d::context;
+	auto* renderer = globals::game::renderer;
+	auto& swapChain = globals::features::upscaling.dx12SwapChain;
+	if (!context || !renderer || !swapChain.swapChainBufferWrapped || !swapChain.swapChainBufferWrapped->rtv)
+		return;
+
+	auto& menuBackground = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGET::kMENUBG];
+	if (!menuBackground.SRV)
+		return;
+	BlitSrvToSwapChain(menuBackground.SRV);
+	LogMenuPipeline("titleBlit");
+}
+
+void FoveatedRender::MapRenderHook::thunk(
+	void* imageSpaceShader, RE::BSTriShape* shape, RE::ImageSpaceEffectParam* param)
+{
+	RunImagespaceAtDestinationViewport<MapRenderHook>(imageSpaceShader, shape, param);
+}
+
+void FoveatedRender::WorldMapRenderHook::thunk(
+	void* imageSpaceShader, RE::BSTriShape* shape, RE::ImageSpaceEffectParam* param)
+{
+	RunImagespaceAtDestinationViewport<WorldMapRenderHook>(imageSpaceShader, shape, param);
+}
+
+void FoveatedRender::WorldMapNoSkyBlurRenderHook::thunk(
+	void* imageSpaceShader, RE::BSTriShape* shape, RE::ImageSpaceEffectParam* param)
+{
+	RunImagespaceAtDestinationViewport<WorldMapNoSkyBlurRenderHook>(imageSpaceShader, shape, param);
+}
+
+void FoveatedRender::HDRTonemapRenderHook::thunk(
+	void* imageSpaceShader, RE::BSTriShape* shape, RE::ImageSpaceEffectParam* param)
+{
+	RunImagespaceAtDestinationViewport<HDRTonemapRenderHook>(imageSpaceShader, shape, param);
+}
+
+void FoveatedRender::HDRTonemapFadeRenderHook::thunk(
+	void* imageSpaceShader, RE::BSTriShape* shape, RE::ImageSpaceEffectParam* param)
+{
+	RunImagespaceAtDestinationViewport<HDRTonemapFadeRenderHook>(imageSpaceShader, shape, param);
+}
+
+void FoveatedRender::RendererUpdateViewPortHook::thunk(
+	RE::BSGraphics::Renderer* renderer, std::uint32_t width, std::uint32_t height, bool disableScale)
+{
+	auto& swapChain = globals::features::upscaling.dx12SwapChain;
+	if (!globals::game::isVR && globals::features::upscaling.foveatedRender.WantsLogicalPerfMode() &&
+		swapChain.useArise && !LeavePausedMenuUnpatched() &&
+		width == swapChain.PhysicalWidth() && height == swapChain.PhysicalHeight()) {
+		width = swapChain.LogicalWidth();
+		height = swapChain.LogicalHeight();
+	}
+	func(renderer, width, height, disableScale);
 }
 
 void FoveatedRender::DistantBlurRenderHook::thunk(void* imageSpaceShader, RE::BSTriShape* shape, RE::ImageSpaceEffectParam* param)
@@ -215,9 +532,23 @@ void FoveatedRender::ID3D11DeviceContext_RSSetViewportsHook::thunk(
 		return;
 	}
 
+	auto& foveated = globals::features::upscaling.foveatedRender;
+	const bool logCopy = foveated.menuCopyDiagnostics.load(std::memory_order_acquire);
+
 	winrt::com_ptr<ID3D11RenderTargetView> target;
 	context->OMGetRenderTargets(1, target.put(), nullptr);
 	if (!target) {
+		D3D11_VIEWPORT corrected = viewports[0];
+		const bool rewritten = TryLogicalViewportFromPhysicalLeak(corrected);
+		if (logCopy)
+			logger::info("[MENUCOPY] stage=setVP dest=none requested={:.0f}x{:.0f} rewritten={} final={:.0f}x{:.0f}",
+				viewports[0].Width, viewports[0].Height, rewritten ? 1 : 0,
+				rewritten ? corrected.Width : viewports[0].Width,
+				rewritten ? corrected.Height : viewports[0].Height);
+		if (rewritten) {
+			func(context, 1, &corrected);
+			return;
+		}
 		func(context, viewportCount, viewports);
 		return;
 	}
@@ -244,6 +575,12 @@ void FoveatedRender::ID3D11DeviceContext_RSSetViewportsHook::thunk(
 	corrected.TopLeftY = 0.0f;
 	corrected.Width = static_cast<float>(std::max(1u, textureDesc.Width >> viewDesc.Texture2D.MipSlice));
 	corrected.Height = static_cast<float>(std::max(1u, textureDesc.Height >> viewDesc.Texture2D.MipSlice));
+	if (logCopy) {
+		const auto dest = DescribeResource(texture.get());
+		logger::info("[MENUCOPY] stage=setVP dest={} {}x{} requested={:.0f}x{:.0f} rewritten={:.0f}x{:.0f}",
+			dest.name, dest.width, dest.height,
+			viewports[0].Width, viewports[0].Height, corrected.Width, corrected.Height);
+	}
 	func(context, 1, &corrected);
 }
 
@@ -759,66 +1096,134 @@ const char* FoveatedRender::SubrectMaskModeName(SubrectMaskMode mode)
 	           T(TKEY("foveated_mask_rectangle"), "Rectangle");
 }
 
-void FoveatedRender::DrawNeuralRenderingSettings()
+void FoveatedRender::DrawLogicalPerfModeControls()
+{
+	if (globals::game::isVR)
+		return;
+	ClampSettings();
+
+	auto& upscaling = globals::features::upscaling;
+	int mode = settings.ariseModel3 ? 2 : (settings.singleThreadPerfMode ? 1 : 0);
+	if (ImGui::RadioButton(T(TKEY("pipeline_origin"), "Origin (engine D, viewport R)"), mode == 0)) {
+		settings.ariseModel3 = false;
+		settings.singleThreadPerfMode = false;
+	}
+	if (ImGui::RadioButton(T(TKEY("pipeline_single_thread"), "Single-thread PerfMode"), mode == 1)) {
+		settings.ariseModel3 = false;
+		settings.singleThreadPerfMode = true;
+		settings.ariseBufferCount = 3;
+	}
+	if (ImGui::RadioButton(T(TKEY("pipeline_arise"), "ARISE Async PerfMode"), mode == 2)) {
+		settings.ariseModel3 = true;
+		settings.singleThreadPerfMode = false;
+		settings.ariseBufferCount = 3;
+	}
+	Util::UI::RestartGatedAnnotate(bootSnapshot, settings, &Settings::ariseModel3,
+		T(TKEY("pipeline_arise_restart"),
+			"ARISE: three-slot logical Present tail. Restart required; HDR is not supported."));
+	Util::UI::RestartGatedAnnotate(bootSnapshot, settings, &Settings::singleThreadPerfMode,
+		T(TKEY("pipeline_single_thread_restart"),
+			"Same logical R proxy and six-pass graph on the Present calling thread."));
+	if (upscaling.dx12SwapChain.useArise)
+		ImGui::TextDisabled("%s", upscaling.dx12SwapChain.IsAriseAsyncTail() ?
+			T(TKEY("pipeline_active_arise"), "Active this session: ARISE asynchronous Tail") :
+			T(TKEY("pipeline_active_single_thread"), "Active this session: Single-thread synchronous Tail"));
+	else
+		ImGui::TextDisabled("%s", T(TKEY("pipeline_active_origin"), "Active this session: Origin (engine RTs at D)"));
+}
+
+void FoveatedRender::DrawNeuralRenderingSettings(bool wrapHeader)
 {
 	ClampSettings();
 
-	if (ImGui::CollapsingHeader(T(TKEY("neural_rendering_header"), "DLSS Neural Rendering"), ImGuiTreeNodeFlags_DefaultOpen)) {
+	if (wrapHeader && !ImGui::CollapsingHeader(T(TKEY("neural_rendering_header"), "DLSS Neural Rendering"), ImGuiTreeNodeFlags_DefaultOpen))
+		return;
+
+	{
 		auto& upscaling = globals::features::upscaling;
-		static const char* qualityModes[] = { "DLAA / Native", "Quality", "Balanced", "Performance", "Ultra Performance" };
-		static const char* dlssPresets[] = { "Default", "Preset J", "Preset K", "Preset L", "Preset M" };
-		static const char* jitterModes[] = { "Actual Camera Jitter", "Zero" };
+		const char* qualityModes[] = {
+			T(TKEY("quality_dlaa"), "DLAA / Native"),
+			T(TKEY("quality_quality"), "Quality"),
+			T(TKEY("quality_balanced"), "Balanced"),
+			T(TKEY("quality_performance"), "Performance"),
+			T(TKEY("quality_ultra_performance"), "Ultra Performance")
+		};
+		const char* dlssPresets[] = {
+			T(TKEY("dlss_preset_default"), "Default"),
+			T(TKEY("dlss_preset_j"), "Preset J"),
+			T(TKEY("dlss_preset_k"), "Preset K"),
+			T(TKEY("dlss_preset_l"), "Preset L"),
+			T(TKEY("dlss_preset_m"), "Preset M")
+		};
+		const char* jitterModes[] = {
+			T(TKEY("jitter_actual"), "Actual Camera Jitter"),
+			T(TKEY("jitter_zero"), "Zero")
+		};
 		if (!globals::game::isVR) {
-			static const char* act1Backends[] = { "Bypass", "DLSS", "FSR3" };
-			ImGui::TextDisabled("Injection Point: PostInject LDR / Before UI (fixed)");
-			ImGui::TextDisabled("Execution: ACT1 SR -> ACT1 DS -> NR -> ACT2 SR -> Fusion -> RCAS");
+			const char* act1Backends[] = {
+				T(TKEY("act1_backend_bypass"), "Bypass"),
+				T(TKEY("act1_backend_dlss"), "DLSS"),
+				T(TKEY("act1_backend_fsr3"), "FSR3")
+			};
+			ImGui::TextDisabled("%s", T(TKEY("injection_point"), "Injection Point: PostInject LDR / Before UI (fixed)"));
+			ImGui::TextDisabled("%s", T(TKEY("six_pass_order"), "Execution: ACT1 SR -> ACT1 DS -> NR -> ACT2 SR -> Fusion -> RCAS"));
 			ImGui::Separator();
-			ImGui::TextUnformatted("ACT1 SR - Scene R to Guidance G");
+			ImGui::TextUnformatted(T(TKEY("act1_sr_header"), "ACT1 SR - Scene R to Guidance G"));
 			if (WantsLogicalPerfMode())
-				ImGui::TextDisabled("ACT1 SR Backend: DLSS (fixed for ARISE)");
+				ImGui::TextDisabled("%s", T(TKEY("act1_sr_backend_fixed"), "ACT1 SR Backend: DLSS (fixed for ARISE)"));
 			else
-				ImGui::Combo("ACT1 SR Backend", reinterpret_cast<int*>(&settings.flatPipelineAct1Backend),
+				ImGui::Combo(T(TKEY("act1_sr_backend"), "ACT1 SR Backend"), reinterpret_cast<int*>(&settings.flatPipelineAct1Backend),
 					act1Backends, IM_ARRAYSIZE(act1Backends));
 			if (settings.flatPipelineAct1Backend != 0) {
-				ImGui::Combo(WantsLogicalPerfMode() ? "Engine R Preset (Restart)" : "ACT1 Quality",
+				ImGui::Combo(WantsLogicalPerfMode() ?
+					T(TKEY("engine_r_preset"), "Engine R Preset (Restart)") :
+					T(TKEY("act1_quality"), "ACT1 Quality"),
 					reinterpret_cast<int*>(&settings.flatPipelineAct1Quality), qualityModes, IM_ARRAYSIZE(qualityModes));
 				if (WantsLogicalPerfMode()) {
 					Util::UI::RestartGatedAnnotate(bootSnapshot, settings, &Settings::flatPipelineAct1Quality,
-						"Defines the logical scene resolution allocated from physical display resolution.");
+						T(TKEY("engine_r_preset_help"),
+							"Defines the logical scene resolution allocated from physical display resolution."));
 					if (bootSnapshot.HasPendingChange(settings, &Settings::flatPipelineAct1Quality)) {
 						const auto activeQuality = std::min(
 							bootSnapshot.Boot(&Settings::flatPipelineAct1Quality),
 							static_cast<uint>(IM_ARRAYSIZE(qualityModes) - 1));
-						ImGui::TextDisabled("Active this session: %s (restart to apply selection)", qualityModes[activeQuality]);
+						ImGui::TextDisabled(T(TKEY("engine_r_preset_active"),
+							"Active this session: %s (restart to apply selection)"), qualityModes[activeQuality]);
 					}
 				}
 				if (settings.flatPipelineAct1Backend == static_cast<uint>(FlatAct1Backend::kDLSS)) {
-					ImGui::Checkbox("Super Resolution Super Sampling (SRSS)", &settings.unifiedPipeline.act1Srss);
+					ImGui::Checkbox(T(TKEY("srss"), "Super Resolution Super Sampling (SRSS)"), &settings.unifiedPipeline.act1Srss);
 					if (WantsLogicalPerfMode())
 						Util::UI::RestartGatedAnnotate(unifiedBootSnapshot, settings.unifiedPipeline,
-							&UnifiedPipelineSettings::act1Srss, "Changes the ACT1 Guidance G resource contract.");
+							&UnifiedPipelineSettings::act1Srss, T(TKEY("srss_restart"), "Changes the ACT1 Guidance G resource contract."));
 					if (!settings.unifiedPipeline.act1Srss)
-						ImGui::TextDisabled("SRSS Off: Guidance G equals Display D");
+						ImGui::TextDisabled("%s", T(TKEY("srss_off"), "SRSS Off: Guidance G equals Display D"));
 					if (settings.unifiedPipeline.act1Srss) {
-						static const char* srssModes[] = { "Performance", "Ultra Performance" };
+						const char* srssModes[] = {
+							T(TKEY("quality_performance"), "Performance"),
+							T(TKEY("quality_ultra_performance"), "Ultra Performance")
+						};
 						int srssMode = static_cast<int>(settings.unifiedPipeline.act1SrssQuality - 3);
-						if (ImGui::Combo("SRSS Mode", &srssMode, srssModes, IM_ARRAYSIZE(srssModes)))
+						if (ImGui::Combo(T(TKEY("srss_mode"), "SRSS Mode"), &srssMode, srssModes, IM_ARRAYSIZE(srssModes)))
 							settings.unifiedPipeline.act1SrssQuality = static_cast<uint>(srssMode + 3);
 						if (WantsLogicalPerfMode())
 							Util::UI::RestartGatedAnnotate(unifiedBootSnapshot, settings.unifiedPipeline,
 								&UnifiedPipelineSettings::act1SrssQuality);
 						if (settings.unifiedPipeline.act1SrssQuality == 3) {
-							ImGui::TextDisabled("SRSS Preset: Preset K (fixed)");
+							ImGui::TextDisabled("%s", T(TKEY("srss_preset_k"), "SRSS Preset: Preset K (fixed)"));
 						} else {
-							static const char* srssPresets[] = { "Preset L", "Preset M" };
+							const char* srssPresets[] = {
+								T(TKEY("dlss_preset_l"), "Preset L"),
+								T(TKEY("dlss_preset_m"), "Preset M")
+							};
 							int srssPreset = static_cast<int>(settings.unifiedPipeline.act1SrssPreset - 3);
-							if (ImGui::Combo("SRSS Preset", &srssPreset, srssPresets, IM_ARRAYSIZE(srssPresets)))
+							if (ImGui::Combo(T(TKEY("srss_preset"), "SRSS Preset"), &srssPreset, srssPresets, IM_ARRAYSIZE(srssPresets)))
 								settings.unifiedPipeline.act1SrssPreset = static_cast<uint>(srssPreset + 3);
 							if (WantsLogicalPerfMode())
 								Util::UI::RestartGatedAnnotate(unifiedBootSnapshot, settings.unifiedPipeline,
 									&UnifiedPipelineSettings::act1SrssPreset);
 						}
-						ImGui::SliderFloat("Guidance Scale (G/D)", &settings.unifiedPipeline.guidanceScale,
+						ImGui::SliderFloat(T(TKEY("guidance_scale"), "Guidance Scale (G/D)"), &settings.unifiedPipeline.guidanceScale,
 							1.0f, 2.0f, "%.2fx");
 						if (WantsLogicalPerfMode())
 							Util::UI::RestartGatedAnnotate(unifiedBootSnapshot, settings.unifiedPipeline,
@@ -829,20 +1234,22 @@ void FoveatedRender::DrawNeuralRenderingSettings()
 								unifiedBootSnapshot.HasPendingChange(settings.unifiedPipeline, &UnifiedPipelineSettings::act1SrssQuality) ||
 								unifiedBootSnapshot.HasPendingChange(settings.unifiedPipeline, &UnifiedPipelineSettings::act1SrssPreset) ||
 								unifiedBootSnapshot.HasPendingChange(settings.unifiedPipeline, &UnifiedPipelineSettings::guidanceScale)))
-							ImGui::TextDisabled("Active this session: %s, mode %u, preset %u, G/D %.2fx",
-								active.act1Srss ? "SRSS On" : "SRSS Off", active.act1SrssQuality,
+							ImGui::TextDisabled(T(TKEY("srss_active_session"),
+								"Active this session: %s, mode %u, preset %u, G/D %.2fx"),
+								active.act1Srss ? T(TKEY("srss_on"), "SRSS On") : T(TKEY("srss_off_label"), "SRSS Off"),
+								active.act1SrssQuality,
 								active.act1SrssPreset, active.guidanceScale);
-						ImGui::TextDisabled("Recommended: Ultra Performance + Preset M");
+						ImGui::TextDisabled("%s", T(TKEY("srss_recommended"), "Recommended: Ultra Performance + Preset M"));
 					} else {
-						ImGui::Combo("ACT1 DLSS Preset", reinterpret_cast<int*>(&settings.flatPipelineAct1Preset),
+						ImGui::Combo(T(TKEY("act1_dlss_preset"), "ACT1 DLSS Preset"), reinterpret_cast<int*>(&settings.flatPipelineAct1Preset),
 							dlssPresets, IM_ARRAYSIZE(dlssPresets));
 					}
 				}
-				ImGui::Combo("ACT1 Jitter Submission", reinterpret_cast<int*>(&settings.flatPipelineAct1Jitter), jitterModes, IM_ARRAYSIZE(jitterModes));
+				ImGui::Combo(T(TKEY("act1_jitter"), "ACT1 Jitter Submission"), reinterpret_cast<int*>(&settings.flatPipelineAct1Jitter), jitterModes, IM_ARRAYSIZE(jitterModes));
 			}
-			ImGui::TextUnformatted("ACT1 DS - Guidance G to Neural N");
-			ImGui::TextDisabled("Filter: HQ Lanczos (runs whenever G differs from N)");
-			ImGui::TextDisabled("Footprint Integral (planned / unavailable)");
+			ImGui::TextUnformatted(T(TKEY("act1_ds_header"), "ACT1 DS - Guidance G to Neural N"));
+			ImGui::TextDisabled("%s", T(TKEY("act1_ds_filter"), "Filter: HQ Lanczos (runs whenever G differs from N)"));
+			ImGui::TextDisabled("%s", T(TKEY("footprint_planned"), "Footprint Integral (planned / unavailable)"));
 			ImGui::Separator();
 		}
 
@@ -854,20 +1261,21 @@ void FoveatedRender::DrawNeuralRenderingSettings()
 				globals::features::upscaling.perfMode.IsHookActive()));
 		if (!supportedRoute) {
 			if (globals::features::upscaling.IsFrameGenerationConfiguredForSession())
-				Util::Text::Warning("Disable Frame Generation and restart the game before enabling DLSS Neural Rendering.");
+				Util::Text::Warning(T(TKEY("neural_rendering_disable_fg"),
+					"Disable Frame Generation and restart the game before enabling DLSS Neural Rendering."));
 			else
 				Util::Text::Warning(T(TKEY("neural_rendering_unavailable"),
 					"Requires DLSS. VR additionally requires Foveated Default mode and active PerfMode."));
 			ImGui::BeginDisabled();
 		}
-		ImGui::TextUnformatted("Neural Rendering");
+		ImGui::TextUnformatted(T(TKEY("neural_rendering"), "Neural Rendering"));
 		ImGui::Checkbox(T(TKEY("neural_rendering_enable"), "Enable DLSS Neural Rendering"), &settings.neuralRenderingEnabled);
 
 		if (settings.neuralRenderingEnabled) {
 			if (!globals::game::isVR) {
 				ImGui::Separator();
-				ImGui::TextUnformatted("NR");
-				ImGui::SliderFloat("NR Resolution Scale", &settings.flatPipelineNrScale, 0.33f, 0.95f, "%.2f");
+				ImGui::TextUnformatted(T(TKEY("nr_header"), "NR"));
+				ImGui::SliderFloat(T(TKEY("nr_resolution_scale"), "NR Resolution Scale"), &settings.flatPipelineNrScale, 0.33f, 0.95f, "%.2f");
 				{
 					const bool model3 = globals::features::upscaling.dx12SwapChain.useArise;
 					const auto preview = BuildFlatPipelinePlan(
@@ -879,43 +1287,69 @@ void FoveatedRender::DrawNeuralRenderingSettings()
 						model3 ? globals::features::upscaling.dx12SwapChain.LogicalHeight() : 0u);
 					const double displayPixels = static_cast<double>(preview.displayWidth) * preview.displayHeight;
 					const double nrPixels = static_cast<double>(preview.nrWidth) * preview.nrHeight;
-					ImGui::TextDisabled("R %ux%u -> G %ux%u -> N %ux%u -> D %ux%u",
+					ImGui::TextDisabled(T(TKEY("pipeline_extents"),
+						"R %ux%u -> G %ux%u -> N %ux%u -> D %ux%u"),
 						preview.renderR.width, preview.renderR.height,
 						preview.guidanceG.width, preview.guidanceG.height,
 						preview.neuralN.width, preview.neuralN.height,
 						preview.displayD.width, preview.displayD.height);
-					ImGui::TextDisabled("Neural N: %.1f%% of Display D pixels",
+					ImGui::TextDisabled(T(TKEY("neural_n_percent"),
+						"Neural N: %.1f%% of Display D pixels"),
 						displayPixels > 0.0 ? nrPixels * 100.0 / displayPixels : 0.0);
 				}
 				{
-					static const char* act2Backends[] = { "DLSS", "FSR3", "NIS", "HQ Lanczos" };
-					static const char* model3Act2Backends[] = { "DLSS", "HQ Lanczos" };
+					const char* act2Backends[] = {
+						T(TKEY("act2_backend_dlss"), "DLSS"),
+						T(TKEY("act2_backend_fsr3"), "FSR3"),
+						T(TKEY("act2_backend_nis"), "NIS"),
+						T(TKEY("act2_backend_lanczos"), "HQ Lanczos")
+					};
+					const char* model3Act2Backends[] = {
+						T(TKEY("act2_backend_dlss"), "DLSS"),
+						T(TKEY("act2_backend_lanczos"), "HQ Lanczos")
+					};
 					ImGui::Separator();
-					ImGui::TextUnformatted("ACT2 SR");
+					ImGui::TextUnformatted(T(TKEY("act2_sr_header"), "ACT2 SR"));
 					if (WantsLogicalPerfMode()) {
 						int model3Act2 = settings.unifiedPipeline.act2SrBackend ==
 							static_cast<uint>(FlatAct2SrBackend::kLanczos) ? 1 : 0;
-						if (ImGui::Combo("ACT2 SR Backend", &model3Act2, model3Act2Backends, IM_ARRAYSIZE(model3Act2Backends)))
+						if (ImGui::Combo(T(TKEY("act2_sr_backend"), "ACT2 SR Backend"), &model3Act2, model3Act2Backends, IM_ARRAYSIZE(model3Act2Backends)))
 							settings.unifiedPipeline.act2SrBackend = model3Act2 ?
 								static_cast<uint>(FlatAct2SrBackend::kLanczos) : static_cast<uint>(FlatAct2SrBackend::kDLSS);
 					} else {
-						ImGui::Combo("ACT2 SR Backend", reinterpret_cast<int*>(&settings.unifiedPipeline.act2SrBackend),
+						ImGui::Combo(T(TKEY("act2_sr_backend"), "ACT2 SR Backend"), reinterpret_cast<int*>(&settings.unifiedPipeline.act2SrBackend),
 							act2Backends, IM_ARRAYSIZE(act2Backends));
 					}
 					if (settings.unifiedPipeline.act2SrBackend == static_cast<uint>(FlatAct2SrBackend::kDLSS))
-						ImGui::Combo("ACT2 DLSS Preset", reinterpret_cast<int*>(&settings.flatPipelineAct2Preset), dlssPresets, IM_ARRAYSIZE(dlssPresets));
+						ImGui::Combo(T(TKEY("act2_dlss_preset"), "ACT2 DLSS Preset"), reinterpret_cast<int*>(&settings.flatPipelineAct2Preset), dlssPresets, IM_ARRAYSIZE(dlssPresets));
 					if (settings.unifiedPipeline.act2SrBackend == static_cast<uint>(FlatAct2SrBackend::kDLSS) ||
 						settings.unifiedPipeline.act2SrBackend == static_cast<uint>(FlatAct2SrBackend::kFSR3))
-						ImGui::Combo("ACT2 Jitter Submission", reinterpret_cast<int*>(&settings.flatPipelineAct2Jitter), jitterModes, IM_ARRAYSIZE(jitterModes));
-					ImGui::TextDisabled("ACT2 Spatial Filter: HQ Lanczos");
-					ImGui::TextDisabled("Footprint Integral (planned / unavailable)");
-					ImGui::Checkbox("Enable ACT2 Fusion", &settings.unifiedPipeline.fusionEnabled);
+						ImGui::Combo(T(TKEY("act2_jitter"), "ACT2 Jitter Submission"), reinterpret_cast<int*>(&settings.flatPipelineAct2Jitter), jitterModes, IM_ARRAYSIZE(jitterModes));
+					ImGui::TextDisabled("%s", T(TKEY("act2_spatial_filter"), "ACT2 Spatial Filter: HQ Lanczos"));
+					ImGui::TextDisabled("%s", T(TKEY("footprint_planned"), "Footprint Integral (planned / unavailable)"));
+					ImGui::Checkbox(T(TKEY("act2_fusion"), "Enable ACT2 Fusion"), &settings.unifiedPipeline.fusionEnabled);
 					if (settings.unifiedPipeline.fusionEnabled) {
-						static const char* fusionDirections[] = { "ACT1 guides NR", "NR guides ACT1" };
-						static const char* denoiseModes[] = { "Off", "Residual Bilateral", "Soft Gaussian", "Luma Preserve", "Strong Clean" };
-						static const char* fusionPresets[] = { "Custom", "Clean", "Soft", "Dreamy", "Detail", "NR Led" };
+						const char* fusionDirections[] = {
+							T(TKEY("fusion_dir_act1"), "ACT1 guides NR"),
+							T(TKEY("fusion_dir_nr"), "NR guides ACT1")
+						};
+						const char* denoiseModes[] = {
+							T(TKEY("fusion_denoise_off"), "Off"),
+							T(TKEY("fusion_denoise_bilateral"), "Residual Bilateral"),
+							T(TKEY("fusion_denoise_gaussian"), "Soft Gaussian"),
+							T(TKEY("fusion_denoise_luma"), "Luma Preserve"),
+							T(TKEY("fusion_denoise_strong"), "Strong Clean")
+						};
+						const char* fusionPresets[] = {
+							T(TKEY("fusion_preset_custom"), "Custom"),
+							T(TKEY("fusion_preset_clean"), "Clean"),
+							T(TKEY("fusion_preset_soft"), "Soft"),
+							T(TKEY("fusion_preset_dreamy"), "Dreamy"),
+							T(TKEY("fusion_preset_detail"), "Detail"),
+							T(TKEY("fusion_preset_nr_led"), "NR Led")
+						};
 						int fusionPreset = static_cast<int>(settings.neuralRenderingFusionPreset);
-						if (ImGui::Combo("Fusion Preset", &fusionPreset, fusionPresets, IM_ARRAYSIZE(fusionPresets))) {
+						if (ImGui::Combo(T(TKEY("fusion_preset"), "Fusion Preset"), &fusionPreset, fusionPresets, IM_ARRAYSIZE(fusionPresets))) {
 							settings.neuralRenderingFusionPreset = static_cast<uint>(fusionPreset);
 							switch (settings.neuralRenderingFusionPreset) {
 							case 1: settings.flatPipelineFusionDirection = 0; settings.flatPipelineFusionDenoise = 1; settings.flatPipelineFusionDenoiseStrength = 0.55f; settings.flatPipelineFusionSoftness = 0.25f; settings.flatPipelineFusionFrequencyGuidance = 0.70f; settings.flatPipelineFusionDepthGuidance = 0.80f; settings.neuralRenderingFusionLuma = 0.75f; settings.neuralRenderingFusionChroma = 0.50f; settings.neuralRenderingFusionEdgeProtection = 0.45f; settings.neuralRenderingFusionResidualLimit = 0.12f; break;
@@ -926,34 +1360,40 @@ void FoveatedRender::DrawNeuralRenderingSettings()
 							default: break;
 							}
 						}
-						ImGui::Combo("Fusion Direction", reinterpret_cast<int*>(&settings.flatPipelineFusionDirection), fusionDirections, IM_ARRAYSIZE(fusionDirections));
-						ImGui::Combo("Fusion Denoise", reinterpret_cast<int*>(&settings.flatPipelineFusionDenoise), denoiseModes, IM_ARRAYSIZE(denoiseModes));
+						ImGui::Combo(T(TKEY("fusion_direction"), "Fusion Direction"), reinterpret_cast<int*>(&settings.flatPipelineFusionDirection), fusionDirections, IM_ARRAYSIZE(fusionDirections));
+						ImGui::Combo(T(TKEY("fusion_denoise"), "Fusion Denoise"), reinterpret_cast<int*>(&settings.flatPipelineFusionDenoise), denoiseModes, IM_ARRAYSIZE(denoiseModes));
 						bool customFusion = false;
-						customFusion |= ImGui::SliderFloat("Fusion Denoise Strength", &settings.flatPipelineFusionDenoiseStrength, 0.0f, 1.0f, "%.2f");
-						customFusion |= ImGui::SliderFloat("Fusion Softness", &settings.flatPipelineFusionSoftness, 0.0f, 1.0f, "%.2f");
-						ImGui::Checkbox("Enable Enhanced Guidance", &settings.flatPipelineFusionEnhancedGuidance);
+						customFusion |= ImGui::SliderFloat(T(TKEY("fusion_denoise_strength"), "Fusion Denoise Strength"), &settings.flatPipelineFusionDenoiseStrength, 0.0f, 1.0f, "%.2f");
+						customFusion |= ImGui::SliderFloat(T(TKEY("fusion_softness"), "Fusion Softness"), &settings.flatPipelineFusionSoftness, 0.0f, 1.0f, "%.2f");
+						ImGui::Checkbox(T(TKEY("fusion_enhanced_guidance"), "Enable Enhanced Guidance"), &settings.flatPipelineFusionEnhancedGuidance);
 						if (settings.flatPipelineFusionEnhancedGuidance) {
-							customFusion |= ImGui::SliderFloat("Fusion Frequency Guidance", &settings.flatPipelineFusionFrequencyGuidance, 0.0f, 1.0f, "%.2f");
-							customFusion |= ImGui::SliderFloat("Fusion Depth Guidance", &settings.flatPipelineFusionDepthGuidance, 0.0f, 1.0f, "%.2f");
-							customFusion |= ImGui::SliderFloat("Fusion Color Guidance", &settings.flatPipelineFusionColorGuidance, 0.0f, 1.0f, "%.2f");
+							customFusion |= ImGui::SliderFloat(T(TKEY("fusion_frequency"), "Fusion Frequency Guidance"), &settings.flatPipelineFusionFrequencyGuidance, 0.0f, 1.0f, "%.2f");
+							customFusion |= ImGui::SliderFloat(T(TKEY("fusion_depth"), "Fusion Depth Guidance"), &settings.flatPipelineFusionDepthGuidance, 0.0f, 1.0f, "%.2f");
+							customFusion |= ImGui::SliderFloat(T(TKEY("fusion_color"), "Fusion Color Guidance"), &settings.flatPipelineFusionColorGuidance, 0.0f, 1.0f, "%.2f");
 						}
-						customFusion |= ImGui::SliderFloat("Fusion Luma", &settings.neuralRenderingFusionLuma, 0.0f, 1.5f, "%.2f");
-						customFusion |= ImGui::SliderFloat("Fusion Chroma", &settings.neuralRenderingFusionChroma, 0.0f, 1.5f, "%.2f");
-						customFusion |= ImGui::SliderFloat("Fusion Edge Protection", &settings.neuralRenderingFusionEdgeProtection, 0.0f, 1.0f, "%.2f");
-						customFusion |= ImGui::SliderFloat("Fusion Residual Limit", &settings.neuralRenderingFusionResidualLimit, 0.01f, 0.5f, "%.3f");
+						customFusion |= ImGui::SliderFloat(T(TKEY("fusion_luma"), "Fusion Luma"), &settings.neuralRenderingFusionLuma, 0.0f, 1.5f, "%.2f");
+						customFusion |= ImGui::SliderFloat(T(TKEY("fusion_chroma"), "Fusion Chroma"), &settings.neuralRenderingFusionChroma, 0.0f, 1.5f, "%.2f");
+						customFusion |= ImGui::SliderFloat(T(TKEY("fusion_edge"), "Fusion Edge Protection"), &settings.neuralRenderingFusionEdgeProtection, 0.0f, 1.0f, "%.2f");
+						customFusion |= ImGui::SliderFloat(T(TKEY("fusion_residual"), "Fusion Residual Limit"), &settings.neuralRenderingFusionResidualLimit, 0.01f, 0.5f, "%.3f");
 						if (customFusion)
 							settings.neuralRenderingFusionPreset = 0;
 					}
 				}
 				ImGui::Separator();
-				ImGui::TextUnformatted("Final Sharpen");
-				ImGui::Checkbox("Enable RCAS", &settings.flatPipelineSharpen);
+				ImGui::TextUnformatted(T(TKEY("final_sharpen"), "Final Sharpen"));
+				ImGui::Checkbox(T(TKEY("rcas_enable"), "Enable RCAS"), &settings.flatPipelineSharpen);
 				if (settings.flatPipelineSharpen)
-					ImGui::SliderFloat("RCAS Sharpness", &settings.flatPipelineSharpness, 0.0f, 1.0f, "%.2f");
+					ImGui::SliderFloat(T(TKEY("rcas_sharpness"), "RCAS Sharpness"), &settings.flatPipelineSharpness, 0.0f, 1.0f, "%.2f");
 			}
 			ImGui::Separator();
-			ImGui::TextUnformatted("NR Tuning");
-			static const char* presets[] = { "Custom", "Balanced", "Fabric Detail", "Natural", "Strong" };
+			ImGui::TextUnformatted(T(TKEY("nr_tuning"), "NR Tuning"));
+			const char* presets[] = {
+				T(TKEY("nr_preset_custom"), "Custom"),
+				T(TKEY("nr_preset_balanced"), "Balanced"),
+				T(TKEY("nr_preset_fabric"), "Fabric Detail"),
+				T(TKEY("nr_preset_natural"), "Natural"),
+				T(TKEY("nr_preset_strong"), "Strong")
+			};
 			int preset = static_cast<int>(settings.neuralRenderingPreset);
 			if (ImGui::Combo(T(TKEY("neural_rendering_preset"), "Tuning Preset"), &preset, presets, IM_ARRAYSIZE(presets))) {
 				settings.neuralRenderingPreset = static_cast<uint>(preset);
@@ -970,7 +1410,12 @@ void FoveatedRender::DrawNeuralRenderingSettings()
 			custom |= ImGui::SliderFloat(T(TKEY("neural_rendering_local_tone"), "Local Tone"), &settings.neuralRenderingLocalTone, 0.0f, 2.0f, "%.2f");
 			custom |= ImGui::SliderFloat(T(TKEY("neural_rendering_local_structure"), "Local Structure"), &settings.neuralRenderingLocalStructure, 0.0f, 2.0f, "%.2f");
 			custom |= ImGui::SliderFloat(T(TKEY("neural_rendering_skin_structure"), "Skin Structure"), &settings.neuralRenderingSkinStructure, 0.0f, 2.0f, "%.2f");
-			static const char* styles[] = { "Style 0", "Style 1", "Style 2", "Style 3" };
+			const char* styles[] = {
+				T(TKEY("nr_style_0"), "Style 0"),
+				T(TKEY("nr_style_1"), "Style 1"),
+				T(TKEY("nr_style_2"), "Style 2"),
+				T(TKEY("nr_style_3"), "Style 3")
+			};
 			int style = static_cast<int>(settings.neuralRenderingStyle);
 			if (ImGui::Combo(T(TKEY("neural_rendering_style"), "Style"), &style, styles, IM_ARRAYSIZE(styles))) {
 				settings.neuralRenderingStyle = static_cast<uint>(style);
@@ -981,23 +1426,27 @@ void FoveatedRender::DrawNeuralRenderingSettings()
 			if (custom)
 				settings.neuralRenderingPreset = 0;
 
-			if (ImGui::TreeNodeEx("Diagnostics")) {
+			if (ImGui::TreeNodeEx(T(TKEY("diagnostics"), "Diagnostics"))) {
 				if (!globals::game::isVR) {
-					if (ImGui::Checkbox("ARISE Async PerfMode", &settings.ariseModel3) && settings.ariseModel3) {
+					if (ImGui::Checkbox(T(TKEY("pipeline_arise"), "ARISE Async PerfMode"), &settings.ariseModel3) && settings.ariseModel3) {
 						settings.singleThreadPerfMode = false;
 						settings.ariseBufferCount = 3;
 					}
 					Util::UI::RestartGatedAnnotate(bootSnapshot, settings, &Settings::ariseModel3,
-						"Uses a three-slot logical Present tail. Restart required; HDR is not supported.");
-					if (ImGui::Checkbox("Single-thread PerfMode", &settings.singleThreadPerfMode) && settings.singleThreadPerfMode) {
+						T(TKEY("pipeline_arise_restart"),
+							"ARISE: three-slot logical Present tail. Restart required; HDR is not supported."));
+					if (ImGui::Checkbox(T(TKEY("pipeline_single_thread"), "Single-thread PerfMode"), &settings.singleThreadPerfMode) && settings.singleThreadPerfMode) {
 						settings.ariseModel3 = false;
 						settings.ariseBufferCount = 3;
 					}
 					Util::UI::RestartGatedAnnotate(bootSnapshot, settings, &Settings::singleThreadPerfMode,
-						"Uses the same logical R proxy and six-pass graph on the Present calling thread.");
+						T(TKEY("pipeline_single_thread_restart"),
+							"Same logical R proxy and six-pass graph on the Present calling thread."));
 					if (upscaling.dx12SwapChain.useArise)
-						ImGui::TextDisabled("Active execution: %s",
-							upscaling.dx12SwapChain.IsAriseAsyncTail() ? "ARISE asynchronous Tail" : "Single-thread synchronous Tail");
+						ImGui::TextDisabled(T(TKEY("diag_active_execution"), "Active execution: %s"),
+							upscaling.dx12SwapChain.IsAriseAsyncTail() ?
+								T(TKEY("diag_tail_async"), "ARISE asynchronous Tail") :
+								T(TKEY("diag_tail_sync"), "Single-thread Present Tail"));
 					ImGui::BeginDisabled(!upscaling.dx12SwapChain.useArise);
 					auto runtimeToggle = [](const char* label, std::atomic_bool& value) {
 						bool enabled = value.load(std::memory_order_relaxed);
@@ -1006,116 +1455,149 @@ void FoveatedRender::DrawNeuralRenderingSettings()
 						value.store(enabled, std::memory_order_release);
 						return true;
 					};
-					runtimeToggle("Model 3 Dimension Diagnostics", ariseDimensionDiagnostics);
-					runtimeToggle("Disable Model 3 UI Composite", ariseDisableUiComposite);
-					runtimeToggle("Force Synchronous Model 3", ariseForceSynchronous);
-					const bool graphToggleChanged = runtimeToggle("Bypass Model 3 Graph", ariseBypassGraph);
+					runtimeToggle(T(TKEY("diag_dimension"), "Model 3 Dimension Diagnostics"), ariseDimensionDiagnostics);
+					runtimeToggle(T(TKEY("diag_menu_copy"), "Menu ISCopy Diagnostics"), menuCopyDiagnostics);
+					runtimeToggle(T(TKEY("diag_disable_ui"), "Disable Model 3 UI Composite"), ariseDisableUiComposite);
+					runtimeToggle(T(TKEY("diag_force_sync"), "Force Synchronous Model 3"), ariseForceSynchronous);
+					const bool graphToggleChanged = runtimeToggle(T(TKEY("diag_bypass_graph"), "Bypass Model 3 Graph"), ariseBypassGraph);
 					if (graphToggleChanged && upscaling.dx12SwapChain.useArise &&
 						!ariseBypassGraph.load(std::memory_order_acquire))
 						upscaling.dx12SwapChain.PrepareAriseGraphPlanChange();
 					ImGui::EndDisabled();
 				}
-				if (!globals::game::isVR && ImGui::Checkbox("ARISE Feature 18 Worker", &settings.ariseWorkerNr))
+				if (!globals::game::isVR && ImGui::Checkbox(T(TKEY("diag_worker_nr"), "ARISE Feature 18 Worker"), &settings.ariseWorkerNr))
 					NeuralRendering::ARISE::Pipeline::Instance().SetWorkerNrEnabled(settings.ariseWorkerNr);
-				if (ImGui::Checkbox("ARISE Shadow Scheduler", &settings.ariseShadowScheduler))
+				if (ImGui::Checkbox(T(TKEY("diag_shadow_scheduler"), "ARISE Shadow Scheduler"), &settings.ariseShadowScheduler))
 					NeuralRendering::ARISE::Pipeline::Instance().SetEnabled(settings.ariseShadowScheduler);
 				ImGui::BeginDisabled(settings.ariseShadowScheduler || settings.ariseWorkerNr || WantsLogicalPerfMode());
-				static const char* ariseBufferCounts[] = { "2 Slots", "3 Slots" };
+				const char* ariseBufferCounts[] = {
+					T(TKEY("diag_slots_2"), "2 Slots"),
+					T(TKEY("diag_slots_3"), "3 Slots")
+				};
 				int ariseBufferIndex = static_cast<int>(settings.ariseBufferCount - 2);
-				if (ImGui::Combo("ARISE Frame Slots", &ariseBufferIndex, ariseBufferCounts, IM_ARRAYSIZE(ariseBufferCounts))) {
+				if (ImGui::Combo(T(TKEY("diag_frame_slots"), "ARISE Frame Slots"), &ariseBufferIndex, ariseBufferCounts, IM_ARRAYSIZE(ariseBufferCounts))) {
 					settings.ariseBufferCount = static_cast<uint>(ariseBufferIndex + 2);
 					NeuralRendering::ARISE::Pipeline::Instance().SetSlotCount(settings.ariseBufferCount);
 				}
 				ImGui::EndDisabled();
 				if (settings.ariseShadowScheduler &&
-					ImGui::Checkbox("ARISE Visual Validation", &settings.ariseVisualValidation))
+					ImGui::Checkbox(T(TKEY("diag_visual_validation"), "ARISE Visual Validation"), &settings.ariseVisualValidation))
 					NeuralRendering::ARISE::Pipeline::Instance().SetVisualValidation(settings.ariseVisualValidation);
 				const auto ariseStats = NeuralRendering::ARISE::Pipeline::Instance().GetStatistics();
-				ImGui::TextDisabled("ARISE: Flat %llu | VR %llu | consumed %llu | saturated %llu (%.3f%%)",
+				ImGui::TextDisabled(T(TKEY("diag_arise_stats"),
+					"ARISE: Flat %llu | VR %llu | consumed %llu | saturated %llu (%.3f%%)"),
 					static_cast<unsigned long long>(ariseStats.observedFlatPresents),
 					static_cast<unsigned long long>(ariseStats.observedVrSubmits),
 					static_cast<unsigned long long>(ariseStats.consumedSubmits),
 					static_cast<unsigned long long>(ariseStats.saturatedSubmits), ariseStats.saturationRate);
-				ImGui::TextDisabled("ARISE Queue: %u/%u | high-water %u | saturation streak %u (max %u)",
+				ImGui::TextDisabled(T(TKEY("diag_arise_queue"),
+					"ARISE Queue: %u/%u | high-water %u | saturation streak %u (max %u)"),
 					ariseStats.queuedSlots, ariseStats.slotCount, ariseStats.queueHighWater,
 					ariseStats.currentSaturationStreak, ariseStats.maxSaturationStreak);
-				ImGui::TextDisabled("ARISE Color: D3D11 copies %llu | D3D12 submits %llu | completes %llu | visual %llu | failures %llu",
+				ImGui::TextDisabled(T(TKEY("diag_arise_color"),
+					"ARISE Color: D3D11 copies %llu | D3D12 submits %llu | completes %llu | visual %llu | failures %llu"),
 					static_cast<unsigned long long>(ariseStats.colorCopies),
 					static_cast<unsigned long long>(ariseStats.gpuSubmits),
 					static_cast<unsigned long long>(ariseStats.gpuCompletes),
 					static_cast<unsigned long long>(ariseStats.visualPresents),
 					static_cast<unsigned long long>(ariseStats.interopFailures));
-				ImGui::TextDisabled("ARISE Worker NR: queued %llu | succeeded %llu | fallback %llu | failed %llu",
+				ImGui::TextDisabled(T(TKEY("diag_arise_worker"),
+					"ARISE Worker NR: queued %llu | succeeded %llu | fallback %llu | failed %llu"),
 					static_cast<unsigned long long>(ariseStats.workerNrQueued),
 					static_cast<unsigned long long>(ariseStats.workerNrSucceeded),
 					static_cast<unsigned long long>(ariseStats.workerNrFallback),
 					static_cast<unsigned long long>(ariseStats.workerNrFailed));
 				const auto model3Stats = upscaling.dx12SwapChain.GetAriseStatistics();
 					if (upscaling.dx12SwapChain.useArise)
-						ImGui::TextDisabled("Logical R execution: %s",
-							model3Stats.asyncTail ? "ARISE asynchronous Tail" : "Single-thread Present Tail");
+						ImGui::TextDisabled(T(TKEY("diag_logical_r"), "Logical R execution: %s"),
+							model3Stats.asyncTail ?
+								T(TKEY("diag_tail_async"), "ARISE asynchronous Tail") :
+								T(TKEY("diag_tail_sync"), "Single-thread Present Tail"));
 				if (model3Stats.renderDocCompatibility)
-					ImGui::TextDisabled("RenderDoc compatibility: DLSS/NR replaced; graph topology preserved");
-				ImGui::TextDisabled("Model 3 extents: logical R %ux%u | physical D %ux%u",
+					ImGui::TextDisabled("%s", T(TKEY("diag_renderdoc"),
+						"RenderDoc compatibility: DLSS/NR replaced; graph topology preserved"));
+				ImGui::TextDisabled(T(TKEY("diag_model3_extents"),
+					"Model 3 extents: logical R %ux%u | physical D %ux%u"),
 					upscaling.dx12SwapChain.LogicalWidth(), upscaling.dx12SwapChain.LogicalHeight(),
 					upscaling.dx12SwapChain.PhysicalWidth(), upscaling.dx12SwapChain.PhysicalHeight());
-				ImGui::TextDisabled("DX12 DLSS provider: %s", model3Stats.dlssAvailable ? "available" : "unavailable");
-				ImGui::TextDisabled("ARISE Model 3: %s%s", model3Stats.graphPath.c_str(),
-					model3Stats.tailNrAvailable ? "" : " (runtime unavailable; passthrough)");
-				ImGui::TextDisabled("Graph passes: ACT1 bypass %llu | Lanczos %llu | NR %llu | Fusion %llu | RCAS %llu",
+				ImGui::TextDisabled(T(TKEY("diag_dx12_dlss"), "DX12 DLSS provider: %s"),
+					model3Stats.dlssAvailable ?
+						T(TKEY("diag_available"), "available") :
+						T(TKEY("diag_unavailable"), "unavailable"));
+				ImGui::TextDisabled(T(TKEY("diag_model3_path"), "ARISE Model 3: %s%s"), model3Stats.graphPath.c_str(),
+					model3Stats.tailNrAvailable ? "" : T(TKEY("diag_passthrough"), " (runtime unavailable; passthrough)"));
+				ImGui::TextDisabled(T(TKEY("diag_graph_passes"),
+					"Graph passes: ACT1 bypass %llu | Lanczos %llu | NR %llu | Fusion %llu | RCAS %llu"),
 					static_cast<unsigned long long>(model3Stats.graph.act1Bypass),
 					static_cast<unsigned long long>(model3Stats.graph.lanczos),
 					static_cast<unsigned long long>(model3Stats.graph.neuralRendering),
 					static_cast<unsigned long long>(model3Stats.graph.fusion),
 					static_cast<unsigned long long>(model3Stats.graph.rcas));
-				ImGui::TextDisabled("DLSS provider: ACT1 ok %llu / failed %llu | ACT2 ok %llu / failed %llu",
+				ImGui::TextDisabled(T(TKEY("diag_dlss_provider"),
+					"DLSS provider: ACT1 ok %llu / failed %llu | ACT2 ok %llu / failed %llu"),
 					static_cast<unsigned long long>(model3Stats.graph.dlss.act1Succeeded),
 					static_cast<unsigned long long>(model3Stats.graph.dlss.act1Failed),
 					static_cast<unsigned long long>(model3Stats.graph.dlss.act2Succeeded),
 					static_cast<unsigned long long>(model3Stats.graph.dlss.act2Failed));
-				ImGui::TextDisabled("Graph recovery: unsupported %llu | fallback %llu | failed %llu",
+				ImGui::TextDisabled(T(TKEY("diag_graph_recovery"),
+					"Graph recovery: unsupported %llu | fallback %llu | failed %llu"),
 					static_cast<unsigned long long>(model3Stats.graph.unsupported),
 					static_cast<unsigned long long>(model3Stats.graph.fallback),
 					static_cast<unsigned long long>(model3Stats.graph.failed));
-				ImGui::TextDisabled("Model 3 frames: captured %llu | reconstructed %llu | fallback %llu | UI %llu",
+				ImGui::TextDisabled(T(TKEY("diag_model3_frames"),
+					"Model 3 frames: captured %llu | reconstructed %llu | fallback %llu | UI %llu"),
 					static_cast<unsigned long long>(model3Stats.captured),
 					static_cast<unsigned long long>(model3Stats.reconstructed),
 					static_cast<unsigned long long>(model3Stats.fallback),
 					static_cast<unsigned long long>(model3Stats.uiComposites));
-				ImGui::TextDisabled("Model 3 Present: logical %llu | physical %llu | backpressure %llu | failures %llu | last 0x%08X",
+				ImGui::TextDisabled(T(TKEY("diag_model3_present"),
+					"Model 3 Present: logical %llu | physical %llu | backpressure %llu | failures %llu | last 0x%08X"),
 					static_cast<unsigned long long>(model3Stats.logicalPresents),
 					static_cast<unsigned long long>(model3Stats.physicalPresents),
 					static_cast<unsigned long long>(model3Stats.backpressure),
 					static_cast<unsigned long long>(model3Stats.failures),
 					static_cast<std::uint32_t>(model3Stats.lastPresentResult));
 				const auto stats = NeuralRendering::GetAct2BackendStats();
-				ImGui::TextDisabled("Actual jitter: %.4f, %.4f", upscaling.jitter.x, upscaling.jitter.y);
-				ImGui::TextDisabled("ACT1 submits: %s | ACT2 submits: %s",
-					(globals::game::isVR ? upscaling.settings.flatAct1JitterMode : settings.flatPipelineAct1Jitter) == 0 ? "Actual" : "Zero",
-					(globals::game::isVR ? upscaling.settings.flatAct2JitterMode : settings.flatPipelineAct2Jitter) == 0 ? "Actual" : "Zero");
-				ImGui::TextDisabled("ACT1 DLSS successful frames: %llu",
+				ImGui::TextDisabled(T(TKEY("diag_actual_jitter"), "Actual jitter: %.4f, %.4f"), upscaling.jitter.x, upscaling.jitter.y);
+				ImGui::TextDisabled(T(TKEY("diag_act_submits"), "ACT1 submits: %s | ACT2 submits: %s"),
+					(globals::game::isVR ? upscaling.settings.flatAct1JitterMode : settings.flatPipelineAct1Jitter) == 0 ?
+						T(TKEY("jitter_actual"), "Actual Camera Jitter") : T(TKEY("jitter_zero"), "Zero"),
+					(globals::game::isVR ? upscaling.settings.flatAct2JitterMode : settings.flatPipelineAct2Jitter) == 0 ?
+						T(TKEY("jitter_actual"), "Actual Camera Jitter") : T(TKEY("jitter_zero"), "Zero"));
+				ImGui::TextDisabled(T(TKEY("diag_act1_ok"), "ACT1 DLSS successful frames: %llu"),
 					static_cast<unsigned long long>(Upscaling::streamline.flatAct1SuccessfulFrames));
-				ImGui::TextDisabled("ACT2 successful frames: NIS %llu | DLSS %llu | FSR3 %llu",
+				ImGui::TextDisabled(T(TKEY("diag_act2_ok"), "ACT2 successful frames: NIS %llu | DLSS %llu | FSR3 %llu"),
 					static_cast<unsigned long long>(stats.nisSucceeded),
 					static_cast<unsigned long long>(stats.dlssSucceeded),
 					static_cast<unsigned long long>(stats.fsrSucceeded));
-				ImGui::Checkbox("Bypass NR Output (SR Comparison)", &settings.neuralRenderingBypassOutput);
+				ImGui::Checkbox(T(TKEY("diag_bypass_nr"), "Bypass NR Output (SR Comparison)"), &settings.neuralRenderingBypassOutput);
 				if (!globals::game::isVR) {
-					ImGui::Checkbox("Flat DLSS Input Isolation", &upscaling.settings.flatDlssInputIsolation);
+					ImGui::Checkbox(T(TKEY("diag_input_isolation"), "Flat DLSS Input Isolation"), &upscaling.settings.flatDlssInputIsolation);
 					Util::UI::RestartGatedAnnotate(upscaling.bootSnapshot, upscaling.settings,
 						&Upscaling::Settings::flatDlssInputIsolation,
-						"Copies the active viewport into exact RenderRes inputs. Restart required.");
-					ImGui::Checkbox("Reset NR History Every Frame", &settings.neuralRenderingResetEveryFrame);
+						T(TKEY("diag_input_isolation_help"),
+							"Copies the active viewport into exact RenderRes inputs. Restart required."));
+					ImGui::Checkbox(T(TKEY("diag_reset_nr"), "Reset NR History Every Frame"), &settings.neuralRenderingResetEveryFrame);
 					if (globals::state && globals::state->IsDeveloperMode()) {
-						static const char* inputPrefilters[] = { "Off", "77% Roundtrip", "66% Roundtrip", "50% Roundtrip" };
+						const char* inputPrefilters[] = {
+							T(TKEY("diag_prefilter_off"), "Off"),
+							T(TKEY("diag_prefilter_77"), "77% Roundtrip"),
+							T(TKEY("diag_prefilter_66"), "66% Roundtrip"),
+							T(TKEY("diag_prefilter_50"), "50% Roundtrip")
+						};
 						int inputPrefilter = static_cast<int>(settings.neuralRenderingInputPrefilter);
-						if (ImGui::Combo("Full NR Input Prefilter", &inputPrefilter, inputPrefilters, IM_ARRAYSIZE(inputPrefilters)))
+						if (ImGui::Combo(T(TKEY("diag_prefilter"), "Full NR Input Prefilter"), &inputPrefilter, inputPrefilters, IM_ARRAYSIZE(inputPrefilters)))
 							settings.neuralRenderingInputPrefilter = static_cast<uint>(inputPrefilter);
-						static const char* motionVectorModes[] = {
-							"Dilated", "Raw Engine MV", "Zero MV", "Inverted MV", "0.5x MV", "2.0x MV"
+						const char* motionVectorModes[] = {
+							T(TKEY("diag_mv_dilated"), "Dilated"),
+							T(TKEY("diag_mv_raw"), "Raw Engine MV"),
+							T(TKEY("diag_mv_zero"), "Zero MV"),
+							T(TKEY("diag_mv_inverted"), "Inverted MV"),
+							T(TKEY("diag_mv_half"), "0.5x MV"),
+							T(TKEY("diag_mv_double"), "2.0x MV")
 						};
 						int motionVectorMode = static_cast<int>(settings.neuralRenderingMotionVectorMode);
-						if (ImGui::Combo("NR Motion Vector Test", &motionVectorMode, motionVectorModes, IM_ARRAYSIZE(motionVectorModes)))
+						if (ImGui::Combo(T(TKEY("diag_mv_test"), "NR Motion Vector Test"), &motionVectorMode, motionVectorModes, IM_ARRAYSIZE(motionVectorModes)))
 							settings.neuralRenderingMotionVectorMode = static_cast<uint>(motionVectorMode);
 					}
 				}
@@ -1124,12 +1606,13 @@ void FoveatedRender::DrawNeuralRenderingSettings()
 
 			auto& neuralRenderer = NeuralRendering::Renderer::Instance();
 			if (neuralRenderer.IsFailureLatched()) {
-				Util::Text::Warning("DLSS Neural Rendering failed and is disabled for this session. Check CommunityShaders.log.");
-				if (ImGui::Button("Reset Neural Rendering Failure"))
+				Util::Text::Warning(T(TKEY("neural_rendering_failed"),
+					"DLSS Neural Rendering failed and is disabled for this session. Check CommunityShaders.log."));
+				if (ImGui::Button(T(TKEY("neural_rendering_reset_failure"), "Reset Neural Rendering Failure")))
 					neuralRenderer.Reset();
 			}
 			if (globals::state && globals::state->IsDeveloperMode()) {
-				ImGui::TextDisabled("Status: %s | NGX: 0x%08X | Evaluations: %llu",
+				ImGui::TextDisabled(T(TKEY("diag_nr_status"), "Status: %s | NGX: 0x%08X | Evaluations: %llu"),
 					neuralRenderer.StatusText(), neuralRenderer.NgxResult(),
 					static_cast<unsigned long long>(neuralRenderer.SuccessfulFrames()));
 			}

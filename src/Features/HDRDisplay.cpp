@@ -924,6 +924,9 @@ void HDRDisplay::SetUIBuffer()
 
 		fb.RTV = Util::AsW32(targetRTV);
 		globals::d3d::context->OMSetRenderTargets(1, &targetRTV, nullptr);
+		globals::features::upscaling.foveatedRender.LogMenuPipeline(
+			uiBufferMode.useUIBuffer ? "setUI-uiBuffer" :
+			uiBufferMode.useFallbackCopy ? "setUI-framebuffer" : "setUI-swapChain");
 		return;
 	}
 

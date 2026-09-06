@@ -42,14 +42,14 @@ struct FoveatedRender
 
 	struct UnifiedPipelineSettings
 	{
-		bool act1Srss = false;
+		bool act1Srss = true;
 		uint act1SrssQuality = 4;
 		uint act1SrssPreset = 4;
-		float guidanceScale = 1.0f;
+		float guidanceScale = 1.23f;
 		uint act1Downsample = static_cast<uint>(ResampleFilter::kLanczos);
-		uint act2SrBackend = static_cast<uint>(FlatAct2SrBackend::kNIS);
+		uint act2SrBackend = static_cast<uint>(FlatAct2SrBackend::kLanczos);
 		uint act2Upsample = static_cast<uint>(ResampleFilter::kLanczos);
-		bool fusionEnabled = false;
+		bool fusionEnabled = true;
 	};
 
 	inline static constexpr Util::Settings::RestartTable<UnifiedPipelineSettings, 4> kUnifiedRestartFields{ {
@@ -159,33 +159,33 @@ struct FoveatedRender
 		float subrectFeatherWidth = 64.0f;
 		float subrectFalloffCurve = 1.0f;
 		float subrectDitherStrength = 1.0f;
-		bool neuralRenderingEnabled = false;
+		bool neuralRenderingEnabled = true;
 		bool ariseShadowScheduler = false;
 		bool ariseVisualValidation = false;
 		bool ariseWorkerNr = false;
 		bool ariseModel3 = false;
-		bool singleThreadPerfMode = false;
-		uint ariseBufferCount = 2;
+		bool singleThreadPerfMode = true;
+		uint ariseBufferCount = 3;
 		uint flatPipelineAct1Backend = static_cast<uint>(FlatAct1Backend::kDLSS);
 		uint flatPipelineAct1Quality = 1;
 		uint flatPipelineAct1Preset = 0;
 		uint flatPipelineAct1Jitter = 0;
 		bool flatPipelineAct1Dsr = false;
-		float flatPipelineNrScale = 0.67f;
-		uint flatPipelineAct2Backend = static_cast<uint>(FlatAct2Backend::kNIS);
+		float flatPipelineNrScale = 0.62f;
+		uint flatPipelineAct2Backend = static_cast<uint>(FlatAct2Backend::kLanczos);
 		UnifiedPipelineSettings unifiedPipeline{};
 		uint flatPipelineAct2Preset = 0;
 		uint flatPipelineAct2Jitter = 1;
-		uint flatPipelineFusionDirection = 0;
+		uint flatPipelineFusionDirection = 1;
 		uint flatPipelineFusionDenoise = 1;
-		float flatPipelineFusionDenoiseStrength = 0.45f;
-		float flatPipelineFusionSoftness = 0.35f;
-		bool flatPipelineFusionEnhancedGuidance = false;
-		float flatPipelineFusionFrequencyGuidance = 0.65f;
-		float flatPipelineFusionDepthGuidance = 0.75f;
+		float flatPipelineFusionDenoiseStrength = 0.40f;
+		float flatPipelineFusionSoftness = 0.20f;
+		bool flatPipelineFusionEnhancedGuidance = true;
+		float flatPipelineFusionFrequencyGuidance = 0.45f;
+		float flatPipelineFusionDepthGuidance = 0.65f;
 		float flatPipelineFusionColorGuidance = 0.70f;
-		bool flatPipelineSharpen = false;
-		float flatPipelineSharpness = 0.2f;
+		bool flatPipelineSharpen = true;
+		float flatPipelineSharpness = 1.0f;
 		bool flatAct1Enabled = true;
 		uint flatAct1QualityMode = 1;
 		uint flatAct1Preset = 0;
@@ -193,12 +193,12 @@ struct FoveatedRender
 		uint flatAct2QualityMode = 1;
 		uint flatAct2Preset = 0;
 		float flatAct2Sharpness = 0.0f;
-		uint neuralRenderingPreset = 3;
-		float neuralRenderingIntensity = 0.8f;
-		float neuralRenderingLocalTone = 0.75f;
-		float neuralRenderingLocalStructure = 0.9f;
-		float neuralRenderingSkinStructure = 0.9f;
-		uint neuralRenderingStyle = 3;
+		uint neuralRenderingPreset = 0;
+		float neuralRenderingIntensity = 2.0f;
+		float neuralRenderingLocalTone = 2.0f;
+		float neuralRenderingLocalStructure = 2.0f;
+		float neuralRenderingSkinStructure = 2.0f;
+		uint neuralRenderingStyle = 0;
 		bool neuralRenderingAutoMask = true;
 		bool neuralRenderingUICorrection = false;
 		bool neuralRenderingBypassOutput = false;
@@ -209,11 +209,11 @@ struct FoveatedRender
 		uint neuralRenderingWorkingScale = 0;
 		uint neuralRenderingOutputMode = 0;
 		float neuralRenderingNisSharpness = 0.35f;
-		uint neuralRenderingFusionPreset = 2;
-		float neuralRenderingFusionLuma = 0.85f;
-		float neuralRenderingFusionChroma = 0.65f;
-		float neuralRenderingFusionEdgeProtection = 0.25f;
-		float neuralRenderingFusionResidualLimit = 0.16f;
+		uint neuralRenderingFusionPreset = 4;
+		float neuralRenderingFusionLuma = 0.80f;
+		float neuralRenderingFusionChroma = 0.45f;
+		float neuralRenderingFusionEdgeProtection = 0.30f;
+		float neuralRenderingFusionResidualLimit = 0.14f;
 	};
 
 	inline static constexpr Util::Settings::RestartTable<Settings, 5> kRestartFields{ {
@@ -240,6 +240,11 @@ struct FoveatedRender
 	std::atomic_bool ariseDisableUiComposite = false;
 	std::atomic_bool ariseForceSynchronous = false;
 	std::atomic_bool ariseBypassGraph = false;
+	std::atomic_bool menuCopyDiagnostics = false;
+	/** @brief One-line menu compositor dump. No-op unless menuCopyDiagnostics is on. */
+	void LogMenuPipeline(const char* stage) const;
+	/** @brief Title/loading only: blit kMENUBG onto SwapChainBuffer at dest format. */
+	void BlitTitleBackgroundToSwapChain() const;
 	Util::Subrect::Controller subrectController;
 
 	// Called from Upscaling::DrawSettings. DrawEnable renders the always-visible
@@ -248,7 +253,9 @@ struct FoveatedRender
 	// BeginDisabled when settings.enabled == 0).
 	void DrawEnable();
 	void DrawSettings();
-	void DrawNeuralRenderingSettings();
+	void DrawNeuralRenderingSettings(bool wrapHeader = true);
+	/** @brief Origin / Single-thread / ARISE radios. Restart-gated; Flat only. */
+	void DrawLogicalPerfModeControls();
 	FlatPipelinePlan BuildFlatPipelinePlan(uint32_t displayWidth, uint32_t displayHeight,
 		uint32_t engineWidth = 0, uint32_t engineHeight = 0) const;
 	// Called from Upscaling::SaveSettings / LoadSettings to round-trip JSON.
@@ -281,9 +288,34 @@ struct FoveatedRender
 		static void thunk(void* imageSpaceShader, RE::BSTriShape* shape, RE::ImageSpaceEffectParam* param);
 		static inline REL::Relocation<decltype(thunk)> func;
 	};
-	struct MenuCopyRenderHook
+	struct MapRenderHook
 	{
 		static void thunk(void* imageSpaceShader, RE::BSTriShape* shape, RE::ImageSpaceEffectParam* param);
+		static inline REL::Relocation<decltype(thunk)> func;
+	};
+	struct WorldMapRenderHook
+	{
+		static void thunk(void* imageSpaceShader, RE::BSTriShape* shape, RE::ImageSpaceEffectParam* param);
+		static inline REL::Relocation<decltype(thunk)> func;
+	};
+	struct WorldMapNoSkyBlurRenderHook
+	{
+		static void thunk(void* imageSpaceShader, RE::BSTriShape* shape, RE::ImageSpaceEffectParam* param);
+		static inline REL::Relocation<decltype(thunk)> func;
+	};
+	struct HDRTonemapRenderHook
+	{
+		static void thunk(void* imageSpaceShader, RE::BSTriShape* shape, RE::ImageSpaceEffectParam* param);
+		static inline REL::Relocation<decltype(thunk)> func;
+	};
+	struct HDRTonemapFadeRenderHook
+	{
+		static void thunk(void* imageSpaceShader, RE::BSTriShape* shape, RE::ImageSpaceEffectParam* param);
+		static inline REL::Relocation<decltype(thunk)> func;
+	};
+	struct RendererUpdateViewPortHook
+	{
+		static void thunk(RE::BSGraphics::Renderer* renderer, std::uint32_t width, std::uint32_t height, bool disableScale);
 		static inline REL::Relocation<decltype(thunk)> func;
 	};
 	struct DistantBlurRenderHook
@@ -363,3 +395,18 @@ private:
 	bool IsPresetCompatibleWithMode(uint presetIndex) const;
 	void ClampPresetToMode();
 };
+
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
+	FoveatedRender::UnifiedPipelineSettings,
+	act1Srss,
+	act1SrssQuality,
+	act1SrssPreset,
+	guidanceScale,
+	act1Downsample,
+	act2SrBackend,
+	act2Upsample,
+	fusionEnabled);
+
+// Settings has 65 fields; nlohmann's NON_INTRUSIVE macros cap at 64.
+void to_json(nlohmann::json& j, const FoveatedRender::Settings& s);
+void from_json(const nlohmann::json& j, FoveatedRender::Settings& s);

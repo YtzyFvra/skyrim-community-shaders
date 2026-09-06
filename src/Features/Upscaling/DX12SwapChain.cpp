@@ -2,6 +2,7 @@
 
 #include <FidelityFX/api/include/dx12/ffx_api_dx12.hpp>
 #include <algorithm>
+#include <cmath>
 #include <d3dcompiler.h>
 #include <dxgi1_6.h>
 
@@ -28,6 +29,28 @@ namespace
 	{
 		return result == DXGI_ERROR_DEVICE_REMOVED || result == DXGI_ERROR_DEVICE_RESET ||
 		       result == DXGI_ERROR_DEVICE_HUNG || result == DXGI_ERROR_DRIVER_INTERNAL_ERROR;
+	}
+
+	void MapLogicalExtentToPhysical(const DX12SwapChain& owner, UINT& width, UINT& height)
+	{
+		if (!owner.LogicalWidth() || !owner.LogicalHeight())
+			return;
+		const double widthScale = static_cast<double>(owner.PhysicalWidth()) / owner.LogicalWidth();
+		const double heightScale = static_cast<double>(owner.PhysicalHeight()) / owner.LogicalHeight();
+		width = std::max(1u, static_cast<UINT>(std::lround(width * widthScale)));
+		height = std::max(1u, static_cast<UINT>(std::lround(height * heightScale)));
+	}
+
+	bool IsProxySwapChainInterface(REFIID riid)
+	{
+		return riid == __uuidof(IUnknown) ||
+		       riid == __uuidof(IDXGIObject) ||
+		       riid == __uuidof(IDXGIDeviceSubObject) ||
+		       riid == __uuidof(IDXGISwapChain) ||
+		       riid == __uuidof(IDXGISwapChain1) ||
+		       riid == __uuidof(IDXGISwapChain2) ||
+		       riid == __uuidof(IDXGISwapChain3) ||
+		       riid == __uuidof(IDXGISwapChain4);
 	}
 
 	constexpr char kModel3UICompositeShader[] = R"(
@@ -788,6 +811,7 @@ HRESULT DX12SwapChain::ResizeBuffers(UINT bufferCount, UINT width, UINT height, 
 			LatchAriseFailure(E_FAIL, "ResizeBuffers resource rebuild");
 			return E_FAIL;
 		}
+		ApplyLogicalRenderExtents();
 		return S_OK;
 	}
 	if (!bufferCount)
@@ -1036,6 +1060,10 @@ HRESULT DX12SwapChain::PresentArise(UINT syncInterval, UINT flags)
 	sl::FrameToken* logicalFrameToken = nullptr;
 	if (streamline.AcquireFrameToken(presentFrameId, logicalFrameToken) && logicalFrameToken)
 		streamline.EmitPCLMarker(sl::PCLMarker::eSimulationEnd, *logicalFrameToken);
+	globals::features::upscaling.foveatedRender.BlitTitleBackgroundToSwapChain();
+	if (globals::features::upscaling.foveatedRender.menuCopyDiagnostics.load(std::memory_order_acquire) &&
+		globals::state && globals::state->IsMainOrLoadingMenuOpen())
+		globals::features::upscaling.foveatedRender.LogMenuPipeline("present");
 	if (globals::features::upscaling.foveatedRender.ariseDimensionDiagnostics.load(std::memory_order_acquire) &&
 		(ariseLogicalPresents.load(std::memory_order_relaxed) % 120 == 0)) {
 		D3D11_TEXTURE2D_DESC sceneDesc{};
@@ -1744,10 +1772,16 @@ DXGISwapChainProxy::DXGISwapChainProxy(IDXGISwapChain4* a_swapChain)
 /****IUknown****/
 HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::QueryInterface(REFIID riid, void** ppvObj)
 {
-	auto ret = swapChain->QueryInterface(riid, ppvObj);
-	if (*ppvObj)
-		*ppvObj = this;
-	return ret;
+	if (!ppvObj)
+		return E_POINTER;
+	*ppvObj = nullptr;
+	// Keep COM identity on this proxy. Forwarding QI to the physical chain
+	// leaks D through GetDesc1 and hands out a mismatched vtable.
+	if (!IsProxySwapChainInterface(riid))
+		return E_NOINTERFACE;
+	*ppvObj = static_cast<IDXGISwapChain4*>(this);
+	AddRef();
+	return S_OK;
 }
 
 ULONG STDMETHODCALLTYPE DXGISwapChainProxy::AddRef()
@@ -1828,14 +1862,9 @@ HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::ResizeBuffers(UINT BufferCount, UI
 HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::ResizeTarget(_In_ const DXGI_MODE_DESC* pNewTargetParameters)
 {
 	if (globals::features::upscaling.dx12SwapChain.useArise && pNewTargetParameters) {
-		auto& owner = globals::features::upscaling.dx12SwapChain;
 		DXGI_MODE_DESC physicalMode = *pNewTargetParameters;
-		const double widthScale = owner.LogicalWidth() ?
-			static_cast<double>(owner.PhysicalWidth()) / owner.LogicalWidth() : 1.0;
-		const double heightScale = owner.LogicalHeight() ?
-			static_cast<double>(owner.PhysicalHeight()) / owner.LogicalHeight() : 1.0;
-		physicalMode.Width = std::max(1u, static_cast<UINT>(std::lround(physicalMode.Width * widthScale)));
-		physicalMode.Height = std::max(1u, static_cast<UINT>(std::lround(physicalMode.Height * heightScale)));
+		MapLogicalExtentToPhysical(globals::features::upscaling.dx12SwapChain,
+			physicalMode.Width, physicalMode.Height);
 		return swapChain->ResizeTarget(&physicalMode);
 	}
 	return swapChain->ResizeTarget(pNewTargetParameters);
@@ -1854,6 +1883,171 @@ HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetFrameStatistics(_Out_ DXGI_FRAM
 HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetLastPresentCount(_Out_ UINT* pLastPresentCount)
 {
 	return swapChain->GetLastPresentCount(pLastPresentCount);
+}
+
+HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetDesc1(_Out_ DXGI_SWAP_CHAIN_DESC1* pDesc)
+{
+	if (!pDesc)
+		return E_POINTER;
+	const HRESULT result = swapChain->GetDesc1(pDesc);
+	if (SUCCEEDED(result) && globals::features::upscaling.dx12SwapChain.useArise) {
+		pDesc->Width = globals::features::upscaling.dx12SwapChain.LogicalWidth();
+		pDesc->Height = globals::features::upscaling.dx12SwapChain.LogicalHeight();
+	}
+	return result;
+}
+
+HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetFullscreenDesc(_Out_ DXGI_SWAP_CHAIN_FULLSCREEN_DESC* pDesc)
+{
+	return swapChain->GetFullscreenDesc(pDesc);
+}
+
+HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetHwnd(_Out_ HWND* pHwnd)
+{
+	return swapChain->GetHwnd(pHwnd);
+}
+
+HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetCoreWindow(_In_ REFIID refiid, _COM_Outptr_ void** ppUnk)
+{
+	return swapChain->GetCoreWindow(refiid, ppUnk);
+}
+
+HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::Present1(UINT SyncInterval, UINT PresentFlags,
+	_In_ const DXGI_PRESENT_PARAMETERS* pPresentParameters)
+{
+	(void)pPresentParameters;
+	return Present(SyncInterval, PresentFlags);
+}
+
+BOOL STDMETHODCALLTYPE DXGISwapChainProxy::IsTemporaryMonoSupported()
+{
+	return swapChain->IsTemporaryMonoSupported();
+}
+
+HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetRestrictToOutput(_COM_Outptr_ IDXGIOutput** ppRestrictToOutput)
+{
+	return swapChain->GetRestrictToOutput(ppRestrictToOutput);
+}
+
+HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::SetBackgroundColor(_In_ const DXGI_RGBA* pColor)
+{
+	return swapChain->SetBackgroundColor(pColor);
+}
+
+HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetBackgroundColor(_Out_ DXGI_RGBA* pColor)
+{
+	return swapChain->GetBackgroundColor(pColor);
+}
+
+HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::SetRotation(_In_ DXGI_MODE_ROTATION Rotation)
+{
+	return swapChain->SetRotation(Rotation);
+}
+
+HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetRotation(_Out_ DXGI_MODE_ROTATION* pRotation)
+{
+	return swapChain->GetRotation(pRotation);
+}
+
+HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::SetSourceSize(UINT Width, UINT Height)
+{
+	auto& owner = globals::features::upscaling.dx12SwapChain;
+	if (owner.useArise)
+		MapLogicalExtentToPhysical(owner, Width, Height);
+	return swapChain->SetSourceSize(Width, Height);
+}
+
+HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetSourceSize(_Out_ UINT* pWidth, _Out_ UINT* pHeight)
+{
+	if (!pWidth || !pHeight)
+		return E_POINTER;
+	const HRESULT result = swapChain->GetSourceSize(pWidth, pHeight);
+	if (SUCCEEDED(result) && globals::features::upscaling.dx12SwapChain.useArise) {
+		*pWidth = globals::features::upscaling.dx12SwapChain.LogicalWidth();
+		*pHeight = globals::features::upscaling.dx12SwapChain.LogicalHeight();
+	}
+	return result;
+}
+
+HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::SetMaximumFrameLatency(UINT MaxLatency)
+{
+	return swapChain->SetMaximumFrameLatency(MaxLatency);
+}
+
+HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetMaximumFrameLatency(_Out_ UINT* pMaxLatency)
+{
+	return swapChain->GetMaximumFrameLatency(pMaxLatency);
+}
+
+HANDLE STDMETHODCALLTYPE DXGISwapChainProxy::GetFrameLatencyWaitableObject()
+{
+	return globals::features::upscaling.dx12SwapChain.GetFrameLatencyWaitableObject();
+}
+
+HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::SetMatrixTransform(const DXGI_MATRIX_3X2_F* pMatrix)
+{
+	return swapChain->SetMatrixTransform(pMatrix);
+}
+
+HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetMatrixTransform(_Out_ DXGI_MATRIX_3X2_F* pMatrix)
+{
+	return swapChain->GetMatrixTransform(pMatrix);
+}
+
+UINT STDMETHODCALLTYPE DXGISwapChainProxy::GetCurrentBackBufferIndex()
+{
+	// GetBuffer only exposes the single logical R wrapper at index 0.
+	return 0;
+}
+
+HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::CheckColorSpaceSupport(
+	_In_ DXGI_COLOR_SPACE_TYPE ColorSpace, _Out_ UINT* pColorSpaceSupport)
+{
+	return swapChain->CheckColorSpaceSupport(ColorSpace, pColorSpaceSupport);
+}
+
+HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::SetColorSpace1(_In_ DXGI_COLOR_SPACE_TYPE ColorSpace)
+{
+	auto& owner = globals::features::upscaling.dx12SwapChain;
+	if (owner.useArise && ColorSpace != DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709) {
+		logger::warn("[ARISE] Ignoring HDR color-space request while Model 3 is active");
+		ColorSpace = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+	}
+	return swapChain->SetColorSpace1(ColorSpace);
+}
+
+HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::ResizeBuffers1(UINT BufferCount, UINT Width, UINT Height,
+	DXGI_FORMAT Format, UINT SwapChainFlags, _In_reads_(BufferCount) const UINT* pCreationNodeMask,
+	_In_reads_(BufferCount) IUnknown* const* ppPresentQueue)
+{
+	(void)pCreationNodeMask;
+	(void)ppPresentQueue;
+	return ResizeBuffers(BufferCount, Width, Height, Format, SwapChainFlags);
+}
+
+HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::SetHDRMetaData(
+	_In_ DXGI_HDR_METADATA_TYPE Type, UINT Size, _In_reads_bytes_opt_(Size) void* pMetaData)
+{
+	return swapChain->SetHDRMetaData(Type, Size, pMetaData);
+}
+
+void DX12SwapChain::ApplyLogicalRenderExtents() const
+{
+	if (!useArise || globals::game::isVR)
+		return;
+	auto* viewport = globals::game::graphicsState;
+	if (!viewport)
+		return;
+	viewport->screenWidth = LogicalWidth();
+	viewport->screenHeight = LogicalHeight();
+	viewport->frameBufferViewport[0] = LogicalWidth();
+	viewport->frameBufferViewport[1] = LogicalHeight();
+	auto& runtimeData = viewport->GetRuntimeData();
+	runtimeData.dynamicResolutionPreviousWidthRatio = 1;
+	runtimeData.dynamicResolutionPreviousHeightRatio = 1;
+	runtimeData.dynamicResolutionWidthRatio = 1;
+	runtimeData.dynamicResolutionHeightRatio = 1;
+	runtimeData.dynamicResolutionLock = 1;
 }
 
 void DX12SwapChain::SetColorSpace(bool enableHDR)
