@@ -111,6 +111,7 @@ namespace FoveatedRenderImpl
 
 		// Subrect UV hash for resource recreation detection
 		static inline uint64_t activeSubrectUVHash = 0;
+		static inline uint32_t neuralGuidesFrame = UINT32_MAX;
 
 	private:
 		static bool ExecuteDefaultMode(Streamline& streamline, const VRDlssParams& p);

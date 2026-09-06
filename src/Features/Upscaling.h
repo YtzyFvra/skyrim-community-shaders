@@ -197,6 +197,10 @@ public:
 	bool IsFrameGenerationActive() const;
 	/** @brief Returns whether settings and menu state permit preparing frame-generation inputs. */
 	bool ShouldPrepareFrameGeneration() const;
+	bool IsFrameGenerationConfiguredForSession() const
+	{
+		return IsFrameGenerationDx12PathActive() && settings.frameGenerationMode != 0;
+	}
 	/** @brief Returns the prepared frame's generation decision until its buffers are cleared after Present. */
 	bool ShouldUseFrameGenerationThisFrame() const;
 	bool IsUpscalingActive() const;
