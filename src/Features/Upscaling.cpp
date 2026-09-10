@@ -697,7 +697,7 @@ void Upscaling::DrawFrameGenerationSettings()
 	if (ImGui::TreeNodeEx(T(TKEY("frame_generation"), "Frame Generation"), ImGuiTreeNodeFlags_DefaultOpen)) {
 		if (globals::game::isVR)
 			ImGui::TextWrapped("%s", T(TKEY("frame_generation_vr_submit"),
-				"VR DLSS-G is single-thread: we own BSOpenVR::Submit, Present a hidden full-eye chain, then Submit. Center-only FG comes later."));
+				"VR: per-eye 8-pass then our Submit. Engine world Submit is swallowed. DLSS-G Present needs per-eye chains."));
 		ImGui::Text("%s", T(TKEY("frame_generation_desc"),
 							  "Frame Generation interpolates real frames with generated ones for a smoother experience"));
 
@@ -2711,16 +2711,11 @@ bool Upscaling::IsFlatDlssPostInjectActive() const
 
 bool Upscaling::IsVrDlssPostInjectActive() const
 {
-	if (!globals::game::isVR || !perfMode.IsHookActive())
+	if (!globals::game::isVR)
 		return false;
 	if (GetUpscaleMethod() != UpscaleMethod::kDLSS)
 		return false;
-	if (!foveatedRender.settings.neuralRenderingEnabled)
-		return false;
-	if (!perfMode.GetRenderEyeWidth() || !perfMode.GetRenderEyeHeight() ||
-		!perfMode.GetDisplayEyeWidth() || !perfMode.GetDisplayEyeHeight())
-		return false;
-	return true;
+	return foveatedRender.settings.neuralRenderingEnabled;
 }
 
 bool Upscaling::IsFlatAct1BypassActive() const
@@ -2750,13 +2745,15 @@ json Upscaling::GetDiagnostics()
 	diagnostics["frameGenMultiplier"] = GetFrameGenerationMultiplier();
 	if (globals::game::isVR) {
 		const auto& cropUV = foveatedRender.subrectController.GetUV();
-		const uint32_t cropInW = std::max(1u, static_cast<uint32_t>(perfMode.GetRenderEyeWidth() * cropUV.w));
-		const uint32_t cropInH = std::max(1u, static_cast<uint32_t>(perfMode.GetRenderEyeHeight() * cropUV.h));
-		const uint32_t cropOutW = std::max(1u, static_cast<uint32_t>(perfMode.GetDisplayEyeWidth() * cropUV.w));
-		const uint32_t cropOutH = std::max(1u, static_cast<uint32_t>(perfMode.GetDisplayEyeHeight() * cropUV.h));
+		uint32_t renderW = 0, renderH = 0, displayW = 0, displayH = 0;
+		NeuralRendering::GetVrOwnedEyeSizes(renderW, renderH, displayW, displayH);
+		const uint32_t cropInW = std::max(1u, static_cast<uint32_t>(renderW * cropUV.w));
+		const uint32_t cropInH = std::max(1u, static_cast<uint32_t>(renderH * cropUV.h));
+		const uint32_t cropOutW = std::max(1u, static_cast<uint32_t>(displayW * cropUV.w));
+		const uint32_t cropOutH = std::max(1u, static_cast<uint32_t>(displayH * cropUV.h));
 		const auto plan = foveatedRender.BuildFlatPipelinePlan(cropOutW, cropOutH, cropInW, cropInH);
 		diagnostics["vrSixPass"] = {
-			{ "injectPoint", "BeforeUIComposite" },
+			{ "injectPoint", "AfterPostOwnedSubmit" },
 			{ "postInjectActive", IsVrDlssPostInjectActive() },
 			{ "centerCrop", !cropUV.IsFullEye() },
 			{ "cropU", cropUV.x },
@@ -2768,15 +2765,15 @@ json Upscaling::GetDiagnostics()
 			{ "cropDisplayWidth", cropOutW },
 			{ "cropDisplayHeight", cropOutH },
 			{ "nrEnabled", foveatedRender.settings.neuralRenderingEnabled },
-			{ "renderEyeWidth", perfMode.GetRenderEyeWidth() },
-			{ "renderEyeHeight", perfMode.GetRenderEyeHeight() },
-			{ "displayEyeWidth", perfMode.GetDisplayEyeWidth() },
-			{ "displayEyeHeight", perfMode.GetDisplayEyeHeight() },
+			{ "renderEyeWidth", renderW },
+			{ "renderEyeHeight", renderH },
+			{ "displayEyeWidth", displayW },
+			{ "displayEyeHeight", displayH },
 			{ "nrWidth", plan.nrWidth },
 			{ "nrHeight", plan.nrHeight },
 			{ "act1OutputWidth", plan.act1OutputWidth },
 			{ "act1OutputHeight", plan.act1OutputHeight },
-			{ "submitDlssg", UsesDLSSGFrameGen() },
+			{ "ownedSubmit", true },
 		};
 	} else {
 		const auto& nr = foveatedRender.settings;
@@ -3562,8 +3559,7 @@ void Upscaling::Main_PostProcessing::thunk(RE::ImageSpaceManager* a_this, uint32
 
 	// Flat SDR reaches its final tonemapped scene in kFRAMEBUFFER when the
 	// engine Post chain returns. Run NR here, before DrawInterfaceStart adds UI.
-	if (!globals::game::isVR)
-		NeuralRendering::ApplyFoveatedLdr();
+	NeuralRendering::ApplyFoveatedLdr();
 
 	Util::SetTemporal(false);
 }

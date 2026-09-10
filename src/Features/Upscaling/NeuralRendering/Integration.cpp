@@ -6,7 +6,9 @@
 #include "Renderer.h"
 #include "Features/HDRDisplay.h"
 #include "Features/Upscaling.h"
+#include "Features/Upscaling/VrSubmitDlssg.h"
 #include "Features/Upscaling/FoveatedRender/Bridge.h"
+#include "Utils/D3D.h"
 #include "Features/Upscaling/FoveatedRender/Core.h"
 #include "Features/Upscaling/FoveatedRender/Ops.h"
 #include "Globals.h"
@@ -55,6 +57,7 @@ namespace NeuralRendering
 		eastl::unique_ptr<Texture2D> act3EditLow;
 		eastl::unique_ptr<Texture2D> act3GuideLow;
 		eastl::unique_ptr<Texture2D> vrCompositeSbs;
+		eastl::unique_ptr<Texture2D> vrEyeColor[2];
 		std::uint32_t colorWidth = 0;
 		std::uint32_t colorHeight = 0;
 		DXGI_FORMAT colorFormat = DXGI_FORMAT_UNKNOWN;
@@ -78,9 +81,6 @@ namespace NeuralRendering
 		bool vrSixPassWasActive = false;
 		bool vrSixPassLogged = false;
 		std::uint32_t vrSixPassDoneFrame = UINT32_MAX;
-		bool flatFrameGenerationBlockLogged = false;
-		bool flatHdrBlockLogged = false;
-		bool flatPostInjectLogged = false;
 		std::uint32_t lastFlatInputPrefilter = UINT32_MAX;
 		std::uint32_t lastFlatMotionVectorMode = UINT32_MAX;
 		bool lastFlatResetEveryFrame = false;
@@ -659,7 +659,7 @@ namespace NeuralRendering
 			ID3D11ShaderResourceView* guidanceSRV, std::uint32_t guidanceWidth, std::uint32_t guidanceHeight,
 			ID3D11Resource* act2Rc, ID3D11Resource*& finalResource, ID3D11ShaderResourceView*& finalSRV, bool forceReset)
 		{
-			if (globals::game::isVR || !foveated.settings.act3Enabled)
+			if (!foveated.settings.act3Enabled)
 				return true;
 			const auto crop = FoveatedRender::MakeAct3Crop(plan.displayWidth, plan.displayHeight, foveated.settings.act3Scale);
 			if (!crop.Valid() || !finalResource || !finalSRV || !depthRSRV || !motionR || !motionRSRV)
@@ -752,10 +752,8 @@ namespace NeuralRendering
 			FoveatedRenderImpl::Ops::BlendSubrectToOutput(
 				writebackSource, finalResource, destUav,
 				crop.x, crop.y, crop.width, crop.height, 0,
-				static_cast<std::uint32_t>(ownGuidance ?
-					FoveatedRender::SubrectBlendMode::kInwardDither :
-					FoveatedRender::SubrectBlendMode::kDither),
-				foveated.settings.act3FeatherWidth, foveated.settings.act3DitherStrength);
+				static_cast<std::uint32_t>(FoveatedRender::SubrectBlendMode::kFeather),
+				foveated.settings.act3FeatherWidth, 0.0f);
 
 			if (foveated.settings.act3Sharpen) {
 				if (!EnsurePipelineTexture(act3SharpenOutput, formatSource, plan.displayWidth, plan.displayHeight,
@@ -1573,6 +1571,39 @@ namespace NeuralRendering
 			return RunSixPassIsolated(upscaling, foveated, plan, context, framebuffer, isolated, planChanged, frame);
 		}
 
+		bool IsVrPostUnorm8(const D3D11_TEXTURE2D_DESC& desc)
+		{
+			return desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM ||
+				desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
+				desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM ||
+				desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+		}
+
+		ID3D11Texture2D* ResolveVrPostTemp(RE::BSGraphics::Renderer* renderer)
+		{
+			if (!renderer)
+				return nullptr;
+			auto& targets = renderer->GetRuntimeData().renderTargets;
+			const RE::RENDER_TARGET preferred[] = {
+				RE::RENDER_TARGETS::kIMAGESPACE_TEMP_COPY,
+				RE::RENDER_TARGETS::kIMAGESPACE_TEMP_COPY2,
+			};
+			for (const auto slot : preferred) {
+				auto* tex = static_cast<ID3D11Texture2D*>(targets[slot].texture);
+				if (!tex)
+					continue;
+				D3D11_TEXTURE2D_DESC desc{};
+				tex->GetDesc(&desc);
+				if (desc.Width < 2 || !desc.Height || !IsVrPostUnorm8(desc))
+					continue;
+				if (!vrSixPassLogged)
+					logger::info("[VrSixPass] PostTemp rt={} {}x{} fmt={}", static_cast<int>(slot),
+						desc.Width, desc.Height, static_cast<int>(desc.Format));
+				return tex;
+			}
+			return nullptr;
+		}
+
 		bool ApplyVrSixPass(Upscaling& upscaling, FoveatedRender& foveated)
 		{
 			using Act2 = FoveatedRender::FlatAct2SrBackend;
@@ -1580,7 +1611,7 @@ namespace NeuralRendering
 			if (!upscaling.IsVrDlssPostInjectActive())
 				return false;
 
-			CS_GPU_PASS("FlatPipeline::VrSixPass");
+			CS_GPU_PASS("NeuralRendering::VrOwnedSubmit");
 			auto* renderer = globals::game::renderer;
 			auto* context = globals::d3d::context;
 			if (!renderer || !context || !globals::d3d::device ||
@@ -1589,10 +1620,8 @@ namespace NeuralRendering
 				!upscaling.vrIntermediateTransparencyMask[0] || !upscaling.vrIntermediateTransparencyMask[1])
 				return false;
 
-			auto& main = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN];
-			auto& total = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kTOTAL];
 			auto& depth = renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kMAIN];
-			if (!main.texture || !total.texture || !depth.texture || !depth.depthSRV)
+			if (!depth.texture || !depth.depthSRV)
 				return false;
 
 			const auto& leftUV = foveated.subrectController.GetUV();
@@ -1600,10 +1629,31 @@ namespace NeuralRendering
 			if (leftUV.w != rightUV.w || leftUV.h != rightUV.h)
 				return false;
 
-			const uint32_t engineW = upscaling.perfMode.GetRenderEyeWidth();
-			const uint32_t engineH = upscaling.perfMode.GetRenderEyeHeight();
-			const uint32_t displayW = upscaling.perfMode.GetDisplayEyeWidth();
-			const uint32_t displayH = upscaling.perfMode.GetDisplayEyeHeight();
+			auto* postTemp = ResolveVrPostTemp(renderer);
+			if (!postTemp)
+				return false;
+			D3D11_TEXTURE2D_DESC postDesc{};
+			postTemp->GetDesc(&postDesc);
+			uint32_t engineW = std::max(1u, postDesc.Width / 2);
+			uint32_t engineH = std::max(1u, postDesc.Height);
+			uint32_t displayW = 0;
+			uint32_t displayH = 0;
+#ifdef ENABLE_SKYRIM_VR
+			if (auto* openvr = RE::BSOpenVR::GetSingleton(); openvr && openvr->vrSystem)
+				openvr->vrSystem->GetRecommendedRenderTargetSize(&displayW, &displayH);
+#endif
+			if (!displayW || !displayH) {
+				if (auto* totalTex = static_cast<ID3D11Texture2D*>(
+						renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kTOTAL].texture)) {
+					D3D11_TEXTURE2D_DESC totalDesc{};
+					totalTex->GetDesc(&totalDesc);
+					displayW = std::max(1u, totalDesc.Width / 2);
+					displayH = std::max(1u, totalDesc.Height);
+				} else {
+					displayW = engineW;
+					displayH = engineH;
+				}
+			}
 			const uint32_t subInW = std::max(1u, static_cast<uint32_t>(engineW * leftUV.w));
 			const uint32_t subInH = std::max(1u, static_cast<uint32_t>(engineH * leftUV.h));
 			const uint32_t subOutW = std::max(1u, static_cast<uint32_t>(displayW * leftUV.w));
@@ -1676,12 +1726,12 @@ namespace NeuralRendering
 			});
 			context->OMSetRenderTargets(0, nullptr, nullptr);
 
-			if (!EnsurePipelineTexture(vrCompositeSbs, total.texture, displayW * 2, displayH,
+			if (!EnsurePipelineTexture(vrCompositeSbs, postTemp, displayW * 2, displayH,
 					"NeuralRendering::VrSixPassComposite"))
 				return false;
 
 			FoveatedRenderImpl::Ops::EnsureVRSubrectTextures(subInW, subInH, subOutW, subOutH,
-				main.texture, upscaling.vrIntermediateMotionVectors[0]->resource.get(),
+				postTemp, upscaling.vrIntermediateMotionVectors[0]->resource.get(),
 				upscaling.vrIntermediateReactiveMask[0]->resource.get(),
 				upscaling.vrIntermediateTransparencyMask[0]->resource.get());
 
@@ -1694,7 +1744,7 @@ namespace NeuralRendering
 			stretchParams.eyeHeightOut = displayH;
 			stretchParams.leftUV = leftUV;
 			stretchParams.rightUV = rightUV;
-			FoveatedRenderImpl::Ops::SnapshotSBS(main.texture, stretchParams.renderW, stretchParams.renderH);
+			FoveatedRenderImpl::Ops::SnapshotSBS(postTemp, stretchParams.renderW, stretchParams.renderH);
 			FoveatedRenderImpl::Ops::ClearHMDMaskOnSnapshot(stretchParams);
 			FoveatedRenderImpl::Ops::StretchDRSBothEyes(vrCompositeSbs->uav.get(), displayW, displayH,
 				engineW, engineH, stretchParams.renderW, stretchParams.renderH);
@@ -1743,7 +1793,7 @@ namespace NeuralRendering
 					eye == 0 ? streamline.flatPostInjectViewport : streamline.flatAct2Viewport,
 					eye
 				};
-				if (!RunSixPassIsolated(upscaling, foveated, plan, context, main.texture, isolated, planChanged, frame))
+				if (!RunSixPassIsolated(upscaling, foveated, plan, context, postTemp, isolated, planChanged, frame))
 					return false;
 
 				const uint32_t dstX = (eye == 1 ? displayW : 0) + static_cast<uint32_t>(uv.x * displayW);
@@ -1751,277 +1801,30 @@ namespace NeuralRendering
 				FoveatedRenderImpl::Ops::BlendSubrectToOutput(dest->resource.get(),
 					vrCompositeSbs->resource.get(), vrCompositeSbs->uav.get(),
 					dstX, dstY, subOutW, subOutH);
-			}
 
-			D3D11_TEXTURE2D_DESC totalDesc{}, compositeDesc{};
-			total.texture->GetDesc(&totalDesc);
-			vrCompositeSbs->resource->GetDesc(&compositeDesc);
-			if (totalDesc.Width == compositeDesc.Width && totalDesc.Height == compositeDesc.Height &&
-				totalDesc.Format == compositeDesc.Format) {
-				context->CopyResource(total.texture, vrCompositeSbs->resource.get());
-			} else {
-				const D3D11_BOX box{ 0, 0, 0,
-					std::min(totalDesc.Width, compositeDesc.Width),
-					std::min(totalDesc.Height, compositeDesc.Height), 1 };
-				context->CopySubresourceRegion(total.texture, 0, 0, 0, 0,
-					vrCompositeSbs->resource.get(), 0, &box);
+				const char* eyeName = eye == 0 ? "NeuralRendering::VrEyeLeft" : "NeuralRendering::VrEyeRight";
+				if (!EnsurePipelineTexture(vrEyeColor[eye], postTemp, displayW, displayH, eyeName))
+					return false;
+				const D3D11_BOX eyeBox{ eye == 1 ? displayW : 0, 0, 0,
+					(eye == 1 ? displayW : 0) + displayW, displayH, 1 };
+				context->CopySubresourceRegion(vrEyeColor[eye]->resource.get(), 0, 0, 0, 0,
+					vrCompositeSbs->resource.get(), 0, &eyeBox);
+#ifdef ENABLE_SKYRIM_VR
+				if (!VrSubmitDlssg::SubmitOwnedEye(eye, vrEyeColor[eye]->resource.get(), displayW, displayH))
+					return false;
+#endif
 			}
+#ifdef ENABLE_SKYRIM_VR
+			VrSubmitDlssg::NoteOwnedFrame(frame);
+#endif
+
 			vrSixPassDoneFrame = frame;
 			if (!vrSixPassLogged) {
-				logger::info("[VrSixPass] Before-UI center six-pass wrote kTOTAL cropR={}x{} cropD={}x{}",
+				logger::info("[VrSixPass] Post kTEMP 8-pass owned Submit cropR={}x{} cropD={}x{}",
 					subInW, subInH, subOutW, subOutH);
 				vrSixPassLogged = true;
 			}
 			return true;
-		}
-
-		bool ApplyFlatLdr(Upscaling& upscaling, FoveatedRender& foveated)
-		{
-			const bool frameGenerationConfigured = upscaling.IsFrameGenerationConfiguredForSession();
-			const bool hdrConfigured = globals::features::hdrDisplay.loaded &&
-				globals::features::hdrDisplay.settings.enableHDR;
-			auto* renderer = globals::game::renderer;
-			winrt::com_ptr<ID3D11Texture2D> framebufferHolder;
-			ID3D11Texture2D* framebuffer = nullptr;
-			if (renderer) {
-				auto& target = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kFRAMEBUFFER];
-				framebuffer = ResolveRenderTargetTexture(target, framebufferHolder);
-			}
-			const bool routeActive = upscaling.GetUpscaleMethod() == Upscaling::UpscaleMethod::kDLSS &&
-				foveated.settings.neuralRenderingEnabled && !frameGenerationConfigured && !hdrConfigured;
-			if (!routeActive) {
-				if (foveated.settings.neuralRenderingEnabled && frameGenerationConfigured && !flatFrameGenerationBlockLogged) {
-					logger::warn("[DLSSNR] Flat route blocked: disable Frame Generation and restart the game");
-					flatFrameGenerationBlockLogged = true;
-				}
-				if (foveated.settings.neuralRenderingEnabled && hdrConfigured && !flatHdrBlockLogged) {
-					logger::warn("[DLSSNR] Flat route blocked: HDR Display is not supported by the LDR integration");
-					flatHdrBlockLogged = true;
-				}
-				if (flatRouteWasActive)
-					Reset();
-				return false;
-			}
-			flatRouteWasActive = true;
-			const bool postInject = upscaling.IsFlatDlssPostInjectActive();
-			const bool act1Bypass = upscaling.IsFlatAct1BypassActive();
-			if (foveated.settings.neuralRenderingBypassOutput && !postInject) {
-				lastFlatBypassOutput = true;
-				return false;
-			}
-
-			const std::uint32_t frame = globals::state ? globals::state->frameCount : 0;
-			if (lastAppliedFrame == frame || lastAttemptedFrame == frame)
-				return true;
-			auto* context = globals::d3d::context;
-			if (!renderer || !context || !globals::d3d::device || !upscaling.motionVectorCopyTexture)
-				return false;
-
-			auto& depth = renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kMAIN];
-			auto& rawMotion = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMOTION_VECTOR];
-			if (!framebuffer || !depth.texture || !depth.depthSRV || !upscaling.motionVectorCopyTexture->resource ||
-				!rawMotion.texture || !rawMotion.SRV)
-				return false;
-
-			D3D11_TEXTURE2D_DESC totalDesc{};
-			D3D11_TEXTURE2D_DESC motionDesc{};
-			framebuffer->GetDesc(&totalDesc);
-			upscaling.motionVectorCopyTexture->resource->GetDesc(&motionDesc);
-			if (!EnsureColorResources(framebuffer, totalDesc.Width, totalDesc.Height))
-				return false;
-
-			CS_GPU_PASS("NeuralRendering::FlatLdrBeforeUI");
-			ID3D11RenderTargetView* savedRTVs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
-			ID3D11DepthStencilView* savedDSV = nullptr;
-			context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, savedRTVs, &savedDSV);
-			const SKSE::stl::scope_exit restoreRenderTargets([&]() noexcept {
-				context->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, savedRTVs, savedDSV);
-				for (auto*& rtv : savedRTVs)
-					if (rtv) rtv->Release();
-				if (savedDSV) savedDSV->Release();
-			});
-			context->OMSetRenderTargets(0, nullptr, nullptr);
-			bool captureStarted = false;
-			const std::uint32_t cachedRenderWidth = upscaling.lastDlssRenderWidth ? upscaling.lastDlssRenderWidth : motionDesc.Width;
-			const std::uint32_t cachedRenderHeight = upscaling.lastDlssRenderHeight ? upscaling.lastDlssRenderHeight : motionDesc.Height;
-			const std::uint32_t renderWidth = std::clamp(cachedRenderWidth, 1u, motionDesc.Width);
-			const std::uint32_t renderHeight = std::clamp(cachedRenderHeight, 1u, motionDesc.Height);
-			const std::uint32_t act1Mode = postInject ? 0u :
-				upscaling.bootSnapshot.Boot(&Upscaling::Settings::flatAct1ResControl);
-			const bool temporalUpscaleInput = postInject || act1Mode != 0 || upscaling.settings.qualityMode != 0;
-			const std::uint32_t motionVectorMode = foveated.settings.neuralRenderingMotionVectorMode;
-			ID3D11ShaderResourceView* sourceMotionSRV = motionVectorMode == 1 ? rawMotion.SRV :
-				upscaling.motionVectorCopyTexture->srv.get();
-			const float motionVectorMultiplier = GetMotionVectorMultiplier(motionVectorMode);
-			const std::uint32_t outputMode = std::clamp(foveated.settings.neuralRenderingOutputMode, 1u, 3u);
-			const bool diagnosticModeChanged = lastFlatInputPrefilter != foveated.settings.neuralRenderingInputPrefilter ||
-				lastFlatMotionVectorMode != motionVectorMode ||
-				lastFlatResetEveryFrame != foveated.settings.neuralRenderingResetEveryFrame ||
-				lastFlatBypassOutput != foveated.settings.neuralRenderingBypassOutput ||
-				lastFlatOutputMode != outputMode ||
-				(foveated.settings.flatAct1Enabled && lastFlatAct1JitterMode != upscaling.settings.flatAct1JitterMode) ||
-				lastFlatAct2JitterMode != upscaling.settings.flatAct2JitterMode;
-			const bool forceReset = foveated.settings.neuralRenderingResetEveryFrame || diagnosticModeChanged;
-			if (lastFlatOutputMode != outputMode) {
-				static constexpr const char* outputNames[]{ "Guidance", "NIS", "DLSS-SR", "FSR3" };
-				logger::info("[ACT2] Selected backend={} mode={} quality={} forceReset=true",
-					outputNames[outputMode], outputMode, foveated.settings.flatAct2QualityMode);
-			}
-			lastAttemptedFrame = frame;
-
-			if (postInject) {
-				auto& streamline = Upscaling::streamline;
-				if (!upscaling.reactiveMaskTexture || !upscaling.transparencyCompositionMaskTexture ||
-					!streamline.PrepareFlatInputIsolation(context, framebuffer, depth.depthSRV,
-						upscaling.motionVectorCopyTexture->resource.get(),
-						upscaling.reactiveMaskTexture->resource.get(),
-						upscaling.transparencyCompositionMaskTexture->resource.get(),
-						renderWidth, renderHeight)) {
-					logger::error("[PostInject] Failed to prepare exact LDR RenderRes inputs {}x{}", renderWidth, renderHeight);
-					if (captureStarted)
-						ExperimentCapture::Complete(nullptr, false);
-					return false;
-				}
-				const sl::Extent extentIn{ 0, 0, renderWidth, renderHeight };
-				const sl::Extent extentOut{ 0, 0, totalDesc.Width, totalDesc.Height };
-				const bool srSucceeded = streamline.EvaluateDLSS(streamline.flatPostInjectViewport, 0,
-					streamline.flatIsolatedColor->resource.get(), color[0]->resource.get(),
-					streamline.flatIsolatedDepth->resource.get(), streamline.flatIsolatedMotionVectors->resource.get(),
-					streamline.flatIsolatedReactiveMask->resource.get(), streamline.flatIsolatedTransparencyMask->resource.get(),
-					extentIn, extentOut, totalDesc.Width, totalDesc.Height,
-					Streamline::DLSSModeForQualityMode(foveated.settings.flatAct1QualityMode), false, diagnosticModeChanged,
-					upscaling.settings.flatAct1JitterMode == 1, 1.0f, 1.0f,
-					foveated.settings.flatAct1Preset, foveated.settings.flatAct1Sharpness);
-				if (!srSucceeded) {
-					logger::error("[PostInject] LDR DLSS-SR evaluate failed {}x{} -> {}x{}; preserving engine Post output",
-						renderWidth, renderHeight, totalDesc.Width, totalDesc.Height);
-					if (captureStarted)
-						ExperimentCapture::Complete(nullptr, false);
-					return false;
-				}
-				if (!flatPostInjectLogged) {
-					logger::info("[PostInject] LDR DLSS-SR -> NR route active input={}x{} output={}x{} viewport=2 mode={}",
-						renderWidth, renderHeight, totalDesc.Width, totalDesc.Height, upscaling.settings.qualityMode);
-					flatPostInjectLogged = true;
-				}
-				captureStarted = ExperimentCapture::BeginIfRequested(color[0]->resource.get(), "flat_postinject");
-				if (foveated.settings.neuralRenderingBypassOutput) {
-					context->CopyResource(framebuffer, color[0]->resource.get());
-					if (captureStarted)
-						ExperimentCapture::Complete(nullptr, false);
-					lastAppliedFrame = frame;
-					lastFlatBypassOutput = true;
-					return true;
-				}
-			} else {
-				context->CopyResource(color[0]->resource.get(), framebuffer);
-				captureStarted = ExperimentCapture::BeginIfRequested(framebuffer, "flat");
-			}
-
-			bool succeeded = false;
-			const float act2InputScale = 1.0f / Upscaling::GetQualityModeRatio(foveated.settings.flatAct2QualityMode);
-			std::uint32_t nrWidth = std::max(1u, static_cast<std::uint32_t>(std::lround(totalDesc.Width * act2InputScale)));
-			std::uint32_t nrHeight = std::max(1u, static_cast<std::uint32_t>(std::lround(totalDesc.Height * act2InputScale)));
-			if (outputMode == 2 && foveated.settings.flatAct2QualityMode != 0) {
-				upscaling.streamline.ClampToDLSSRenderRange(foveated.settings.flatAct2QualityMode,
-					totalDesc.Width, totalDesc.Height, nrWidth, nrHeight);
-			}
-			if (EnsureFusionResources(framebuffer, totalDesc.Width, totalDesc.Height, nrWidth, nrHeight) &&
-				DownsampleForNeuralRendering(context,
-					act1Bypass ? renderWidth : totalDesc.Width,
-					act1Bypass ? renderHeight : totalDesc.Height)) {
-				D3D11_TEXTURE2D_DESC lowDesc{};
-				halfResolutionColor->resource->GetDesc(&lowDesc);
-				const std::uint32_t guideWidth = temporalUpscaleInput ? renderWidth : lowDesc.Width;
-				const std::uint32_t guideHeight = temporalUpscaleInput ? renderHeight : lowDesc.Height;
-				if (!EnsureGuideResources(upscaling.motionVectorCopyTexture->resource.get(), guideWidth, guideHeight) ||
-					!ResizeGuides(context, depth.depthSRV, sourceMotionSRV,
-						renderWidth, renderHeight, guideWidth, guideHeight, motionVectorMultiplier,
-						0, 0, foveated.settings.unifiedPipeline.act1DepthDownsample)) {
-					if (captureStarted)
-						ExperimentCapture::Complete(nullptr, false);
-					return false;
-				}
-				succeeded = Renderer::Instance().Apply(globals::d3d::device, context, 0,
-					halfResolutionColor->resource.get(), resizedDepthGuide->resource.get(), resizedDepthGuide->srv.get(),
-					resizedMotionGuide->resource.get(), guideWidth, guideHeight,
-					lowDesc.Width, lowDesc.Height, static_cast<float>(guideWidth),
-					static_cast<float>(guideHeight), GetTuning(foveated.settings), forceReset);
-				if (succeeded && outputMode == 2) {
-					succeeded = ApplyAct2Dlss(upscaling, context, depth.depthSRV, sourceMotionSRV,
-						renderWidth, renderHeight, lowDesc.Width, lowDesc.Height,
-						totalDesc.Width, totalDesc.Height, motionVectorMultiplier, forceReset);
-					if (succeeded)
-						context->CopyResource(framebuffer, upscaledNeuralColor->resource.get());
-				} else if (succeeded && outputMode == 3) {
-					succeeded = ApplyAct2Fsr(upscaling, context, depth.depthSRV, sourceMotionSRV,
-						renderWidth, renderHeight, lowDesc.Width, lowDesc.Height,
-						totalDesc.Width, totalDesc.Height, motionVectorMultiplier, forceReset);
-					if (succeeded)
-						context->CopyResource(framebuffer, upscaledNeuralColor->resource.get());
-				} else if (succeeded) {
-					if (lowDesc.Width == totalDesc.Width && lowDesc.Height == totalDesc.Height) {
-						context->CopyResource(framebuffer, halfResolutionColor->resource.get());
-					} else {
-						succeeded = nisScaler.Apply(globals::d3d::device, context,
-							halfResolutionColor->srv.get(), upscaledNeuralColor->uav.get(), lowDesc.Width, lowDesc.Height,
-							totalDesc.Width, totalDesc.Height, foveated.settings.neuralRenderingNisSharpness);
-						if (succeeded)
-							context->CopyResource(framebuffer, upscaledNeuralColor->resource.get());
-					}
-					if (succeeded)
-						++act2BackendStats.nisSucceeded;
-				}
-			}
-			if (succeeded) {
-				lastFlatInputPrefilter = foveated.settings.neuralRenderingInputPrefilter;
-				lastFlatMotionVectorMode = motionVectorMode;
-				lastFlatResetEveryFrame = foveated.settings.neuralRenderingResetEveryFrame;
-				lastFlatBypassOutput = foveated.settings.neuralRenderingBypassOutput;
-				lastFlatOutputMode = outputMode;
-				lastFlatAct1JitterMode = foveated.settings.flatAct1Enabled ?
-					upscaling.settings.flatAct1JitterMode : UINT32_MAX;
-				lastFlatAct2JitterMode = upscaling.settings.flatAct2JitterMode;
-				ExperimentCapture::Complete(framebuffer, true);
-				lastAppliedFrame = frame;
-				if (!writebackLogged) {
-					if (foveated.settings.neuralRenderingHalfResolution) {
-						D3D11_TEXTURE2D_DESC lowDesc{};
-						halfResolutionColor->resource->GetDesc(&lowDesc);
-						logger::info("[DLSSNR] Flat reduced-resolution resolve sourceGuides={}x{} nrGuides={}x{} nrColor={}x{} output={}x{} mvecScale={}x{} jitter=({:.4f},{:.4f}) mvMode={} mvMultiplier={:.2f} scale={} mode={} preset={} luma={:.2f} chroma={:.2f} edge={:.2f} limit={:.3f}",
-							renderWidth, renderHeight, lowDesc.Width, lowDesc.Height, lowDesc.Width, lowDesc.Height,
-							totalDesc.Width, totalDesc.Height, lowDesc.Width, lowDesc.Height,
-							0.0f, 0.0f,
-							motionVectorMode, motionVectorMultiplier,
-							foveated.settings.neuralRenderingWorkingScale,
-							foveated.settings.neuralRenderingOutputMode, foveated.settings.neuralRenderingFusionPreset,
-							foveated.settings.neuralRenderingFusionLuma, foveated.settings.neuralRenderingFusionChroma,
-							foveated.settings.neuralRenderingFusionEdgeProtection,
-							foveated.settings.neuralRenderingFusionResidualLimit);
-					} else {
-						logger::info("[DLSSNR] Flat full-resolution output sourceGuides={}x{} nrGuides={}x{} color={}x{} mvecScale={}x{} jitter=(0,0) prefilter={} resetEveryFrame={} mvMode={} mvMultiplier={:.2f}",
-							renderWidth, renderHeight, totalDesc.Width, totalDesc.Height,
-							totalDesc.Width, totalDesc.Height, totalDesc.Width, totalDesc.Height,
-							foveated.settings.neuralRenderingInputPrefilter,
-							foveated.settings.neuralRenderingResetEveryFrame,
-							motionVectorMode, motionVectorMultiplier);
-					}
-					writebackLogged = true;
-				}
-			}
-			if (captureStarted && !succeeded)
-				ExperimentCapture::Complete(nullptr, false);
-			if (!succeeded && postInject) {
-				context->CopyResource(framebuffer, color[0]->resource.get());
-				lastAppliedFrame = frame;
-				if (!flatPostInjectNrFallbackLogged) {
-					logger::warn("[PostInject] NR/ACT2 failed after SR; writing the completed DLSS-SR output as fallback");
-					flatPostInjectNrFallbackLogged = true;
-				}
-				return true;
-			}
-
-			return succeeded;
 		}
 
 		bool CaptureModel3Tail(Upscaling& upscaling)
@@ -2371,82 +2174,62 @@ namespace NeuralRendering
 			vrSixPassWasActive = false;
 			Reset();
 		}
-		if (!globals::game::isVR || !FoveatedRenderImpl::Bridge::IsRouteActive() ||
-			upscaling.GetUpscaleMethod() != Upscaling::UpscaleMethod::kDLSS ||
-			foveated.GetDlssMode() != FoveatedRender::DlssMode::kDefault ||
-			!foveated.settings.neuralRenderingEnabled || upscaling.IsFrameGenerationActive())
-			return false;
+		return false;
+	}
 
-		const std::uint32_t frame = globals::state ? globals::state->frameCount : 0;
-		const std::uint32_t guideFrame = FoveatedRenderImpl::Core::neuralGuidesFrame;
-		if (lastAppliedFrame == frame || (guideFrame != frame && !(frame > 0 && guideFrame == frame - 1)))
-			return false;
-
+	bool GetVrOwnedEyeSizes(uint32_t& renderW, uint32_t& renderH, uint32_t& displayW, uint32_t& displayH)
+	{
+		renderW = renderH = displayW = displayH = 0;
 		auto* renderer = globals::game::renderer;
-		auto* context = globals::d3d::context;
-		if (!renderer || !context || !globals::d3d::device ||
-			!FoveatedRenderImpl::Core::vrSubrectDepth[0] || !FoveatedRenderImpl::Core::vrSubrectDepth[1] ||
-			!FoveatedRenderImpl::Core::vrSubrectMotionVectors[0] || !FoveatedRenderImpl::Core::vrSubrectMotionVectors[1])
-			return false;
-		auto& total = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kTOTAL];
-		if (!total.texture)
-			return false;
-
-		D3D11_TEXTURE2D_DESC totalDesc{};
-		total.texture->GetDesc(&totalDesc);
-		const auto& leftUV = foveated.subrectController.GetUV();
-		const auto& rightUV = foveated.subrectController.GetRightEyeUV();
-		if (leftUV.w != rightUV.w || leftUV.h != rightUV.h)
-			return false;
-		const std::uint32_t eyeWidth = totalDesc.Width / 2;
-		const std::uint32_t outWidth = std::max<std::uint32_t>(1, static_cast<std::uint32_t>(eyeWidth * leftUV.w));
-		const std::uint32_t outHeight = std::max<std::uint32_t>(1, static_cast<std::uint32_t>(totalDesc.Height * leftUV.h));
-
-		CS_GPU_PASS("NeuralRendering::FoveatedLdrBeforeUI");
-		ID3D11RenderTargetView* savedRTVs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
-		ID3D11DepthStencilView* savedDSV = nullptr;
-		context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, savedRTVs, &savedDSV);
-		context->OMSetRenderTargets(0, nullptr, nullptr);
-
-		const Util::Subrect::UVRegion* eyeUVs[2]{ &leftUV, &rightUV };
-		std::array<Renderer::StereoEyeInput, 2> inputs{};
-		for (std::uint32_t eye = 0; eye < 2; ++eye) {
-			const auto& uv = *eyeUVs[eye];
-			const std::uint32_t x = (eye ? eyeWidth : 0) + static_cast<std::uint32_t>(eyeWidth * uv.x);
-			const std::uint32_t y = static_cast<std::uint32_t>(totalDesc.Height * uv.y);
-			float motionScaleX = 1.0f;
-			float motionScaleY = 1.0f;
-			FoveatedRenderImpl::Bridge::ComputeMvecScale(eye, motionScaleX, motionScaleY);
-			inputs[eye] = {
-				.depth = FoveatedRenderImpl::Core::vrSubrectDepth[eye]->resource.get(),
-				.depthSRV = FoveatedRenderImpl::Core::vrSubrectDepth[eye]->srv.get(),
-				.motionVectors = FoveatedRenderImpl::Core::vrSubrectMotionVectors[eye]->resource.get(),
-				.sourceX = x,
-				.sourceY = y,
-				.motionVectorScaleX = motionScaleX * FoveatedRenderImpl::Core::vrSubrectInW,
-				.motionVectorScaleY = motionScaleY * FoveatedRenderImpl::Core::vrSubrectInH,
-			};
-		}
-		const bool captureStarted = ExperimentCapture::BeginIfRequested(total.texture, "vr");
-		const bool succeeded = Renderer::Instance().ApplyStereo(globals::d3d::device, context,
-			total.texture, inputs, FoveatedRenderImpl::Core::vrSubrectInW, FoveatedRenderImpl::Core::vrSubrectInH,
-			outWidth, outHeight, GetTuning(foveated.settings));
-		if (succeeded) {
-			ExperimentCapture::Complete(total.texture, true);
-			lastAppliedFrame = frame;
-			if (!writebackLogged) {
-				logger::info("[DLSSNR] LDR output written before UI composite size={}x{} batchedAsync=true", outWidth, outHeight);
-				writebackLogged = true;
+		if (renderer) {
+			auto& targets = renderer->GetRuntimeData().renderTargets;
+			if (auto* temp = static_cast<ID3D11Texture2D*>(targets[RE::RENDER_TARGETS::kIMAGESPACE_TEMP_COPY].texture)) {
+				D3D11_TEXTURE2D_DESC desc{};
+				temp->GetDesc(&desc);
+				if (desc.Width >= 2 && desc.Height) {
+					renderW = desc.Width / 2;
+					renderH = desc.Height;
+				}
+			}
+			if (auto* total = static_cast<ID3D11Texture2D*>(targets[RE::RENDER_TARGETS::kTOTAL].texture)) {
+				D3D11_TEXTURE2D_DESC desc{};
+				total->GetDesc(&desc);
+				if (desc.Width >= 2 && desc.Height) {
+					displayW = desc.Width / 2;
+					displayH = desc.Height;
+				}
 			}
 		}
-		if (captureStarted && !succeeded)
-			ExperimentCapture::Complete(nullptr, false);
+#ifdef ENABLE_SKYRIM_VR
+		if (globals::game::isVR) {
+			if (auto* openvr = RE::BSOpenVR::GetSingleton(); openvr && openvr->vrSystem) {
+				uint32_t recW = 0, recH = 0;
+				openvr->vrSystem->GetRecommendedRenderTargetSize(&recW, &recH);
+				if (recW && recH) {
+					displayW = recW;
+					displayH = recH;
+				}
+			}
+		}
+#endif
+		if (!renderW || !renderH) {
+			renderW = displayW;
+			renderH = displayH;
+		}
+		if (!displayW || !displayH) {
+			displayW = renderW;
+			displayH = renderH;
+		}
+		return renderW && renderH && displayW && displayH;
+	}
 
-		context->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, savedRTVs, savedDSV);
-		for (auto*& rtv : savedRTVs)
-			if (rtv) rtv->Release();
-		if (savedDSV) savedDSV->Release();
-		return succeeded;
+	ID3D11Texture2D* GetVrOwnedComposite(ID3D11ShaderResourceView** outSrv)
+	{
+		if (!vrCompositeSbs || !vrCompositeSbs->resource)
+			return nullptr;
+		if (outSrv)
+			*outSrv = vrCompositeSbs->srv.get();
+		return static_cast<ID3D11Texture2D*>(vrCompositeSbs->resource.get());
 	}
 
 	Act2BackendStats GetAct2BackendStats()
@@ -2493,6 +2276,8 @@ namespace NeuralRendering
 		act3EditLow.reset();
 		act3GuideLow.reset();
 		vrCompositeSbs.reset();
+		vrEyeColor[0].reset();
+		vrEyeColor[1].reset();
 		nisScaler.Reset();
 		act1FsrScaler.Reset();
 		act2FsrScaler.Reset();
@@ -2515,9 +2300,6 @@ namespace NeuralRendering
 		vrSixPassWasActive = false;
 		vrSixPassLogged = false;
 		vrSixPassDoneFrame = UINT32_MAX;
-		flatFrameGenerationBlockLogged = false;
-		flatHdrBlockLogged = false;
-		flatPostInjectLogged = false;
 		lastFlatInputPrefilter = UINT32_MAX;
 		lastFlatMotionVectorMode = UINT32_MAX;
 		lastFlatResetEveryFrame = false;
@@ -2532,8 +2314,10 @@ namespace NeuralRendering
 		lastModel3PlanSignature = 0;
 		hasModel3Plan = false;
 		lastModel3Frame = UINT64_MAX;
+		lastModel3CaptureFrame = UINT64_MAX;
 		lastModel3Eligible = false;
 		model3RestrictionLogged = false;
+		model3CaptureFailureLogged = false;
 		act2BackendStats = {};
 	}
 }

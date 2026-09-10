@@ -1128,9 +1128,9 @@ Destination[p]=float4((lobe*(b+d+f+h)+e)/(4*lobe+1),1);})";
 				std::uint32_t pad0, pad1, pad2;
 			} constants{
 				plan.act3.cropX, plan.act3.cropY, plan.act3.cropWidth, plan.act3.cropHeight,
-				plan.act3.guidanceEnabled ? 2u : 1u,
+				0u,
 				plan.act3.featherWidth, static_cast<std::uint32_t>(plan.frameId), 0u,
-				plan.act3.ditherStrength, 0u, 0u, 0u };
+				0.0f, 0u, 0u, 0u };
 			const auto views = BindViews(slot, source, kColorFormat, destination, kColorFormat);
 			if (!views.ptr)
 				return false;

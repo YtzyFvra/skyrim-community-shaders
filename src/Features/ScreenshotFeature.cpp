@@ -9,6 +9,7 @@
 
 #include "Features/HDRDisplay.h"
 #include "Features/Upscaling.h"
+#include "Features/Upscaling/NeuralRendering/Integration.h"
 #include "Globals.h"
 #include "I18n/I18n.h"
 #include "Menu.h"
@@ -354,7 +355,7 @@ namespace
 	}
 
 	// Picks the capture source:
-	//   VR                 -> kTOTAL (final SBS composite submitted to the HMD).
+	//   VR                 -> owned SBS after 8-pass Submit, else kTOTAL.
 	//   Flat Model 3       -> reconstructed Display D + UI (not the DXGI backbuffer).
 	//   HDR + CS menu open -> clean HDR composite (no UI, no menu blur).
 	//   HDR enabled        -> swap-chain back buffer after ApplyHDR (PQ HDR10 / PQ float).
@@ -369,6 +370,13 @@ namespace
 		}
 
 		if (globals::game::isVR) {
+			ID3D11ShaderResourceView* ownedSrv = nullptr;
+			if (auto* owned = NeuralRendering::GetVrOwnedComposite(&ownedSrv)) {
+				src.texture = owned;
+				src.srv = ownedSrv;
+				src.description = "VR owned composite";
+				return src;
+			}
 			// Real object is VR-sized (kVRTOTAL) here; the multi-runtime build's
 			// compile-time array type stays kTOTAL-sized.
 #pragma clang diagnostic push

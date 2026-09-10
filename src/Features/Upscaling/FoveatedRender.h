@@ -257,8 +257,8 @@ struct FoveatedRender
 		bool act3ResetEveryFrame = false;
 		bool act3Sharpen = false;                 ///< Fullscreen RCAS after the crop is written back.
 		float act3Sharpness = 1.0f;
-		float act3FeatherWidth = 64.0f;           ///< KIT dither band in pixels at the crop edge.
-		float act3DitherStrength = 1.0f;          ///< Noise amplitude in that band; 1 matches KIT VR.
+		float act3FeatherWidth = 64.0f;           ///< Smoothstep writeback band at the crop edge.
+		float act3DitherStrength = 1.0f;          ///< Unused; kept for settings compatibility.
 		bool act3GuidanceEnabled = false;         ///< ACT2 Guidance partition on the ACT3 crop.
 		float act3GuidanceLuma = 1.0f;
 		float act3GuidanceChroma = 0.70f;

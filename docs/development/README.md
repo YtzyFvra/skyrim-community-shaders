@@ -8,6 +8,7 @@
 -   **[Repository Architecture](./architecture.md)** - Codebase layout, global systems, and multi-runtime targeting
 -   **[Release Process](./release-process.md)** - Branch model, semantic version bumps, release stages, and manual packaging
 -   **[Flat ARISE Menu Extents](./flat-arise-menu.md)** - Logical R vs physical D menus; what is patched and what must not be restored
+-   **[VR Owned Submit](./vr-owned-submit.md)** - Post kTEMP 8-pass, per-eye Submit, swallow engine world Submit
 
 ## Quick Links
 

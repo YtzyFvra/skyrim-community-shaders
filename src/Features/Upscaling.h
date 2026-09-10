@@ -217,7 +217,7 @@ public:
 	bool ShouldUseFrameGenerationThisFrame() const;
 	bool IsUpscalingActive() const;
 	bool IsFlatDlssPostInjectActive() const;
-	/** @brief VR PerfMode + DLSS + NR, before UI. Skips HDR SR and hybrid Post. */
+	/** @brief VR + DLSS + NR: Post kTEMP 8-pass, owned Submit. Skips hybrid Post. */
 	bool IsVrDlssPostInjectActive() const;
 	bool IsDlssPostInjectActive() const
 	{

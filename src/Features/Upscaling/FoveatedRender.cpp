@@ -1214,7 +1214,7 @@ void FoveatedRender::DrawLogicalPerfModeControls()
 {
 	if (globals::game::isVR) {
 		ImGui::TextDisabled("%s", T(TKEY("pipeline_arise_vr_blocked"),
-			"ARISE owns DXGI Present. VR submits through OpenVR. Six-pass runs on D3D11 before UI."));
+			"ARISE owns DXGI Present. VR submits through OpenVR. 8-pass runs after Post, then we Submit."));
 		return;
 	}
 	ClampSettings();
@@ -1436,7 +1436,7 @@ void FoveatedRender::DrawNeuralRenderingSettings(bool wrapHeader)
 			T(TKEY("jitter_actual"), "Actual Camera Jitter"),
 			T(TKEY("jitter_zero"), "Zero")
 		};
-		const bool showSixPass = !globals::game::isVR || upscaling.perfMode.IsHookActive();
+		const bool showSixPass = true;
 		if (showSixPass) {
 			const char* act1Backends[] = {
 				T(TKEY("act1_backend_bypass"), "Bypass"),
@@ -1444,16 +1444,19 @@ void FoveatedRender::DrawNeuralRenderingSettings(bool wrapHeader)
 				T(TKEY("act1_backend_fsr3"), "FSR3")
 			};
 			const bool model3Preview = !globals::game::isVR && upscaling.dx12SwapChain.useArise;
-			const bool vrSixPreview = globals::game::isVR && upscaling.perfMode.IsHookActive();
+			const bool vrSixPreview = globals::game::isVR;
 			const auto& previewUV = subrectController.GetUV();
+			uint32_t vrRenderW = 0, vrRenderH = 0, vrDisplayW = 0, vrDisplayH = 0;
+			if (vrSixPreview)
+				NeuralRendering::GetVrOwnedEyeSizes(vrRenderW, vrRenderH, vrDisplayW, vrDisplayH);
 			const uint32_t vrPreviewInW = vrSixPreview ?
-				std::max(1u, static_cast<uint32_t>(upscaling.perfMode.GetRenderEyeWidth() * previewUV.w)) : 0u;
+				std::max(1u, static_cast<uint32_t>(vrRenderW * previewUV.w)) : 0u;
 			const uint32_t vrPreviewInH = vrSixPreview ?
-				std::max(1u, static_cast<uint32_t>(upscaling.perfMode.GetRenderEyeHeight() * previewUV.h)) : 0u;
+				std::max(1u, static_cast<uint32_t>(vrRenderH * previewUV.h)) : 0u;
 			const uint32_t vrPreviewOutW = vrSixPreview ?
-				std::max(1u, static_cast<uint32_t>(upscaling.perfMode.GetDisplayEyeWidth() * previewUV.w)) : 0u;
+				std::max(1u, static_cast<uint32_t>(vrDisplayW * previewUV.w)) : 0u;
 			const uint32_t vrPreviewOutH = vrSixPreview ?
-				std::max(1u, static_cast<uint32_t>(upscaling.perfMode.GetDisplayEyeHeight() * previewUV.h)) : 0u;
+				std::max(1u, static_cast<uint32_t>(vrDisplayH * previewUV.h)) : 0u;
 			const auto previewPlan = BuildFlatPipelinePlan(
 				vrSixPreview ? vrPreviewOutW :
 					(model3Preview ? upscaling.dx12SwapChain.PhysicalWidth() :
@@ -1466,11 +1469,11 @@ void FoveatedRender::DrawNeuralRenderingSettings(bool wrapHeader)
 				vrSixPreview ? vrPreviewInH :
 					(model3Preview ? upscaling.dx12SwapChain.LogicalHeight() : 0u));
 			ImGui::TextDisabled("%s", globals::game::isVR ?
-				T(TKEY("injection_point_vr"), "Injection Point: Before UI composite on kTOTAL (foveated center)") :
+				T(TKEY("injection_point_vr"), "Injection Point: After Post on kTEMP, owned per-eye Submit") :
 				T(TKEY("injection_point"), "Injection Point: PostInject LDR / Before UI (fixed)"));
 			if (globals::game::isVR)
 				ImGui::TextDisabled("%s", T(TKEY("vr_six_pass_note"),
-					"Center six-pass, periphery stretch. DLSS-G is full-eye on Submit."));
+					"kTEMP 8-pass per eye, then our Submit. Engine world Submit is swallowed."));
 			DrawSixPassOverview(previewPlan, settings.unifiedPipeline.fusionEnabled,
 				settings.flatPipelineSharpen);
 			ImGui::Separator();
@@ -1583,17 +1586,16 @@ void FoveatedRender::DrawNeuralRenderingSettings(bool wrapHeader)
 		}
 
 		const bool model3Route = !globals::game::isVR && upscaling.dx12SwapChain.useArise;
-		const bool supportedRoute = (model3Route ||
-			globals::features::upscaling.GetUpscaleMethod() == Upscaling::UpscaleMethod::kDLSS) &&
-			(model3Route || !globals::features::upscaling.IsFrameGenerationConfiguredForSession()) &&
-			(!globals::game::isVR || upscaling.perfMode.IsHookActive() || GetDlssMode() == DlssMode::kDefault);
+		const bool supportedRoute = model3Route ||
+			(globals::features::upscaling.GetUpscaleMethod() == Upscaling::UpscaleMethod::kDLSS &&
+				(globals::game::isVR || !globals::features::upscaling.IsFrameGenerationConfiguredForSession()));
 		if (!supportedRoute) {
-			if (globals::features::upscaling.IsFrameGenerationConfiguredForSession())
+			if (!globals::game::isVR && globals::features::upscaling.IsFrameGenerationConfiguredForSession())
 				Util::Text::Warning(T(TKEY("neural_rendering_disable_fg"),
 					"Disable Frame Generation and restart the game before enabling DLSS Neural Rendering."));
 			else
 				Util::Text::Warning(T(TKEY("neural_rendering_unavailable"),
-					"Requires DLSS. VR six-pass needs PerfMode; without it, Foveated Default still enables the legacy NR crop."));
+					"Requires DLSS."));
 			ImGui::BeginDisabled();
 		}
 		ImGui::TextUnformatted(T(TKEY("neural_rendering"), "Neural Rendering"));
@@ -1613,17 +1615,20 @@ void FoveatedRender::DrawNeuralRenderingSettings(bool wrapHeader)
 				ImGui::EndDisabled();
 				{
 					const bool model3 = !globals::game::isVR && globals::features::upscaling.dx12SwapChain.useArise;
-					const bool vrSix = globals::game::isVR && globals::features::upscaling.perfMode.IsHookActive();
+					const bool vrSix = globals::game::isVR;
+					uint32_t vrRenderW = 0, vrRenderH = 0, vrDisplayW = 0, vrDisplayH = 0;
+					if (vrSix)
+						NeuralRendering::GetVrOwnedEyeSizes(vrRenderW, vrRenderH, vrDisplayW, vrDisplayH);
 					const auto preview = BuildFlatPipelinePlan(
-						vrSix ? globals::features::upscaling.perfMode.GetDisplayEyeWidth() :
+						vrSix ? vrDisplayW :
 							(model3 ? globals::features::upscaling.dx12SwapChain.PhysicalWidth() :
 								(globals::state ? static_cast<uint32_t>(globals::state->screenSize.x) : 0u)),
-						vrSix ? globals::features::upscaling.perfMode.GetDisplayEyeHeight() :
+						vrSix ? vrDisplayH :
 							(model3 ? globals::features::upscaling.dx12SwapChain.PhysicalHeight() :
 								(globals::state ? static_cast<uint32_t>(globals::state->screenSize.y) : 0u)),
-						vrSix ? globals::features::upscaling.perfMode.GetRenderEyeWidth() :
+						vrSix ? vrRenderW :
 							(model3 ? globals::features::upscaling.dx12SwapChain.LogicalWidth() : 0u),
-						vrSix ? globals::features::upscaling.perfMode.GetRenderEyeHeight() :
+						vrSix ? vrRenderH :
 							(model3 ? globals::features::upscaling.dx12SwapChain.LogicalHeight() : 0u));
 					const double displayPixels = static_cast<double>(preview.displayWidth) * preview.displayHeight;
 					const double nrPixels = static_cast<double>(preview.nrWidth) * preview.nrHeight;
@@ -1829,7 +1834,7 @@ void FoveatedRender::DrawNeuralRenderingSettings(bool wrapHeader)
 			ImGui::Checkbox(T(TKEY("act3_enable"), "ACT3 Center NR"), &settings.act3Enabled);
 			if (auto _tt = Util::HoverTooltipWrapper()) {
 				ImGui::Text("%s", T(TKEY("act3_enable_tooltip"),
-					"After Final Sharpen, crop a fixed center of D, run a second NR, and write it back with KIT dither mixing at the crop edge."));
+					"After Final Sharpen, crop a fixed center of D, run a second NR, and write it back with a feathered mix at the crop edge."));
 			}
 			if (settings.act3Enabled) {
 				ImGui::SliderFloat(T(TKEY("act3_scale"), "Center Scale"), &settings.act3Scale, 0.0f, 0.9f, "%.2f");
@@ -1840,12 +1845,7 @@ void FoveatedRender::DrawNeuralRenderingSettings(bool wrapHeader)
 				ImGui::SliderFloat(T(TKEY("act3_feather"), "Writeback Feather"), &settings.act3FeatherWidth, 2.0f, 128.0f, "%.0f px");
 				if (auto _tt = Util::HoverTooltipWrapper()) {
 					ImGui::Text("%s", T(TKEY("act3_feather_tooltip"),
-						"Width of the KIT dither band. Interior stays 100% ACT3; the band mixes with the first-pass D."));
-				}
-				ImGui::SliderFloat(T(TKEY("act3_dither"), "Writeback Dither"), &settings.act3DitherStrength, 0.0f, 2.0f, "%.2f");
-				if (auto _tt = Util::HoverTooltipWrapper()) {
-					ImGui::Text("%s", T(TKEY("act3_dither_tooltip"),
-						"Directional and spatially locked. Outer edge stays background, inner edge stays ACT3. 0 is a smooth ramp; 1 adds static grain in the band only."));
+						"Smoothstep band at the crop edge. Outer edge is first-pass D, inner edge is ACT3."));
 				}
 				ImGui::Checkbox(T(TKEY("act3_guidance"), "ACT3 Guidance"), &settings.act3GuidanceEnabled);
 				if (auto _tt = Util::HoverTooltipWrapper()) {
@@ -1854,7 +1854,7 @@ void FoveatedRender::DrawNeuralRenderingSettings(bool wrapHeader)
 				}
 				if (settings.act3GuidanceEnabled) {
 					ImGui::TextDisabled("%s", T(TKEY("act3_guidance_help"),
-						"Background keeps the first Guidance. The crop runs ACT3 NR then this Guidance. The dither band picks one or the other: inward ACT3, outward background."));
+						"Background keeps the first Guidance. The crop runs ACT3 NR then this Guidance. The feather band lerps from first-pass D (outer) to ACT3 (inner)."));
 					ImGui::SliderFloat(T(TKEY("act3_guidance_luma"), "ACT3 Detail Luma"), &settings.act3GuidanceLuma, 0.0f, 1.5f, "%.2f");
 					if (auto _tt = Util::HoverTooltipWrapper()) {
 						ImGui::Text("%s", T(TKEY("fusion_luma_tooltip"),
@@ -1952,7 +1952,7 @@ void FoveatedRender::DrawNeuralRenderingSettings(bool wrapHeader)
 			if (ImGui::TreeNodeEx(T(TKEY("diagnostics"), "Diagnostics"))) {
 				if (globals::game::isVR)
 					ImGui::TextDisabled("%s", T(TKEY("pipeline_arise_vr_blocked"),
-						"ARISE owns DXGI Present. VR submits through OpenVR. Six-pass runs on D3D11 before UI."));
+						"ARISE owns DXGI Present. VR submits through OpenVR. 8-pass runs after Post, then we Submit."));
 				if (!globals::game::isVR) {
 					if (ImGui::Checkbox(T(TKEY("pipeline_arise"), "ARISE Async PerfMode"), &settings.ariseModel3) && settings.ariseModel3) {
 						settings.singleThreadPerfMode = false;
@@ -2346,26 +2346,25 @@ void FoveatedRender::DrawSettings()
 								  "you drag-resize the region below, even with this off."));
 		}
 
-		// Preview off kVR_FRAMEBUFFER (the final composed SBS image the headset
-		// sees) rather than kMAIN. kMAIN is mid-pipeline and carries non-1
-		// alpha where Skyrim composited UI plates, so even with the opaque
-		// blend callback you see the menu mask outline instead of the rendered
-		// world. ScreenshotFeature picks the same RT for the same reason
-		// (ScreenshotFeature.cpp:243). Foveated is VR-only so kVR_FRAMEBUFFER
-		// is always populated when we get here.
 		auto renderer = globals::game::renderer;
-		if (renderer) {
+		ID3D11ShaderResourceView* previewSrv = nullptr;
+		ID3D11Texture2D* previewTex = nullptr;
+		if (auto* owned = NeuralRendering::GetVrOwnedComposite(&previewSrv)) {
+			previewTex = owned;
+		} else if (renderer) {
 			// Real object is VR-sized (kVRTOTAL) here; the multi-runtime build's
 			// compile-time array type stays kTOTAL-sized.
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Warray-bounds"
 			auto& fb = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kVR_FRAMEBUFFER];
 #pragma clang diagnostic pop
-			auto* tex = Util::AsReal(fb.texture);
-			subrectController.DrawEditor(Util::AsReal(fb.SRV), tex, 0.5f, 0.0f, Util::Subrect::OpaquePreviewBlendCallback);
-		} else {
-			subrectController.DrawEditor(nullptr, nullptr, 0.5f);
+			previewSrv = Util::AsReal(fb.SRV);
+			previewTex = Util::AsReal(fb.texture);
 		}
+		if (previewSrv && previewTex)
+			subrectController.DrawEditor(previewSrv, previewTex, 0.5f, 0.0f, Util::Subrect::OpaquePreviewBlendCallback);
+		else
+			subrectController.DrawEditor(nullptr, nullptr, 0.5f);
 
 		if (subrectController.IsDragging())
 			lastDragTime = std::chrono::steady_clock::now();
