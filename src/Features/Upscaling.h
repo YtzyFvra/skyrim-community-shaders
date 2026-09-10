@@ -217,6 +217,12 @@ public:
 	bool ShouldUseFrameGenerationThisFrame() const;
 	bool IsUpscalingActive() const;
 	bool IsFlatDlssPostInjectActive() const;
+	/** @brief VR PerfMode + DLSS + NR, before UI. Skips HDR SR and hybrid Post. */
+	bool IsVrDlssPostInjectActive() const;
+	bool IsDlssPostInjectActive() const
+	{
+		return IsFlatDlssPostInjectActive() || IsVrDlssPostInjectActive();
+	}
 	bool IsFlatAct1BypassActive() const;
 
 	// Feature interface overrides
@@ -282,6 +288,8 @@ public:
 	void DrawFrameGenerationSettings();
 	/** @brief NVIDIA Reflex latency controls. Shared with RTX DLSS Booster. */
 	void DrawReflexSettings();
+	/** @brief Display-D RCAS, independent of Neural Rendering. Shared with RTX DLSS Booster. */
+	void DrawFinalSharpenSettings();
 	const char* GetQualityModeName(uint qualityMode) const;
 	virtual void SaveSettings(json& o_json) override;
 	virtual void LoadSettings(json& o_json) override;

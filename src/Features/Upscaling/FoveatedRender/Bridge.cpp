@@ -24,7 +24,7 @@ void FoveatedRenderImpl::Bridge::ComputeMvecScale(uint32_t eyeIndex, float& outX
 	outX = 1.0f;
 	outY = 1.0f;
 
-	if (!IsRouteActive())
+	if (!IsRouteActive() && !foveatedEvaluating)
 		return;
 
 	auto& enhancer = globals::features::upscaling.foveatedRender;

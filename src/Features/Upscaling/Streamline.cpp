@@ -1345,8 +1345,17 @@ void Streamline::TagDX12Resources(ID3D12GraphicsCommandList* cmdList,
 
 	// Depth/mvec carry valid data only in the render-resolution subrect of their
 	// display-sized targets; declare that extent, matching the FSR FG dispatch.
-	auto renderSizeF = globals::state->screenSize * globals::features::upscaling.resolutionScale;
-	sl::Extent renderExtent{ 0, 0, static_cast<uint32_t>(renderSizeF.x), static_cast<uint32_t>(renderSizeF.y) };
+	sl::Extent renderExtent{ 0, 0, width, height };
+	if (globals::game::isVR) {
+		auto& perfMode = globals::features::upscaling.perfMode;
+		const uint32_t guideW = perfMode.GetRenderEyeWidth() * 2;
+		const uint32_t guideH = perfMode.GetRenderEyeHeight();
+		if (guideW && guideH)
+			renderExtent = { 0, 0, guideW, guideH };
+	} else {
+		auto renderSizeF = globals::state->screenSize * globals::features::upscaling.resolutionScale;
+		renderExtent = { 0, 0, static_cast<uint32_t>(renderSizeF.x), static_cast<uint32_t>(renderSizeF.y) };
+	}
 
 	sl::Resource depthRes = { sl::ResourceType::eTex2d, depth, D3D12_RESOURCE_STATE_COMMON };
 	sl::Resource mvecRes = { sl::ResourceType::eTex2d, mvec, D3D12_RESOURCE_STATE_COMMON };

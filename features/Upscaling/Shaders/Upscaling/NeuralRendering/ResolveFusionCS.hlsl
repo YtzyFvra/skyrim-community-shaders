@@ -1,6 +1,11 @@
+// Affine-guided lifting. a is already lerp(prior, a_fit, ρ²) from the fit pass.
+//   D = RC + a * (G_D - Lo) + (ToneGain - 1) * E_lf + (DetailGain - 1) * E_hf
 Texture2D<float4> OriginalColor : register(t0);
 Texture2D<float4> NeuralColor : register(t1);
-Texture2D<float> DepthGuide : register(t2);
+Texture2D<float4> NeuralGain : register(t2);
+Texture2D<float4> GuideLow : register(t3);
+Texture2D<float4> EditLow : register(t4);
+Texture2D<float> DepthGuide : register(t5);
 RWTexture2D<float4> OutputColor : register(u0);
 
 cbuffer FusionConstants : register(b0)
@@ -9,260 +14,310 @@ cbuffer FusionConstants : register(b0)
 	uint FullHeight;
 	uint GuidanceWidth;
 	uint GuidanceHeight;
-	float LumaStrength;
-	float ChromaStrength;
-	float EdgeProtection;
-	float ResidualLimit;
-	uint Direction;
-	uint DenoiseMode;
-	float DenoiseStrength;
-	float Softness;
+	float DetailLuma;
+	float DetailChroma;
+	float RdEdgeFloor;
+	float Regularization;
+	uint CompareMode;
+	uint DebugView;
+	float GainPrior;
+	float FitWindow;
 	uint DepthWidth;
 	uint DepthHeight;
-	float FrequencyGuidance;
+	float MaxGain;
 	float DepthGuidance;
-	uint EnhancedGuidance;
-	float ColorGuidance;
-	float2 GuidancePadding;
+	uint EdgeBlockMode;
+	float EdgeBlockGThresh;
+	uint NeuralWidth;
+	uint NeuralHeight;
+	float CameraFar;
+	float CameraNear;
+	float CameraRange;
+	float CameraProduct;
+	float DepthDilate;
+	float DetailGain;
+	float ToneGainLuma;
+	float ToneGainChroma;
+	float DitherStrength;
+	float EdgeBlockSkip;
+	float EdgeBlockDilateD;
+	float EdgeBlockMix;
 };
 
 static const float3 LumaWeights = float3(0.2126, 0.7152, 0.0722);
+static const float SkyRaw = 1.0 - 64.0 / 16777216.0;
+static const float MaskRaw = 1e-5;
+static const float SkyLinear = 1.0e7;
 
-float4 LoadGuidance(int2 pixel)
+float3 LoadGuidance(int2 pixel)
 {
-	pixel = clamp(pixel, int2(0, 0), int2(GuidanceWidth - 1, GuidanceHeight - 1));
-	return OriginalColor.Load(int3(pixel, 0));
+	pixel = clamp(pixel, int2(0, 0), int2(GuidanceWidth, GuidanceHeight) - 1);
+	return OriginalColor.Load(int3(pixel, 0)).rgb;
 }
 
-float4 LoadOriginal(int2 pixel)
+float4 LoadGain(int2 pixel)
 {
-	pixel = clamp(pixel, int2(0, 0), int2(FullWidth - 1, FullHeight - 1));
-	float2 position = (float2(pixel) + 0.5) *
-		float2(GuidanceWidth, GuidanceHeight) / float2(FullWidth, FullHeight) - 0.5;
+	pixel = clamp(pixel, int2(0, 0), int2(NeuralWidth, NeuralHeight) - 1);
+	return NeuralGain.Load(int3(pixel, 0));
+}
+
+float3 LoadEditLow(int2 pixel)
+{
+	pixel = clamp(pixel, int2(0, 0), int2(NeuralWidth, NeuralHeight) - 1);
+	return EditLow.Load(int3(pixel, 0)).rgb;
+}
+
+float3 GuidanceAtDisplay(int2 destPixel)
+{
+	float2 ratio = float2(GuidanceWidth, GuidanceHeight) / float2(FullWidth, FullHeight);
+	float2 position = (float2(destPixel) + 0.5) * ratio - 0.5;
+	if (all(abs(ratio - 1.0) < 1e-3))
+		return LoadGuidance(int2(round(position)));
+	int2 base = int2(floor(position));
+	float3 acc = 0.0;
+	float weightSum = 0.0;
+	[unroll]
+	for (int y = -1; y <= 2; ++y) {
+		[unroll]
+		for (int x = -1; x <= 2; ++x) {
+			float2 delta = abs(float2(base + int2(x, y)) - position) / max(ratio, 1.0);
+			float weight = saturate(1.0 - delta.x) * saturate(1.0 - delta.y);
+			if (weight <= 0.0)
+				continue;
+			acc += LoadGuidance(base + int2(x, y)) * weight;
+			weightSum += weight;
+		}
+	}
+	return acc / max(weightSum, 1e-5);
+}
+
+float2 NeuralPosition(int2 destPixel)
+{
+	if (EdgeBlockMode != 0)
+		return float2(destPixel);
+	return (float2(destPixel) + 0.5) * float2(NeuralWidth, NeuralHeight) / float2(FullWidth, FullHeight) - 0.5;
+}
+
+float4 GainAtDisplay(float2 position)
+{
 	int2 base = int2(floor(position));
 	float2 fraction = frac(position);
 	return lerp(
-		lerp(LoadGuidance(base), LoadGuidance(base + int2(1, 0)), fraction.x),
-		lerp(LoadGuidance(base + int2(0, 1)), LoadGuidance(base + int2(1, 1)), fraction.x),
+		lerp(LoadGain(base), LoadGain(base + int2(1, 0)), fraction.x),
+		lerp(LoadGain(base + int2(0, 1)), LoadGain(base + int2(1, 1)), fraction.x),
 		fraction.y);
 }
 
-float4 LoadNeural(int2 pixel)
+float3 EditLowAtDisplay(float2 position)
 {
-	pixel = clamp(pixel, int2(0, 0), int2(FullWidth - 1, FullHeight - 1));
-	return NeuralColor.Load(int3(pixel, 0));
+	int2 base = int2(floor(position));
+	float2 fraction = frac(position);
+	return lerp(
+		lerp(LoadEditLow(base), LoadEditLow(base + int2(1, 0)), fraction.x),
+		lerp(LoadEditLow(base + int2(0, 1)), LoadEditLow(base + int2(1, 1)), fraction.x),
+		fraction.y);
 }
 
-float LoadDepth(int2 pixel)
+float3 CubeScale(float3 base, float3 inject)
 {
-	pixel = clamp(pixel, int2(0, 0), int2(DepthWidth - 1, DepthHeight - 1));
+	float alpha = 1.0;
+	[unroll]
+	for (int c = 0; c < 3; ++c) {
+		if (inject[c] > 1e-6)
+			alpha = min(alpha, (1.0 - base[c]) / inject[c]);
+		else if (inject[c] < -1e-6)
+			alpha = min(alpha, (0.0 - base[c]) / inject[c]);
+	}
+	return base + saturate(alpha) * inject;
+}
+
+float Dither(int2 pixel)
+{
+	float3 p3 = frac(float3(pixel.xyx) * float3(0.1031, 0.1030, 0.0973));
+	p3 += dot(p3, p3.yzx + 33.33);
+	float2 r = frac((p3.xx + p3.yz) * p3.zy);
+	return (r.x + r.y - 1.0) / 255.0;
+}
+
+float3 SplitLumaChroma(float3 value, float lumaGain, float chromaGain)
+{
+	float luma = dot(value, LumaWeights);
+	return lumaGain * luma + chromaGain * (value - luma);
+}
+
+float LoadRawDepth(int2 pixel)
+{
+	if (DepthWidth == 0 || DepthHeight == 0)
+		return 1.0;
+	pixel = clamp(pixel, int2(0, 0), int2(DepthWidth, DepthHeight) - 1);
 	return DepthGuide.Load(int3(pixel, 0));
 }
 
-float DepthBlockConfidence(int2 pixel)
+float LinearizeDepth(float raw)
 {
-	if (EnhancedGuidance == 0 || DepthGuidance <= 0.0)
-		return 1.0;
-	float2 depthPosition = (float2(pixel) + 0.5) *
+	if (raw < MaskRaw)
+		return CameraNear;
+	if (raw >= SkyRaw || CameraRange <= 0.0 || CameraProduct <= 0.0)
+		return SkyLinear;
+	return CameraProduct / max(-raw * CameraRange + CameraFar, 1e-5);
+}
+
+int2 OwnerRFromDisplay(int2 destPixel)
+{
+	float2 position = (float2(destPixel) + 0.5) *
 		float2(DepthWidth, DepthHeight) / float2(FullWidth, FullHeight) - 0.5;
-	int2 depthPixel = int2(round(depthPosition));
-	int2 radius = max(int2(1, 1), int2(round(2.0 * float2(DepthWidth, DepthHeight) / float2(FullWidth, FullHeight))));
-	float center = LoadDepth(depthPixel);
-	float minimumDepth = center;
-	float maximumDepth = center;
-	float samples[4] = {
-		LoadDepth(depthPixel + int2(-radius.x, 0)), LoadDepth(depthPixel + int2(radius.x, 0)),
-		LoadDepth(depthPixel + int2(0, -radius.y)), LoadDepth(depthPixel + int2(0, radius.y))
-	};
-	[unroll]
-	for (uint index = 0; index < 4; ++index) {
-		minimumDepth = min(minimumDepth, samples[index]);
-		maximumDepth = max(maximumDepth, samples[index]);
-	}
-	float blockRange = maximumDepth - minimumDepth;
-	float discontinuity = smoothstep(0.002, 0.025, blockRange);
-	float confidence = lerp(1.0, 0.45, discontinuity);
-	return lerp(1.0, confidence, saturate(DepthGuidance));
+	return clamp(int2(round(position)), int2(0, 0), int2(DepthWidth, DepthHeight) - 1);
 }
 
-float EnhancedStructureConfidence(int2 pixel, float3 original, float3 neural,
-	float originalLuma, float baseLuma, float gradient)
+int2 GuidanceFromDisplay(int2 destPixel)
 {
-	if (EnhancedGuidance == 0)
-		return 1.0;
-
-	float lumaMin = originalLuma;
-	float lumaMax = originalLuma;
-	float3 blockColors[4] = {
-		LoadOriginal(pixel + int2(-2, 0)).rgb, LoadOriginal(pixel + int2(2, 0)).rgb,
-		LoadOriginal(pixel + int2(0, -2)).rgb, LoadOriginal(pixel + int2(0, 2)).rgb
-	};
-	[unroll]
-	for (uint index = 0; index < 4; ++index) {
-		float sampleLuma = dot(blockColors[index], LumaWeights);
-		lumaMin = min(lumaMin, sampleLuma);
-		lumaMax = max(lumaMax, sampleLuma);
-	}
-	float blockFrequency = abs(originalLuma - baseLuma) * 4.0 + (lumaMax - lumaMin) + gradient * 0.5;
-	float frequencyConfidence = lerp(1.0, lerp(1.0, 0.45, smoothstep(0.08, 0.45, blockFrequency)),
-		saturate(FrequencyGuidance));
-
-	float originalScale = max(originalLuma, 0.08);
-	float lumaDisagreement = abs(dot(neural, LumaWeights) - originalLuma) / originalScale;
-	float3 originalChroma = original - originalLuma;
-	float neuralLuma = dot(neural, LumaWeights);
-	float3 neuralChroma = neural - neuralLuma;
-	float chromaDisagreement = length(neuralChroma - originalChroma) / originalScale;
-	float colorDisagreement = lumaDisagreement * 0.65 + chromaDisagreement * 0.35;
-	float colorConfidence = lerp(1.0, lerp(1.0, 0.35, smoothstep(0.08, 0.55, colorDisagreement)),
-		saturate(ColorGuidance));
-	return max(0.35, frequencyConfidence * colorConfidence * DepthBlockConfidence(pixel));
+	float2 position = (float2(destPixel) + 0.5) *
+		float2(GuidanceWidth, GuidanceHeight) / float2(FullWidth, FullHeight) - 0.5;
+	return clamp(int2(round(position)), int2(0, 0), int2(GuidanceWidth, GuidanceHeight) - 1);
 }
 
-float4 SampleNeuralEasu(float2 pixel)
+bool RdPairCliff(int2 a, int2 b)
 {
-	int2 base = int2(floor(pixel));
-	float2 fraction = frac(pixel);
-	float3 samples[12] = {
-		LoadNeural(base + int2(0, -1)).rgb,
-		LoadNeural(base + int2(1, -1)).rgb,
-		LoadNeural(base + int2(-1, 0)).rgb,
-		LoadNeural(base + int2(0, 0)).rgb,
-		LoadNeural(base + int2(1, 0)).rgb,
-		LoadNeural(base + int2(2, 0)).rgb,
-		LoadNeural(base + int2(-1, 1)).rgb,
-		LoadNeural(base + int2(0, 1)).rgb,
-		LoadNeural(base + int2(1, 1)).rgb,
-		LoadNeural(base + int2(2, 1)).rgb,
-		LoadNeural(base + int2(0, 2)).rgb,
-		LoadNeural(base + int2(1, 2)).rgb,
-	};
-	float luma[12];
-	[unroll]
-	for (uint index = 0; index < 12; ++index)
-		luma[index] = dot(samples[index], LumaWeights);
-
-	float2 direction = float2(
-		(luma[4] + luma[8]) - (luma[3] + luma[7]),
-		(luma[7] + luma[8]) - (luma[3] + luma[4]));
-	float directionLength = length(direction);
-	direction = directionLength > 1e-5 ? direction / directionLength : float2(1.0, 0.0);
-	float anisotropy = saturate(directionLength * 4.0);
-	float2 orthogonal = float2(-direction.y, direction.x);
-	float3 accumulated = 0.0;
-	float weightSum = 0.0;
-	static const int2 offsets[12] = {
-		int2(0, -1), int2(1, -1), int2(-1, 0), int2(0, 0), int2(1, 0), int2(2, 0),
-		int2(-1, 1), int2(0, 1), int2(1, 1), int2(2, 1), int2(0, 2), int2(1, 2)
-	};
-	[unroll]
-	for (uint tap = 0; tap < 12; ++tap) {
-		float2 delta = float2(offsets[tap]) - fraction;
-		float along = dot(delta, direction);
-		float across = dot(delta, orthogonal);
-		float distanceSquared = along * along * lerp(1.0, 0.55, anisotropy) +
-			across * across * lerp(1.0, 1.8, anisotropy);
-		float weight = saturate(1.0 - distanceSquared * 0.25);
-		weight = weight * weight * (3.0 - 2.0 * weight);
-		accumulated += samples[tap] * weight;
-		weightSum += weight;
-	}
-	float3 result = accumulated / max(weightSum, 1e-5);
-	float3 localMin = min(min(samples[3], samples[4]), min(samples[7], samples[8]));
-	float3 localMax = max(max(samples[3], samples[4]), max(samples[7], samples[8]));
-	return float4(clamp(result, localMin, localMax), 1.0);
+	float rawA = LoadRawDepth(a);
+	float rawB = LoadRawDepth(b);
+	if (rawA < MaskRaw || rawB < MaskRaw)
+		return false;
+	bool skyA = rawA >= SkyRaw;
+	bool skyB = rawB >= SkyRaw;
+	if (skyA != skyB)
+		return true;
+	if (skyA || skyB)
+		return false;
+	float linearA = LinearizeDepth(rawA);
+	float linearB = LinearizeDepth(rawB);
+	return abs(linearA - linearB) / max(min(linearA, linearB), 1.0) >
+		lerp(0.18, 0.028, saturate(DepthGuidance));
 }
 
-float3 FilterNeural(int2 pixel)
+bool RdCliffAtR(int2 engine)
 {
-	float3 center = LoadNeural(pixel).rgb;
-	if (DenoiseMode == 0 || DenoiseStrength <= 0.0)
-		return center;
+	return RdPairCliff(engine, engine + int2(1, 0)) ||
+		RdPairCliff(engine, engine + int2(-1, 0)) ||
+		RdPairCliff(engine, engine + int2(0, 1)) ||
+		RdPairCliff(engine, engine + int2(0, -1));
+}
 
-	float centerLuma = dot(center, LumaWeights);
-	float3 filtered = 0.0;
-	float weightSum = 0.0;
+float2 GuidanceGradient(int2 destPixel)
+{
+	int2 g = GuidanceFromDisplay(destPixel);
+	float gx = dot(LoadGuidance(g + int2(1, 0)), LumaWeights) - dot(LoadGuidance(g + int2(-1, 0)), LumaWeights);
+	float gy = dot(LoadGuidance(g + int2(0, 1)), LumaWeights) - dot(LoadGuidance(g + int2(0, -1)), LumaWeights);
+	return float2(gx, gy);
+}
+
+float LumaVar3(int2 destPixel, bool guidance)
+{
+	float sum = 0.0;
+	float sumSq = 0.0;
 	[unroll]
 	for (int y = -1; y <= 1; ++y) {
 		[unroll]
 		for (int x = -1; x <= 1; ++x) {
-			float3 sampleColor = LoadNeural(pixel + int2(x, y)).rgb;
-			float spatialWeight = (x == 0 && y == 0) ? 1.0 : ((x == 0 || y == 0) ? 0.72 : 0.48);
-			float lumaDelta = abs(dot(sampleColor, LumaWeights) - centerLuma);
-			float rangeScale = DenoiseMode == 4 ? 18.0 : (DenoiseMode == 1 ? 42.0 : 28.0);
-			float rangeWeight = DenoiseMode == 2 ? 1.0 : exp2(-lumaDelta * rangeScale);
-			float weight = spatialWeight * rangeWeight;
-			filtered += sampleColor * weight;
-			weightSum += weight;
+			int2 dest = destPixel + int2(x, y);
+			float luma = guidance ?
+				dot(LoadGuidance(GuidanceFromDisplay(dest)), LumaWeights) :
+				dot(GuideLow.Load(int3(clamp(dest, int2(0, 0), int2(FullWidth, FullHeight) - 1), 0)).rgb, LumaWeights);
+			sum += luma;
+			sumSq += luma * luma;
 		}
 	}
-	filtered /= max(weightSum, 1e-5);
-	if (DenoiseMode == 3) {
-		float filteredLuma = dot(filtered, LumaWeights);
-		filtered += (centerLuma - filteredLuma) * LumaWeights / dot(LumaWeights, LumaWeights);
-	}
-	return lerp(center, filtered, saturate(DenoiseStrength * (DenoiseMode == 4 ? 1.25 : 1.0)));
-}
-
-float3 AnalyzeReference(int2 pixel, float3 center,
-	out float leftLuma, out float rightLuma, out float upLuma, out float downLuma)
-{
-	float3 left = LoadOriginal(pixel + int2(-1, 0)).rgb;
-	float3 right = LoadOriginal(pixel + int2(1, 0)).rgb;
-	float3 up = LoadOriginal(pixel + int2(0, -1)).rgb;
-	float3 down = LoadOriginal(pixel + int2(0, 1)).rgb;
-	leftLuma = dot(left, LumaWeights);
-	rightLuma = dot(right, LumaWeights);
-	upLuma = dot(up, LumaWeights);
-	downLuma = dot(down, LumaWeights);
-	float3 diagonal = LoadOriginal(pixel + int2(-1, -1)).rgb + LoadOriginal(pixel + int2(1, -1)).rgb +
-		LoadOriginal(pixel + int2(-1, 1)).rgb + LoadOriginal(pixel + int2(1, 1)).rgb;
-	return center * 0.25 + (left + right + up + down) * 0.125 + diagonal * 0.0625;
+	return max(sumSq / 9.0 - (sum / 9.0) * (sum / 9.0), 0.0);
 }
 
 [numthreads(8, 8, 1)]
 void main(uint3 dispatchThreadID : SV_DispatchThreadID)
 {
-	if (dispatchThreadID.x >= FullWidth || dispatchThreadID.y >= FullHeight)
+	int2 local = int2(dispatchThreadID.xy);
+	int2 cropOrigin = int2(int(EdgeBlockMode & 0xffff), int(EdgeBlockMode >> 16));
+	const bool cropResolve = EdgeBlockMode != 0;
+	if (cropResolve) {
+		if (local.x >= NeuralWidth || local.y >= NeuralHeight)
+			return;
+	} else if (local.x >= FullWidth || local.y >= FullHeight)
 		return;
 
-	int2 pixel = int2(dispatchThreadID.xy);
-	float4 original = LoadOriginal(pixel);
-	float3 neural = FilterNeural(pixel);
-	float leftLuma;
-	float rightLuma;
-	float upLuma;
-	float downLuma;
-	float3 originalBase = AnalyzeReference(pixel, original.rgb, leftLuma, rightLuma, upLuma, downLuma);
-	float originalLuma = dot(original.rgb, LumaWeights);
-	float baseLuma = dot(originalBase, LumaWeights);
-	float neuralLuma = dot(neural, LumaWeights);
+	int2 neuralPixel = local;
+	int2 displayPixel = cropResolve ? local + cropOrigin : local;
+	int2 neuralMax = cropResolve ?
+		int2(NeuralWidth, NeuralHeight) - 1 : int2(FullWidth, FullHeight) - 1;
 
-	float gradient = abs(rightLuma - leftLuma) + abs(downLuma - upLuma);
-	float edge = saturate(gradient * 4.0);
-	float structureConfidence = EnhancedStructureConfidence(
-		pixel, original.rgb, neural, originalLuma, baseLuma, gradient);
-	float guard = saturate(1.0 - EdgeProtection * edge) * structureConfidence;
+	float4 rcSample = NeuralColor.Load(int3(neuralPixel, 0));
+	float3 rc = rcSample.rgb;
+	float3 lo = GuideLow.Load(int3(neuralPixel, 0)).rgb;
+	float2 neuralPosition = NeuralPosition(neuralPixel);
+	float4 gainSample = GainAtDisplay(neuralPosition);
+	float3 gain = gainSample.rgb;
 
-	float lumaResidual = clamp(neuralLuma - baseLuma, -ResidualLimit, ResidualLimit);
-	float redResidual = clamp((neural.r - neuralLuma) - (originalBase.r - baseLuma), -ResidualLimit, ResidualLimit);
-	float blueResidual = clamp((neural.b - neuralLuma) - (originalBase.b - baseLuma), -ResidualLimit, ResidualLimit);
-	float3 result;
-	if (Direction == 0) {
-		float fusedLuma = originalLuma + guard * LumaStrength * lumaResidual;
-		float fusedRed = fusedLuma + (original.r - originalLuma) + guard * ChromaStrength * redResidual;
-		float fusedBlue = fusedLuma + (original.b - originalLuma) + guard * ChromaStrength * blueResidual;
-		float fusedGreen = (fusedLuma - LumaWeights.r * fusedRed - LumaWeights.b * fusedBlue) / LumaWeights.g;
-		result = float3(fusedRed, fusedGreen, fusedBlue);
-	} else {
-		float3 detail = clamp(original.rgb - originalBase, -ResidualLimit, ResidualLimit);
-		float detailLuma = dot(detail, LumaWeights);
-		float3 detailChroma = detail - detailLuma;
-		float detailConfidence = guard * saturate(1.0 - Softness * 0.7);
-		float3 neuralWithDetail = neural + detailConfidence * (LumaStrength * detailLuma + ChromaStrength * detailChroma);
-		result = lerp(original.rgb, neuralWithDetail, structureConfidence);
+	bool rightHalf = displayPixel.x * 2 >= (int)FullWidth;
+	if (CompareMode == 1 || (CompareMode == 2 && rightHalf) || (CompareMode == 3 && !rightHalf))
+		gain = 1.0;
+
+	float3 detail = GuidanceAtDisplay(displayPixel) - lo;
+	float3 edit = rc - lo;
+	float3 editLow5 = EditLowAtDisplay(neuralPosition);
+	float3 editLow13 = 0.0;
+	int2 nBase = int2(floor(neuralPosition));
+	[unroll]
+	for (int y = -1; y <= 1; ++y) {
+		[unroll]
+		for (int x = -1; x <= 1; ++x)
+			editLow13 += LoadEditLow(nBase + int2(x, y));
 	}
-	float3 softTarget = lerp(originalBase, neural, Direction == 0 ? 0.65 : 0.85);
-	result = lerp(result, softTarget, saturate(Softness) * 0.45 * structureConfidence);
-	OutputColor[dispatchThreadID.xy] = float4(saturate(result), original.a);
+	editLow13 /= 9.0;
+	float3 editMid = editLow5 - editLow13;
+	float3 editHigh = edit - editLow5;
+
+	if (EdgeBlockDilateD > 1e-4) {
+		float2 g = GuidanceGradient(displayPixel);
+		int2 step = int2(round(g / max(length(g), 1e-5)));
+		if (all(step == 0))
+			step = int2(1, 0);
+		float3 ehPlus = NeuralColor.Load(int3(clamp(neuralPixel + step, int2(0, 0), neuralMax), 0)).rgb -
+			GuideLow.Load(int3(clamp(neuralPixel + step, int2(0, 0), neuralMax), 0)).rgb -
+			EditLowAtDisplay(NeuralPosition(neuralPixel + step));
+		float3 ehMinus = NeuralColor.Load(int3(clamp(neuralPixel - step, int2(0, 0), neuralMax), 0)).rgb -
+			GuideLow.Load(int3(clamp(neuralPixel - step, int2(0, 0), neuralMax), 0)).rgb -
+			EditLowAtDisplay(NeuralPosition(neuralPixel - step));
+		editHigh += EdgeBlockDilateD * (editHigh - 0.5 * (ehPlus + ehMinus));
+	}
+
+	float3 inject = gain * SplitLumaChroma(detail, DetailLuma, DetailChroma) +
+		SplitLumaChroma(editLow13, ToneGainLuma - 1.0, ToneGainChroma - 1.0) +
+		SplitLumaChroma(editMid, 0.5 * (ToneGainLuma - 1.0), 0.5 * (ToneGainChroma - 1.0)) +
+		(DetailGain - 1.0) * editHigh;
+
+	float3 result = CubeScale(rc, inject);
+	float bandGainDelta = max(max(abs(ToneGainLuma - 1.0), abs(ToneGainChroma - 1.0)), abs(DetailGain - 1.0));
+	float dither = DitherStrength * saturate(bandGainDelta * 2.0);
+	if (dither > 0.0)
+		result = saturate(result + Dither(displayPixel) * dither);
+
+	if (DebugView == 1)
+		result = gain * 0.5;
+	else if (DebugView == 2)
+		result = saturate(0.5 + detail * 4.0);
+	else if (DebugView == 3)
+		result = saturate(0.5 + edit * 4.0);
+	else if (DebugView == 4)
+		result = saturate(0.5 + editLow5 * 4.0);
+	else if (DebugView == 5)
+		result = saturate(0.5 + editHigh * 8.0);
+	else if (DebugView == 6)
+		result = lerp(dot(rc, LumaWeights).xxx * 0.5, float3(1.0, 0.2, 0.1),
+			RdCliffAtR(OwnerRFromDisplay(displayPixel)) ? 1.0 : 0.0);
+	else if (DebugView == 7) {
+		float eps = max(Regularization * Regularization * 0.05, 1e-6);
+		float varG = LumaVar3(displayPixel, true);
+		float varLo = LumaVar3(displayPixel, false);
+		float energyW = saturate(max(varG - varLo, 0.0) / (max(varG - varLo, 0.0) + varLo + eps));
+		result = lerp(dot(rc, LumaWeights).xxx * 0.45, float3(1.0, 0.55, 0.15), energyW);
+	} else if (DebugView == 9)
+		result = lerp(dot(rc, LumaWeights).xxx * 0.45, float3(1.0, 0.85, 0.2), gainSample.a);
+
+	OutputColor[dispatchThreadID.xy] = float4(result, rcSample.a);
 }

@@ -12,10 +12,12 @@
 #include "NeuralRendering/Integration.h"
 #include "NeuralRendering/ArisePipeline.h"
 #include "NeuralRendering/Renderer.h"
+#include "VrSubmitDlssg.h"
 #include "Profiler.h"
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 
 #define I18N_KEY_PREFIX "feature.upscaling."
 
@@ -45,6 +47,7 @@
 	X(flatPipelineAct1Jitter)                     \
 	X(flatPipelineAct1Dsr)                        \
 	X(flatPipelineNrScale)                        \
+	X(flatPipelineNrNative)                       \
 	X(flatPipelineAct2Backend)                    \
 	X(unifiedPipeline)                            \
 	X(flatPipelineAct2Preset)                     \
@@ -86,7 +89,53 @@
 	X(neuralRenderingFusionLuma)                  \
 	X(neuralRenderingFusionChroma)                \
 	X(neuralRenderingFusionEdgeProtection)        \
-	X(neuralRenderingFusionResidualLimit)
+	X(neuralRenderingFusionResidualLimit)         \
+	X(fusionDepthDilate)                          \
+	X(fusionGEdge)                                \
+	X(fusionNEdge)                                \
+	X(fusionEdgePower)                            \
+	X(fusionHfLumaSuppress)                       \
+	X(fusionHfTowardN)                            \
+	X(fusionNcDilate)                             \
+	X(fusionAlignG)                               \
+	X(fusionCompareMode)                          \
+	X(fusionDebugView)                            \
+	X(fusionToneGainLuma)                         \
+	X(fusionToneGainChroma)                       \
+	X(fusionDetailGain)                           \
+	X(fusionDither)                               \
+	X(fusionGainPrior)                            \
+	X(fusionWedge)                                \
+	X(fusionWedgeConstCount)                      \
+	X(fusionEdgeBlockGThresh)                     \
+	X(fusionFitSideSigma)                         \
+	X(fusionDirectionalSharpen)                   \
+	X(fusionSoftEdge)                             \
+	X(act3Enabled)                                \
+	X(act3Scale)                                  \
+	X(act3Preset)                                 \
+	X(act3Intensity)                              \
+	X(act3LocalTone)                              \
+	X(act3LocalStructure)                         \
+	X(act3SkinStructure)                          \
+	X(act3Style)                                  \
+	X(act3AutoMask)                               \
+	X(act3UICorrection)                           \
+	X(act3ResetEveryFrame)                        \
+	X(act3Sharpen)                                \
+	X(act3Sharpness)                              \
+	X(act3FeatherWidth)                           \
+	X(act3DitherStrength)                         \
+	X(act3GuidanceEnabled)                        \
+	X(act3GuidanceLuma)                           \
+	X(act3GuidanceChroma)                         \
+	X(act3GuidancePrior)                          \
+	X(act3GuidanceMaxGain)                        \
+	X(act3GuidanceToneLuma)                       \
+	X(act3GuidanceToneChroma)                     \
+	X(act3GuidanceDetailGain)                     \
+	X(act3GuidanceDither)                         \
+	X(act3GuidanceDirSharpen)
 
 void to_json(nlohmann::json& j, const FoveatedRender::Settings& s)
 {
@@ -146,6 +195,7 @@ void FoveatedRender::PostPostLoad()
 	// happened to click as buttons.
 	subrectController.MaterializeNewDefaults();
 	NeuralRendering::ARISE::Pipeline::Instance().Install();
+	VrSubmitDlssg::Install();
 	NeuralRendering::ARISE::Pipeline::Instance().SetSlotCount(settings.ariseBufferCount);
 	NeuralRendering::ARISE::Pipeline::Instance().SetVisualValidation(settings.ariseVisualValidation);
 	NeuralRendering::ARISE::Pipeline::Instance().SetWorkerNrEnabled(settings.ariseWorkerNr);
@@ -619,7 +669,7 @@ void FoveatedRender::LoadSettings(const json& o_json)
 	} else {
 		settings.unifiedPipeline.act1Srss = settings.flatPipelineAct1Dsr;
 		settings.unifiedPipeline.guidanceScale = settings.flatPipelineAct1Dsr ? 2.0f : 1.0f;
-		switch (static_cast<FlatAct2Backend>(std::min(settings.flatPipelineAct2Backend, 4u))) {
+		switch (static_cast<FlatAct2Backend>(std::min(settings.flatPipelineAct2Backend, static_cast<uint>(FlatAct2Backend::kEasu)))) {
 		case FlatAct2Backend::kDLSS:
 			settings.unifiedPipeline.act2SrBackend = static_cast<uint>(FlatAct2SrBackend::kDLSS);
 			break;
@@ -632,6 +682,12 @@ void FoveatedRender::LoadSettings(const json& o_json)
 		case FlatAct2Backend::kFusion:
 			settings.unifiedPipeline.act2SrBackend = static_cast<uint>(FlatAct2SrBackend::kLanczos);
 			settings.unifiedPipeline.fusionEnabled = true;
+			break;
+		case FlatAct2Backend::kMitchell:
+			settings.unifiedPipeline.act2SrBackend = static_cast<uint>(FlatAct2SrBackend::kMitchell);
+			break;
+		case FlatAct2Backend::kEasu:
+			settings.unifiedPipeline.act2SrBackend = static_cast<uint>(FlatAct2SrBackend::kEasu);
 			break;
 		case FlatAct2Backend::kLanczos:
 			settings.unifiedPipeline.act2SrBackend = static_cast<uint>(FlatAct2SrBackend::kLanczos);
@@ -708,24 +764,16 @@ void FoveatedRender::ClampSettings()
 	else if (unified.act1SrssPreset != 3 && unified.act1SrssPreset != 4)
 		unified.act1SrssPreset = 4;
 	unified.guidanceScale = std::clamp(unified.guidanceScale, 1.0f, 2.0f);
-	unified.act1Downsample = static_cast<uint>(ResampleFilter::kLanczos);
-	unified.act2SrBackend = std::min(unified.act2SrBackend, static_cast<uint>(FlatAct2SrBackend::kLanczos));
-	unified.act2Upsample = static_cast<uint>(ResampleFilter::kLanczos);
-	if (WantsLogicalPerfMode()) {
+	unified.act1Downsample = std::min(unified.act1Downsample, static_cast<uint>(ResampleFilter::kTent));
+	unified.act1DepthDownsample = std::min(unified.act1DepthDownsample, static_cast<uint>(DepthResampleFilter::kLanczos));
+	unified.act2SrBackend = std::min(unified.act2SrBackend, static_cast<uint>(FlatAct2SrBackend::kTent));
+	unified.act2Upsample = std::min(unified.act2Upsample, static_cast<uint>(ResampleFilter::kTent));
+	unified.fusionReconstruct = std::min(unified.fusionReconstruct, static_cast<uint>(FusionReconstruct::kLanczos));
+	if (WantsLogicalPerfMode())
 		settings.flatPipelineAct1Backend = static_cast<uint>(FlatAct1Backend::kDLSS);
-		if (unified.act2SrBackend == static_cast<uint>(FlatAct2SrBackend::kFSR3) ||
-			unified.act2SrBackend == static_cast<uint>(FlatAct2SrBackend::kNIS))
-			unified.act2SrBackend = static_cast<uint>(FlatAct2SrBackend::kDLSS);
-	}
 	settings.flatPipelineAct1Dsr = false;
-	if (unified.fusionEnabled)
-		settings.flatPipelineAct2Backend = static_cast<uint>(FlatAct2Backend::kFusion);
-	else if (unified.act2SrBackend == static_cast<uint>(FlatAct2SrBackend::kLanczos))
-		settings.flatPipelineAct2Backend = static_cast<uint>(FlatAct2Backend::kLanczos);
-	else
-		settings.flatPipelineAct2Backend = unified.act2SrBackend;
 	settings.flatPipelineNrScale = std::clamp(settings.flatPipelineNrScale, 0.33f, 0.95f);
-	settings.flatPipelineAct2Backend = std::min(settings.flatPipelineAct2Backend, 4u);
+	settings.flatPipelineAct2Backend = std::min(settings.flatPipelineAct2Backend, static_cast<uint>(FlatAct2Backend::kEasu));
 	settings.flatPipelineAct2Preset = std::min(settings.flatPipelineAct2Preset, 4u);
 	settings.flatPipelineAct2Jitter = std::min(settings.flatPipelineAct2Jitter, 1u);
 	settings.flatPipelineFusionDirection = std::min(settings.flatPipelineFusionDirection, 1u);
@@ -752,17 +800,75 @@ void FoveatedRender::ClampSettings()
 	settings.neuralRenderingWorkingScale = std::min(settings.neuralRenderingWorkingScale, 2u);
 	settings.neuralRenderingOutputMode = std::min(settings.neuralRenderingOutputMode, 3u);
 	settings.neuralRenderingNisSharpness = std::clamp(settings.neuralRenderingNisSharpness, 0.0f, 1.0f);
-	settings.neuralRenderingFusionPreset = std::min(settings.neuralRenderingFusionPreset, 5u);
+	settings.neuralRenderingFusionPreset = std::min(settings.neuralRenderingFusionPreset, 3u);
 	settings.neuralRenderingFusionLuma = std::clamp(settings.neuralRenderingFusionLuma, 0.0f, 1.5f);
 	settings.neuralRenderingFusionChroma = std::clamp(settings.neuralRenderingFusionChroma, 0.0f, 1.5f);
 	settings.neuralRenderingFusionEdgeProtection = std::clamp(settings.neuralRenderingFusionEdgeProtection, 0.0f, 1.0f);
 	settings.neuralRenderingFusionResidualLimit = std::clamp(settings.neuralRenderingFusionResidualLimit, 0.01f, 0.5f);
+	settings.fusionDepthDilate = std::clamp(settings.fusionDepthDilate, 0.0f, 2.0f);
+	settings.fusionGEdge = std::clamp(settings.fusionGEdge, 0.0f, 1.0f);
+	settings.fusionNEdge = std::clamp(settings.fusionNEdge, 0.0f, 1.0f);
+	settings.fusionEdgePower = std::clamp(settings.fusionEdgePower, 0.0f, 1.0f);
+	settings.fusionHfLumaSuppress = std::clamp(settings.fusionHfLumaSuppress, 0.0f, 1.0f);
+	settings.fusionHfTowardN = std::clamp(settings.fusionHfTowardN, 0.0f, 1.0f);
+	settings.fusionNcDilate = std::clamp(settings.fusionNcDilate, 0.0f, 2.0f);
+	settings.fusionAlignG = std::clamp(settings.fusionAlignG, 0.0f, 2.0f);
+	settings.fusionCompareMode = std::min(settings.fusionCompareMode, 3u);
+	settings.fusionToneGainLuma = std::clamp(settings.fusionToneGainLuma, 0.0f, 3.0f);
+	settings.fusionToneGainChroma = std::clamp(settings.fusionToneGainChroma, 0.0f, 3.0f);
+	settings.fusionDetailGain = std::clamp(settings.fusionDetailGain, 0.0f, 3.0f);
+	settings.fusionDither = std::clamp(settings.fusionDither, 0.0f, 2.0f);
+	settings.fusionGainPrior = std::clamp(settings.fusionGainPrior, 0.0f, 1.5f);
+	settings.fusionEdgeBlockGThresh = std::clamp(settings.fusionEdgeBlockGThresh, 0.0f, 1.0f);
+	settings.fusionFitSideSigma = std::clamp(settings.fusionFitSideSigma, 0.02f, 0.5f);
+	settings.fusionDirectionalSharpen = std::clamp(settings.fusionDirectionalSharpen, 0.0f, 2.0f);
+	settings.fusionSoftEdge = std::clamp(settings.fusionSoftEdge, 0.0f, 1.0f);
+	settings.fusionDebugView = std::min(settings.fusionDebugView, 9u);
+	settings.act3Scale = std::clamp(settings.act3Scale, 0.0f, 0.9f);
+	settings.act3Preset = std::min(settings.act3Preset, 4u);
+	settings.act3Intensity = std::clamp(settings.act3Intensity, 0.0f, 2.0f);
+	settings.act3LocalTone = std::clamp(settings.act3LocalTone, 0.0f, 2.0f);
+	settings.act3LocalStructure = std::clamp(settings.act3LocalStructure, 0.0f, 2.0f);
+	settings.act3SkinStructure = std::clamp(settings.act3SkinStructure, 0.0f, 2.0f);
+	settings.act3Style = std::min(settings.act3Style, 3u);
+	settings.act3Sharpness = std::clamp(settings.act3Sharpness, 0.0f, 1.0f);
+	settings.act3FeatherWidth = std::clamp(settings.act3FeatherWidth, 2.0f, 128.0f);
+	settings.act3DitherStrength = std::clamp(settings.act3DitherStrength, 0.0f, 2.0f);
+	settings.act3GuidanceLuma = std::clamp(settings.act3GuidanceLuma, 0.0f, 1.5f);
+	settings.act3GuidanceChroma = std::clamp(settings.act3GuidanceChroma, 0.0f, 1.5f);
+	settings.act3GuidancePrior = std::clamp(settings.act3GuidancePrior, 0.0f, 1.5f);
+	settings.act3GuidanceMaxGain = std::clamp(settings.act3GuidanceMaxGain, 0.0f, 1.0f);
+	settings.act3GuidanceToneLuma = std::clamp(settings.act3GuidanceToneLuma, 0.0f, 3.0f);
+	settings.act3GuidanceToneChroma = std::clamp(settings.act3GuidanceToneChroma, 0.0f, 3.0f);
+	settings.act3GuidanceDetailGain = std::clamp(settings.act3GuidanceDetailGain, 0.0f, 3.0f);
+	settings.act3GuidanceDither = std::clamp(settings.act3GuidanceDither, 0.0f, 2.0f);
+	settings.act3GuidanceDirSharpen = std::clamp(settings.act3GuidanceDirSharpen, 0.0f, 2.0f);
 	// Preset clamping reads from Upscaling::Settings now.
 	auto& sharedPreset = globals::features::upscaling.settings.presetDLSS;
 	sharedPreset = std::min(sharedPreset, 5u);
 	if (!IsPresetCompatibleWithMode(sharedPreset)) {
 		sharedPreset = 3;  // Fall back to L
 	}
+}
+
+FoveatedRender::Act3Crop FoveatedRender::MakeAct3Crop(uint32_t displayWidth, uint32_t displayHeight, float scale)
+{
+	Act3Crop crop{};
+	scale = std::clamp(scale, 0.0f, 0.9f);
+	if (scale < 0.01f || displayWidth < 8 || displayHeight < 8)
+		return crop;
+	auto evenSize = [](uint32_t value, uint32_t limit) {
+		uint32_t size = value & ~1u;
+		size = std::min(size, limit & ~1u);
+		return std::max(8u, size);
+	};
+	crop.width = evenSize(static_cast<uint32_t>(std::lround(displayWidth * scale)), displayWidth);
+	crop.height = evenSize(static_cast<uint32_t>(std::lround(displayHeight * scale)), displayHeight);
+	if (crop.width > displayWidth || crop.height > displayHeight)
+		return {};
+	crop.x = (displayWidth - crop.width) / 2;
+	crop.y = (displayHeight - crop.height) / 2;
+	return crop;
 }
 
 FoveatedRender::FlatPipelinePlan FoveatedRender::BuildFlatPipelinePlan(
@@ -778,19 +884,25 @@ FoveatedRender::FlatPipelinePlan FoveatedRender::BuildFlatPipelinePlan(
 	const uint act1QualitySetting = model3AtBoot ? bootSnapshot.Boot(&Settings::flatPipelineAct1Quality) : settings.flatPipelineAct1Quality;
 	plan.act1Backend = model3AtBoot ? FlatAct1Backend::kDLSS : static_cast<FlatAct1Backend>(std::min(act1Backend, 2u));
 	plan.act2SrBackend = static_cast<FlatAct2SrBackend>(std::min(
-		unified.act2SrBackend, static_cast<uint>(FlatAct2SrBackend::kLanczos)));
+		unified.act2SrBackend, static_cast<uint>(FlatAct2SrBackend::kTent)));
 	plan.fusion = unified.fusionEnabled;
-	if (plan.fusion) {
-		plan.act2Backend = FlatAct2Backend::kFusion;
-	} else {
-		switch (plan.act2SrBackend) {
-		case FlatAct2SrBackend::kDLSS: plan.act2Backend = FlatAct2Backend::kDLSS; break;
-		case FlatAct2SrBackend::kFSR3: plan.act2Backend = FlatAct2Backend::kFSR3; break;
-		case FlatAct2SrBackend::kNIS: plan.act2Backend = FlatAct2Backend::kNIS; break;
-		case FlatAct2SrBackend::kLanczos: plan.act2Backend = FlatAct2Backend::kLanczos; break;
-		}
-	}
+	plan.act3Guidance = settings.act3Enabled && settings.act3GuidanceEnabled;
+	if (plan.act2SrBackend == FlatAct2SrBackend::kDLSS)
+		plan.act2Backend = FlatAct2Backend::kDLSS;
+	else if (plan.act2SrBackend == FlatAct2SrBackend::kFSR3)
+		plan.act2Backend = FlatAct2Backend::kFSR3;
+	else if (plan.act2SrBackend == FlatAct2SrBackend::kNIS)
+		plan.act2Backend = FlatAct2Backend::kNIS;
+	else if (plan.act2SrBackend == FlatAct2SrBackend::kMitchell)
+		plan.act2Backend = FlatAct2Backend::kMitchell;
+	else if (plan.act2SrBackend == FlatAct2SrBackend::kEasu)
+		plan.act2Backend = FlatAct2Backend::kEasu;
+	else
+		plan.act2Backend = FlatAct2Backend::kLanczos;
+	plan.fusionReconstruct = static_cast<FusionReconstruct>(std::min(
+		unified.fusionReconstruct, static_cast<uint>(FusionReconstruct::kLanczos)));
 	plan.act1Downsample = static_cast<ResampleFilter>(unified.act1Downsample);
+	plan.act1DepthDownsample = static_cast<DepthResampleFilter>(unified.act1DepthDownsample);
 	plan.act2Upsample = static_cast<ResampleFilter>(unified.act2Upsample);
 	plan.act1Dsr = !model3AtBoot && settings.flatPipelineAct1Dsr && plan.act1Backend != FlatAct1Backend::kBypass;
 	plan.srss = unified.act1Srss && plan.act1Backend == FlatAct1Backend::kDLSS;
@@ -830,16 +942,18 @@ FoveatedRender::FlatPipelinePlan FoveatedRender::BuildFlatPipelinePlan(
 	plan.renderR = { plan.engineWidth, plan.engineHeight };
 	plan.guidanceG = { plan.act1OutputWidth, plan.act1OutputHeight };
 
+	const float nrScale = settings.flatPipelineNrNative ? 1.0f : settings.flatPipelineNrScale;
 	plan.nrWidth = std::min(plan.act1OutputWidth, std::max(1u, static_cast<uint32_t>(
-		std::lround(displayWidth * settings.flatPipelineNrScale))));
+		std::lround(displayWidth * nrScale))));
 	plan.nrHeight = std::min(plan.act1OutputHeight, std::max(1u, static_cast<uint32_t>(
-		std::lround(displayHeight * settings.flatPipelineNrScale))));
+		std::lround(displayHeight * nrScale))));
 	plan.nrOutputWidth = plan.nrWidth;
 	plan.nrOutputHeight = plan.nrHeight;
 	plan.neuralN = { plan.nrWidth, plan.nrHeight };
 	plan.act2OutputWidth = displayWidth;
 	plan.act2OutputHeight = displayHeight;
-	if (plan.act2Backend == FlatAct2Backend::kDLSS) {
+	if (plan.act2Backend == FlatAct2Backend::kDLSS &&
+		(plan.nrWidth != displayWidth || plan.nrHeight != displayHeight)) {
 		float closestScaleDistance = std::numeric_limits<float>::max();
 		const float actualScale = static_cast<float>(plan.nrWidth) / static_cast<float>(displayWidth);
 		for (uint candidate = 1; candidate <= 4; ++candidate) {
@@ -1098,8 +1212,11 @@ const char* FoveatedRender::SubrectMaskModeName(SubrectMaskMode mode)
 
 void FoveatedRender::DrawLogicalPerfModeControls()
 {
-	if (globals::game::isVR)
+	if (globals::game::isVR) {
+		ImGui::TextDisabled("%s", T(TKEY("pipeline_arise_vr_blocked"),
+			"ARISE owns DXGI Present. VR submits through OpenVR. Six-pass runs on D3D11 before UI."));
 		return;
+	}
 	ClampSettings();
 
 	auto& upscaling = globals::features::upscaling;
@@ -1132,6 +1249,166 @@ void FoveatedRender::DrawLogicalPerfModeControls()
 		ImGui::TextDisabled("%s", T(TKEY("pipeline_active_origin"), "Active this session: Origin (engine RTs at D)"));
 }
 
+namespace
+{
+	void DrawArrow(ImDrawList* drawList, ImVec2 from, ImVec2 to, ImU32 color)
+	{
+		drawList->AddLine(from, to, color, 1.5f);
+		const ImVec2 delta{ to.x - from.x, to.y - from.y };
+		const float length = std::sqrt(delta.x * delta.x + delta.y * delta.y);
+		if (length < 1.0f)
+			return;
+		const ImVec2 dir{ delta.x / length, delta.y / length };
+		const ImVec2 n{ -dir.y, dir.x };
+		drawList->AddTriangleFilled(
+			to,
+			ImVec2(to.x - dir.x * 7.0f + n.x * 3.5f, to.y - dir.y * 7.0f + n.y * 3.5f),
+			ImVec2(to.x - dir.x * 7.0f - n.x * 3.5f, to.y - dir.y * 7.0f - n.y * 3.5f),
+			color);
+	}
+
+	void DrawSixPassDiagram(const FoveatedRender::FlatPipelinePlan& plan, bool fusionOn)
+	{
+		ImDrawList* drawList = ImGui::GetWindowDrawList();
+		const ImVec2 origin = ImGui::GetCursorScreenPos();
+		const float width = std::max(ImGui::GetContentRegionAvail().x, 280.0f);
+		const float height = 128.0f;
+		ImGui::Dummy(ImVec2(width, height));
+
+		auto area = [](FoveatedRender::Extent e) {
+			return std::sqrt(std::max(1.0f, static_cast<float>(e.width) * static_cast<float>(e.height)));
+		};
+		const float maxArea = std::max({ area(plan.renderR), area(plan.guidanceG), area(plan.neuralN), area(plan.displayD), 1.0f });
+		auto halfSize = [&](FoveatedRender::Extent e) {
+			const float scale = plan.renderR.width ? area(e) / maxArea : 0.7f;
+			return ImVec2(16.0f + 24.0f * scale, 11.0f + 16.0f * scale);
+		};
+
+		const ImU32 fill = ImGui::GetColorU32(ImGuiCol_FrameBg);
+		const ImU32 border = ImGui::GetColorU32(ImGuiCol_Border);
+		const ImU32 text = ImGui::GetColorU32(ImGuiCol_Text);
+		const ImU32 dim = ImGui::GetColorU32(ImGuiCol_TextDisabled);
+		const float rowY = origin.y + 42.0f;
+		const float xs[4] = {
+			origin.x + width * 0.12f, origin.x + width * 0.37f,
+			origin.x + width * 0.62f, origin.x + width * 0.87f
+		};
+		const FoveatedRender::Extent extents[4] = { plan.renderR, plan.guidanceG, plan.neuralN, plan.displayD };
+		const char* names[4] = { "R", "G", "N", "D" };
+		ImVec2 halves[4];
+		for (int i = 0; i < 4; ++i)
+			halves[i] = halfSize(extents[i]);
+
+		const char* arrowLabels[3] = { "SR", "DS", "UD" };
+		for (int i = 0; i < 3; ++i) {
+			const ImVec2 from{ xs[i] + halves[i].x, rowY };
+			const ImVec2 to{ xs[i + 1] - halves[i + 1].x, rowY };
+			DrawArrow(drawList, from, to, dim);
+			const ImVec2 mid{ (from.x + to.x) * 0.5f, rowY - 12.0f };
+			const ImVec2 labelSize = ImGui::CalcTextSize(arrowLabels[i]);
+			drawList->AddText(ImVec2(mid.x - labelSize.x * 0.5f, mid.y - labelSize.y), dim, arrowLabels[i]);
+		}
+
+		for (int i = 0; i < 4; ++i) {
+			const ImVec2 min{ xs[i] - halves[i].x, rowY - halves[i].y };
+			const ImVec2 max{ xs[i] + halves[i].x, rowY + halves[i].y };
+			drawList->AddRectFilled(min, max, fill, 4.0f);
+			drawList->AddRect(min, max, border, 4.0f);
+			const ImVec2 nameSize = ImGui::CalcTextSize(names[i]);
+			drawList->AddText(ImVec2(xs[i] - nameSize.x * 0.5f, rowY - nameSize.y * 0.5f), text, names[i]);
+			char sizeLabel[32];
+			if (extents[i].width && extents[i].height)
+				std::snprintf(sizeLabel, sizeof(sizeLabel), "%ux%u", extents[i].width, extents[i].height);
+			else
+				std::snprintf(sizeLabel, sizeof(sizeLabel), "--");
+			const ImVec2 sizeText = ImGui::CalcTextSize(sizeLabel);
+			drawList->AddText(ImVec2(xs[i] - sizeText.x * 0.5f, rowY + halves[i].y + 4.0f), dim, sizeLabel);
+		}
+
+		const ImVec2 nrFrom{ xs[2], rowY + halves[2].y + 18.0f };
+		drawList->AddCircle(ImVec2(xs[2], rowY), halves[2].x + 5.0f, dim, 24, 1.0f);
+		const ImVec2 nrLabel = ImGui::CalcTextSize("NR");
+		drawList->AddText(ImVec2(xs[2] - nrLabel.x * 0.5f, nrFrom.y), dim, "NR");
+
+		if (fusionOn) {
+			const ImVec2 g{ xs[1], rowY + halves[1].y };
+			const ImVec2 d{ xs[3], rowY + halves[3].y };
+			const ImVec2 bend{ (g.x + d.x) * 0.5f, origin.y + height - 8.0f };
+			const ImVec2 fusionPath[3]{ g, bend, d };
+			drawList->AddPolyline(fusionPath, 3, dim, ImDrawFlags_None, 1.5f);
+			const char* guidance = "Guidance";
+			const ImVec2 guidanceSize = ImGui::CalcTextSize(guidance);
+			drawList->AddText(ImVec2(bend.x - guidanceSize.x * 0.5f, bend.y - guidanceSize.y - 2.0f), dim, guidance);
+		}
+	}
+
+	const char* SpatialUpsampleName(FoveatedRender::FlatAct2SrBackend backend)
+	{
+		switch (backend) {
+		case FoveatedRender::FlatAct2SrBackend::kTent:
+			return T(TKEY("fusion_reconstruct_tent"), "Tent");
+		case FoveatedRender::FlatAct2SrBackend::kMitchell:
+			return T(TKEY("act2_backend_mitchell"), "Mitchell");
+		case FoveatedRender::FlatAct2SrBackend::kEasu:
+			return T(TKEY("act2_backend_easu"), "EASU");
+		default:
+			return T(TKEY("act2_backend_lanczos"), "HQ Lanczos");
+		}
+	}
+
+	void DrawSixPassOverview(const FoveatedRender::FlatPipelinePlan& plan, bool fusionOn, bool rcasOn)
+	{
+		const bool haveSize = plan.renderR.width && plan.guidanceG.width && plan.neuralN.width && plan.displayD.width;
+		if (fusionOn && rcasOn)
+			ImGui::TextDisabled(T(TKEY("six_pass_order_fusion_rcas"),
+				"Execution: ACT1 SR -> ACT1 DS -> NR -> %s -> Guidance -> RCAS"), SpatialUpsampleName(plan.act2SrBackend));
+		else if (fusionOn)
+			ImGui::TextDisabled(T(TKEY("six_pass_order_fusion"),
+				"Execution: ACT1 SR -> ACT1 DS -> NR -> %s -> Guidance"), SpatialUpsampleName(plan.act2SrBackend));
+		else
+			ImGui::TextDisabled(T(TKEY("six_pass_order_spatial"),
+				"Execution: ACT1 SR -> ACT1 DS -> NR -> %s -> RCAS"), SpatialUpsampleName(plan.act2SrBackend));
+		if (haveSize) {
+			ImGui::TextDisabled(T(TKEY("six_pass_step_act1_sr"), "1. ACT1 SR   R %ux%u  ->  G %ux%u"),
+				plan.renderR.width, plan.renderR.height, plan.guidanceG.width, plan.guidanceG.height);
+			ImGui::TextDisabled(T(TKEY("six_pass_step_act1_ds"), "2. ACT1 DS   G %ux%u  ->  N %ux%u"),
+				plan.guidanceG.width, plan.guidanceG.height, plan.neuralN.width, plan.neuralN.height);
+			ImGui::TextDisabled(T(TKEY("six_pass_step_nr"), "3. NR        rebuild at N %ux%u"),
+				plan.neuralN.width, plan.neuralN.height);
+			ImGui::TextDisabled(T(TKEY("six_pass_step_spatial"), "4. %s      N %ux%u  ->  D %ux%u"),
+				SpatialUpsampleName(plan.act2SrBackend),
+				plan.neuralN.width, plan.neuralN.height, plan.displayD.width, plan.displayD.height);
+			if (fusionOn)
+				ImGui::TextDisabled(T(TKEY("six_pass_step_guidance"), "5. Guidance  RC@D + gain x (G %ux%u - low G)"),
+					plan.guidanceG.width, plan.guidanceG.height);
+			if (fusionOn && rcasOn)
+				ImGui::TextDisabled(T(TKEY("six_pass_step_rcas_after_guidance"), "6. RCAS      sharpen D %ux%u"),
+					plan.displayD.width, plan.displayD.height);
+			else if (!fusionOn)
+				ImGui::TextDisabled(T(TKEY("six_pass_step_rcas"), "5. RCAS      sharpen D %ux%u"),
+					plan.displayD.width, plan.displayD.height);
+		} else {
+			ImGui::TextDisabled("%s", T(TKEY("six_pass_step_act1_sr_nosize"), "1. ACT1 SR   Scene R -> Guidance G"));
+			ImGui::TextDisabled("%s", T(TKEY("six_pass_step_act1_ds_nosize"), "2. ACT1 DS   Guidance G -> Neural N"));
+			ImGui::TextDisabled("%s", T(TKEY("six_pass_step_nr_nosize"), "3. NR        rebuild at Neural N"));
+			ImGui::TextDisabled("%s", T(TKEY("six_pass_step_act2_sr_nosize"), "4. ACT2 UD   Neural N -> Display D"));
+			if (fusionOn)
+				ImGui::TextDisabled("%s", T(TKEY("six_pass_step_guidance_nosize"),
+					"5. Guidance  RC@D + fitted gain x G detail above the N band"));
+			if (fusionOn && rcasOn)
+				ImGui::TextDisabled("%s", T(TKEY("six_pass_step_rcas_after_guidance_nosize"), "6. RCAS      sharpen Display D"));
+			else if (!fusionOn)
+				ImGui::TextDisabled("%s", T(TKEY("six_pass_step_rcas_nosize"), "5. RCAS      sharpen Display D"));
+		}
+		if (ImGui::TreeNode(T(TKEY("six_pass_diagram"), "Size and Guidance"))) {
+			DrawSixPassDiagram(plan, fusionOn);
+			ImGui::TextWrapped("%s", T(TKEY("six_pass_diagram_help"),
+				"Box size follows each domain's pixel count. ACT1 SR grows R to G. ACT1 DS shrinks G to N for NR. ACT2 UD lifts N to RC@D. Guidance fits NR's gain at N and adds gain x G detail to RC@D."));
+			ImGui::TreePop();
+		}
+	}
+}
+
 void FoveatedRender::DrawNeuralRenderingSettings(bool wrapHeader)
 {
 	ClampSettings();
@@ -1159,14 +1436,43 @@ void FoveatedRender::DrawNeuralRenderingSettings(bool wrapHeader)
 			T(TKEY("jitter_actual"), "Actual Camera Jitter"),
 			T(TKEY("jitter_zero"), "Zero")
 		};
-		if (!globals::game::isVR) {
+		const bool showSixPass = !globals::game::isVR || upscaling.perfMode.IsHookActive();
+		if (showSixPass) {
 			const char* act1Backends[] = {
 				T(TKEY("act1_backend_bypass"), "Bypass"),
 				T(TKEY("act1_backend_dlss"), "DLSS"),
 				T(TKEY("act1_backend_fsr3"), "FSR3")
 			};
-			ImGui::TextDisabled("%s", T(TKEY("injection_point"), "Injection Point: PostInject LDR / Before UI (fixed)"));
-			ImGui::TextDisabled("%s", T(TKEY("six_pass_order"), "Execution: ACT1 SR -> ACT1 DS -> NR -> ACT2 SR -> Fusion -> RCAS"));
+			const bool model3Preview = !globals::game::isVR && upscaling.dx12SwapChain.useArise;
+			const bool vrSixPreview = globals::game::isVR && upscaling.perfMode.IsHookActive();
+			const auto& previewUV = subrectController.GetUV();
+			const uint32_t vrPreviewInW = vrSixPreview ?
+				std::max(1u, static_cast<uint32_t>(upscaling.perfMode.GetRenderEyeWidth() * previewUV.w)) : 0u;
+			const uint32_t vrPreviewInH = vrSixPreview ?
+				std::max(1u, static_cast<uint32_t>(upscaling.perfMode.GetRenderEyeHeight() * previewUV.h)) : 0u;
+			const uint32_t vrPreviewOutW = vrSixPreview ?
+				std::max(1u, static_cast<uint32_t>(upscaling.perfMode.GetDisplayEyeWidth() * previewUV.w)) : 0u;
+			const uint32_t vrPreviewOutH = vrSixPreview ?
+				std::max(1u, static_cast<uint32_t>(upscaling.perfMode.GetDisplayEyeHeight() * previewUV.h)) : 0u;
+			const auto previewPlan = BuildFlatPipelinePlan(
+				vrSixPreview ? vrPreviewOutW :
+					(model3Preview ? upscaling.dx12SwapChain.PhysicalWidth() :
+						(globals::state ? static_cast<uint32_t>(globals::state->screenSize.x) : 0u)),
+				vrSixPreview ? vrPreviewOutH :
+					(model3Preview ? upscaling.dx12SwapChain.PhysicalHeight() :
+						(globals::state ? static_cast<uint32_t>(globals::state->screenSize.y) : 0u)),
+				vrSixPreview ? vrPreviewInW :
+					(model3Preview ? upscaling.dx12SwapChain.LogicalWidth() : 0u),
+				vrSixPreview ? vrPreviewInH :
+					(model3Preview ? upscaling.dx12SwapChain.LogicalHeight() : 0u));
+			ImGui::TextDisabled("%s", globals::game::isVR ?
+				T(TKEY("injection_point_vr"), "Injection Point: Before UI composite on kTOTAL (foveated center)") :
+				T(TKEY("injection_point"), "Injection Point: PostInject LDR / Before UI (fixed)"));
+			if (globals::game::isVR)
+				ImGui::TextDisabled("%s", T(TKEY("vr_six_pass_note"),
+					"Center six-pass, periphery stretch. DLSS-G is full-eye on Submit."));
+			DrawSixPassOverview(previewPlan, settings.unifiedPipeline.fusionEnabled,
+				settings.flatPipelineSharpen);
 			ImGui::Separator();
 			ImGui::TextUnformatted(T(TKEY("act1_sr_header"), "ACT1 SR - Scene R to Guidance G"));
 			if (WantsLogicalPerfMode())
@@ -1248,8 +1554,31 @@ void FoveatedRender::DrawNeuralRenderingSettings(bool wrapHeader)
 				ImGui::Combo(T(TKEY("act1_jitter"), "ACT1 Jitter Submission"), reinterpret_cast<int*>(&settings.flatPipelineAct1Jitter), jitterModes, IM_ARRAYSIZE(jitterModes));
 			}
 			ImGui::TextUnformatted(T(TKEY("act1_ds_header"), "ACT1 DS - Guidance G to Neural N"));
-			ImGui::TextDisabled("%s", T(TKEY("act1_ds_filter"), "Filter: HQ Lanczos (runs whenever G differs from N)"));
-			ImGui::TextDisabled("%s", T(TKEY("footprint_planned"), "Footprint Integral (planned / unavailable)"));
+			{
+				const char* downsampleFilters[] = {
+					T(TKEY("act2_backend_lanczos"), "HQ Lanczos"),
+					T(TKEY("fusion_reconstruct_tent"), "Tent")
+				};
+				ImGui::Combo(T(TKEY("act1_ds_method"), "ACT1 DS Color"),
+					reinterpret_cast<int*>(&settings.unifiedPipeline.act1Downsample),
+					downsampleFilters, IM_ARRAYSIZE(downsampleFilters));
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::Text("%s", T(TKEY("act1_ds_method_tooltip"),
+						"How G color is reduced to N before Neural Rendering. Independent of N to D."));
+				}
+				const char* depthFilters[] = {
+					T(TKEY("act1_ds_depth_min2x2"), "Min 2x2"),
+					T(TKEY("fusion_reconstruct_tent"), "Tent"),
+					T(TKEY("act2_backend_lanczos"), "HQ Lanczos")
+				};
+				ImGui::Combo(T(TKEY("act1_ds_depth"), "ACT1 DS Depth"),
+					reinterpret_cast<int*>(&settings.unifiedPipeline.act1DepthDownsample),
+					depthFilters, IM_ARRAYSIZE(depthFilters));
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::Text("%s", T(TKEY("act1_ds_depth_tooltip"),
+						"How engine depth is reduced to N. Tent/Lanczos use the same G texel centers and kernel as color; Min 2x2 keeps nearest-surface on R."));
+				}
+			}
 			ImGui::Separator();
 		}
 
@@ -1257,134 +1586,53 @@ void FoveatedRender::DrawNeuralRenderingSettings(bool wrapHeader)
 		const bool supportedRoute = (model3Route ||
 			globals::features::upscaling.GetUpscaleMethod() == Upscaling::UpscaleMethod::kDLSS) &&
 			(model3Route || !globals::features::upscaling.IsFrameGenerationConfiguredForSession()) &&
-			(!globals::game::isVR || (GetDlssMode() == DlssMode::kDefault &&
-				globals::features::upscaling.perfMode.IsHookActive()));
+			(!globals::game::isVR || upscaling.perfMode.IsHookActive() || GetDlssMode() == DlssMode::kDefault);
 		if (!supportedRoute) {
 			if (globals::features::upscaling.IsFrameGenerationConfiguredForSession())
 				Util::Text::Warning(T(TKEY("neural_rendering_disable_fg"),
 					"Disable Frame Generation and restart the game before enabling DLSS Neural Rendering."));
 			else
 				Util::Text::Warning(T(TKEY("neural_rendering_unavailable"),
-					"Requires DLSS. VR additionally requires Foveated Default mode and active PerfMode."));
+					"Requires DLSS. VR six-pass needs PerfMode; without it, Foveated Default still enables the legacy NR crop."));
 			ImGui::BeginDisabled();
 		}
 		ImGui::TextUnformatted(T(TKEY("neural_rendering"), "Neural Rendering"));
 		ImGui::Checkbox(T(TKEY("neural_rendering_enable"), "Enable DLSS Neural Rendering"), &settings.neuralRenderingEnabled);
 
 		if (settings.neuralRenderingEnabled) {
-			if (!globals::game::isVR) {
+			if (showSixPass) {
 				ImGui::Separator();
 				ImGui::TextUnformatted(T(TKEY("nr_header"), "NR"));
+				ImGui::Checkbox(T(TKEY("nr_native"), "NR 1:1 (no scale)"), &settings.flatPipelineNrNative);
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::Text("%s", T(TKEY("nr_native_tooltip"),
+						"Run Neural Rendering at Display D. Skip NR downsample. ACT2 is identity; Guidance still sharpens RC@D if enabled."));
+				}
+				ImGui::BeginDisabled(settings.flatPipelineNrNative);
 				ImGui::SliderFloat(T(TKEY("nr_resolution_scale"), "NR Resolution Scale"), &settings.flatPipelineNrScale, 0.33f, 0.95f, "%.2f");
+				ImGui::EndDisabled();
 				{
-					const bool model3 = globals::features::upscaling.dx12SwapChain.useArise;
+					const bool model3 = !globals::game::isVR && globals::features::upscaling.dx12SwapChain.useArise;
+					const bool vrSix = globals::game::isVR && globals::features::upscaling.perfMode.IsHookActive();
 					const auto preview = BuildFlatPipelinePlan(
-						model3 ? globals::features::upscaling.dx12SwapChain.PhysicalWidth() :
-							(globals::state ? static_cast<uint32_t>(globals::state->screenSize.x) : 0u),
-						model3 ? globals::features::upscaling.dx12SwapChain.PhysicalHeight() :
-							(globals::state ? static_cast<uint32_t>(globals::state->screenSize.y) : 0u),
-						model3 ? globals::features::upscaling.dx12SwapChain.LogicalWidth() : 0u,
-						model3 ? globals::features::upscaling.dx12SwapChain.LogicalHeight() : 0u);
+						vrSix ? globals::features::upscaling.perfMode.GetDisplayEyeWidth() :
+							(model3 ? globals::features::upscaling.dx12SwapChain.PhysicalWidth() :
+								(globals::state ? static_cast<uint32_t>(globals::state->screenSize.x) : 0u)),
+						vrSix ? globals::features::upscaling.perfMode.GetDisplayEyeHeight() :
+							(model3 ? globals::features::upscaling.dx12SwapChain.PhysicalHeight() :
+								(globals::state ? static_cast<uint32_t>(globals::state->screenSize.y) : 0u)),
+						vrSix ? globals::features::upscaling.perfMode.GetRenderEyeWidth() :
+							(model3 ? globals::features::upscaling.dx12SwapChain.LogicalWidth() : 0u),
+						vrSix ? globals::features::upscaling.perfMode.GetRenderEyeHeight() :
+							(model3 ? globals::features::upscaling.dx12SwapChain.LogicalHeight() : 0u));
 					const double displayPixels = static_cast<double>(preview.displayWidth) * preview.displayHeight;
 					const double nrPixels = static_cast<double>(preview.nrWidth) * preview.nrHeight;
-					ImGui::TextDisabled(T(TKEY("pipeline_extents"),
-						"R %ux%u -> G %ux%u -> N %ux%u -> D %ux%u"),
-						preview.renderR.width, preview.renderR.height,
-						preview.guidanceG.width, preview.guidanceG.height,
-						preview.neuralN.width, preview.neuralN.height,
-						preview.displayD.width, preview.displayD.height);
 					ImGui::TextDisabled(T(TKEY("neural_n_percent"),
 						"Neural N: %.1f%% of Display D pixels"),
 						displayPixels > 0.0 ? nrPixels * 100.0 / displayPixels : 0.0);
 				}
-				{
-					const char* act2Backends[] = {
-						T(TKEY("act2_backend_dlss"), "DLSS"),
-						T(TKEY("act2_backend_fsr3"), "FSR3"),
-						T(TKEY("act2_backend_nis"), "NIS"),
-						T(TKEY("act2_backend_lanczos"), "HQ Lanczos")
-					};
-					const char* model3Act2Backends[] = {
-						T(TKEY("act2_backend_dlss"), "DLSS"),
-						T(TKEY("act2_backend_lanczos"), "HQ Lanczos")
-					};
-					ImGui::Separator();
-					ImGui::TextUnformatted(T(TKEY("act2_sr_header"), "ACT2 SR"));
-					if (WantsLogicalPerfMode()) {
-						int model3Act2 = settings.unifiedPipeline.act2SrBackend ==
-							static_cast<uint>(FlatAct2SrBackend::kLanczos) ? 1 : 0;
-						if (ImGui::Combo(T(TKEY("act2_sr_backend"), "ACT2 SR Backend"), &model3Act2, model3Act2Backends, IM_ARRAYSIZE(model3Act2Backends)))
-							settings.unifiedPipeline.act2SrBackend = model3Act2 ?
-								static_cast<uint>(FlatAct2SrBackend::kLanczos) : static_cast<uint>(FlatAct2SrBackend::kDLSS);
-					} else {
-						ImGui::Combo(T(TKEY("act2_sr_backend"), "ACT2 SR Backend"), reinterpret_cast<int*>(&settings.unifiedPipeline.act2SrBackend),
-							act2Backends, IM_ARRAYSIZE(act2Backends));
-					}
-					if (settings.unifiedPipeline.act2SrBackend == static_cast<uint>(FlatAct2SrBackend::kDLSS))
-						ImGui::Combo(T(TKEY("act2_dlss_preset"), "ACT2 DLSS Preset"), reinterpret_cast<int*>(&settings.flatPipelineAct2Preset), dlssPresets, IM_ARRAYSIZE(dlssPresets));
-					if (settings.unifiedPipeline.act2SrBackend == static_cast<uint>(FlatAct2SrBackend::kDLSS) ||
-						settings.unifiedPipeline.act2SrBackend == static_cast<uint>(FlatAct2SrBackend::kFSR3))
-						ImGui::Combo(T(TKEY("act2_jitter"), "ACT2 Jitter Submission"), reinterpret_cast<int*>(&settings.flatPipelineAct2Jitter), jitterModes, IM_ARRAYSIZE(jitterModes));
-					ImGui::TextDisabled("%s", T(TKEY("act2_spatial_filter"), "ACT2 Spatial Filter: HQ Lanczos"));
-					ImGui::TextDisabled("%s", T(TKEY("footprint_planned"), "Footprint Integral (planned / unavailable)"));
-					ImGui::Checkbox(T(TKEY("act2_fusion"), "Enable ACT2 Fusion"), &settings.unifiedPipeline.fusionEnabled);
-					if (settings.unifiedPipeline.fusionEnabled) {
-						const char* fusionDirections[] = {
-							T(TKEY("fusion_dir_act1"), "ACT1 guides NR"),
-							T(TKEY("fusion_dir_nr"), "NR guides ACT1")
-						};
-						const char* denoiseModes[] = {
-							T(TKEY("fusion_denoise_off"), "Off"),
-							T(TKEY("fusion_denoise_bilateral"), "Residual Bilateral"),
-							T(TKEY("fusion_denoise_gaussian"), "Soft Gaussian"),
-							T(TKEY("fusion_denoise_luma"), "Luma Preserve"),
-							T(TKEY("fusion_denoise_strong"), "Strong Clean")
-						};
-						const char* fusionPresets[] = {
-							T(TKEY("fusion_preset_custom"), "Custom"),
-							T(TKEY("fusion_preset_clean"), "Clean"),
-							T(TKEY("fusion_preset_soft"), "Soft"),
-							T(TKEY("fusion_preset_dreamy"), "Dreamy"),
-							T(TKEY("fusion_preset_detail"), "Detail"),
-							T(TKEY("fusion_preset_nr_led"), "NR Led")
-						};
-						int fusionPreset = static_cast<int>(settings.neuralRenderingFusionPreset);
-						if (ImGui::Combo(T(TKEY("fusion_preset"), "Fusion Preset"), &fusionPreset, fusionPresets, IM_ARRAYSIZE(fusionPresets))) {
-							settings.neuralRenderingFusionPreset = static_cast<uint>(fusionPreset);
-							switch (settings.neuralRenderingFusionPreset) {
-							case 1: settings.flatPipelineFusionDirection = 0; settings.flatPipelineFusionDenoise = 1; settings.flatPipelineFusionDenoiseStrength = 0.55f; settings.flatPipelineFusionSoftness = 0.25f; settings.flatPipelineFusionFrequencyGuidance = 0.70f; settings.flatPipelineFusionDepthGuidance = 0.80f; settings.neuralRenderingFusionLuma = 0.75f; settings.neuralRenderingFusionChroma = 0.50f; settings.neuralRenderingFusionEdgeProtection = 0.45f; settings.neuralRenderingFusionResidualLimit = 0.12f; break;
-							case 2: settings.flatPipelineFusionDirection = 0; settings.flatPipelineFusionDenoise = 2; settings.flatPipelineFusionDenoiseStrength = 0.65f; settings.flatPipelineFusionSoftness = 0.65f; settings.flatPipelineFusionFrequencyGuidance = 0.75f; settings.flatPipelineFusionDepthGuidance = 0.80f; settings.neuralRenderingFusionLuma = 0.65f; settings.neuralRenderingFusionChroma = 0.40f; settings.neuralRenderingFusionEdgeProtection = 0.50f; settings.neuralRenderingFusionResidualLimit = 0.10f; break;
-							case 3: settings.flatPipelineFusionDirection = 0; settings.flatPipelineFusionDenoise = 4; settings.flatPipelineFusionDenoiseStrength = 0.80f; settings.flatPipelineFusionSoftness = 0.85f; settings.flatPipelineFusionFrequencyGuidance = 0.85f; settings.flatPipelineFusionDepthGuidance = 0.90f; settings.neuralRenderingFusionLuma = 0.55f; settings.neuralRenderingFusionChroma = 0.35f; settings.neuralRenderingFusionEdgeProtection = 0.60f; settings.neuralRenderingFusionResidualLimit = 0.08f; break;
-							case 4: settings.flatPipelineFusionDirection = 1; settings.flatPipelineFusionDenoise = 1; settings.flatPipelineFusionDenoiseStrength = 0.40f; settings.flatPipelineFusionSoftness = 0.20f; settings.flatPipelineFusionFrequencyGuidance = 0.45f; settings.flatPipelineFusionDepthGuidance = 0.65f; settings.neuralRenderingFusionLuma = 0.80f; settings.neuralRenderingFusionChroma = 0.45f; settings.neuralRenderingFusionEdgeProtection = 0.30f; settings.neuralRenderingFusionResidualLimit = 0.14f; break;
-							case 5: settings.flatPipelineFusionDirection = 1; settings.flatPipelineFusionDenoise = 3; settings.flatPipelineFusionDenoiseStrength = 0.55f; settings.flatPipelineFusionSoftness = 0.45f; settings.flatPipelineFusionFrequencyGuidance = 0.60f; settings.flatPipelineFusionDepthGuidance = 0.75f; settings.neuralRenderingFusionLuma = 0.55f; settings.neuralRenderingFusionChroma = 0.35f; settings.neuralRenderingFusionEdgeProtection = 0.45f; settings.neuralRenderingFusionResidualLimit = 0.11f; break;
-							default: break;
-							}
-						}
-						ImGui::Combo(T(TKEY("fusion_direction"), "Fusion Direction"), reinterpret_cast<int*>(&settings.flatPipelineFusionDirection), fusionDirections, IM_ARRAYSIZE(fusionDirections));
-						ImGui::Combo(T(TKEY("fusion_denoise"), "Fusion Denoise"), reinterpret_cast<int*>(&settings.flatPipelineFusionDenoise), denoiseModes, IM_ARRAYSIZE(denoiseModes));
-						bool customFusion = false;
-						customFusion |= ImGui::SliderFloat(T(TKEY("fusion_denoise_strength"), "Fusion Denoise Strength"), &settings.flatPipelineFusionDenoiseStrength, 0.0f, 1.0f, "%.2f");
-						customFusion |= ImGui::SliderFloat(T(TKEY("fusion_softness"), "Fusion Softness"), &settings.flatPipelineFusionSoftness, 0.0f, 1.0f, "%.2f");
-						ImGui::Checkbox(T(TKEY("fusion_enhanced_guidance"), "Enable Enhanced Guidance"), &settings.flatPipelineFusionEnhancedGuidance);
-						if (settings.flatPipelineFusionEnhancedGuidance) {
-							customFusion |= ImGui::SliderFloat(T(TKEY("fusion_frequency"), "Fusion Frequency Guidance"), &settings.flatPipelineFusionFrequencyGuidance, 0.0f, 1.0f, "%.2f");
-							customFusion |= ImGui::SliderFloat(T(TKEY("fusion_depth"), "Fusion Depth Guidance"), &settings.flatPipelineFusionDepthGuidance, 0.0f, 1.0f, "%.2f");
-							customFusion |= ImGui::SliderFloat(T(TKEY("fusion_color"), "Fusion Color Guidance"), &settings.flatPipelineFusionColorGuidance, 0.0f, 1.0f, "%.2f");
-						}
-						customFusion |= ImGui::SliderFloat(T(TKEY("fusion_luma"), "Fusion Luma"), &settings.neuralRenderingFusionLuma, 0.0f, 1.5f, "%.2f");
-						customFusion |= ImGui::SliderFloat(T(TKEY("fusion_chroma"), "Fusion Chroma"), &settings.neuralRenderingFusionChroma, 0.0f, 1.5f, "%.2f");
-						customFusion |= ImGui::SliderFloat(T(TKEY("fusion_edge"), "Fusion Edge Protection"), &settings.neuralRenderingFusionEdgeProtection, 0.0f, 1.0f, "%.2f");
-						customFusion |= ImGui::SliderFloat(T(TKEY("fusion_residual"), "Fusion Residual Limit"), &settings.neuralRenderingFusionResidualLimit, 0.01f, 0.5f, "%.3f");
-						if (customFusion)
-							settings.neuralRenderingFusionPreset = 0;
-					}
-				}
-				ImGui::Separator();
-				ImGui::TextUnformatted(T(TKEY("final_sharpen"), "Final Sharpen"));
-				ImGui::Checkbox(T(TKEY("rcas_enable"), "Enable RCAS"), &settings.flatPipelineSharpen);
-				if (settings.flatPipelineSharpen)
-					ImGui::SliderFloat(T(TKEY("rcas_sharpness"), "RCAS Sharpness"), &settings.flatPipelineSharpness, 0.0f, 1.0f, "%.2f");
 			}
+
 			ImGui::Separator();
 			ImGui::TextUnformatted(T(TKEY("nr_tuning"), "NR Tuning"));
 			const char* presets[] = {
@@ -1426,7 +1674,285 @@ void FoveatedRender::DrawNeuralRenderingSettings(bool wrapHeader)
 			if (custom)
 				settings.neuralRenderingPreset = 0;
 
+			if (showSixPass) {
+				{
+					ImGui::Separator();
+					ImGui::TextUnformatted(T(TKEY("n_to_d_header"), "N to D"));
+					const char* displayMethods[] = {
+						T(TKEY("act2_backend_lanczos"), "HQ Lanczos"),
+						T(TKEY("fusion_reconstruct_tent"), "Tent"),
+						T(TKEY("act2_backend_mitchell"), "Mitchell"),
+						T(TKEY("act2_backend_easu"), "EASU")
+					};
+					int displayMethod =
+						settings.unifiedPipeline.act2SrBackend == static_cast<uint>(FlatAct2SrBackend::kTent) ? 1 :
+						settings.unifiedPipeline.act2SrBackend == static_cast<uint>(FlatAct2SrBackend::kMitchell) ? 2 :
+						settings.unifiedPipeline.act2SrBackend == static_cast<uint>(FlatAct2SrBackend::kEasu) ? 3 : 0;
+					if (ImGui::Combo(T(TKEY("n_to_d_method"), "N to D Method"), &displayMethod, displayMethods, IM_ARRAYSIZE(displayMethods))) {
+						settings.unifiedPipeline.act2SrBackend = displayMethod == 1 ?
+							static_cast<uint>(FlatAct2SrBackend::kTent) :
+							displayMethod == 2 ? static_cast<uint>(FlatAct2SrBackend::kMitchell) :
+							displayMethod == 3 ? static_cast<uint>(FlatAct2SrBackend::kEasu) :
+							static_cast<uint>(FlatAct2SrBackend::kLanczos);
+					}
+					if (auto _tt = Util::HoverTooltipWrapper()) {
+						ImGui::Text("%s", T(TKEY("n_to_d_tooltip"),
+							"ACT2 UD only. Mitchell and Tent stay soft. Guidance is a later pass that sharpens RC@D; it is not an upsampler."));
+					}
+					ImGui::TextDisabled("%s", T(TKEY("n_to_d_spatial_help"),
+						"Soft upsample of native N to RC@D. RD follows this same UD implicitly."));
+					ImGui::Checkbox(T(TKEY("fusion_after_act2"), "Guidance after ACT2"), &settings.unifiedPipeline.fusionEnabled);
+					if (auto _tt = Util::HoverTooltipWrapper()) {
+						ImGui::Text("%s", T(TKEY("fusion_after_act2_tooltip"),
+							"After ACT2, add gain x (G - UD(NR input)) to RC@D. Gain is fitted from NR's own input/output at N, so G lends detail but no tone. RCAS can still run after this."));
+					}
+					if (settings.unifiedPipeline.fusionEnabled) {
+						ImGui::TextDisabled("%s", T(TKEY("fusion_is_act2"),
+							"Fits NR as a local affine map of its own input at N. D = RC + a x (G - UD(NR input)). Same-side fit; a blends to prior by ρ². RD only drops cross-cliff samples."));
+						if (ImGui::CollapsingHeader(T(TKEY("fusion_grp_fit"), "Guidance · Fit"), ImGuiTreeNodeFlags_DefaultOpen)) {
+							ImGui::SliderFloat(T(TKEY("fusion_softness"), "Fit Window"), &settings.flatPipelineFusionSoftness, 0.0f, 1.0f, "%.2f");
+							if (auto _tt = Util::HoverTooltipWrapper()) {
+								ImGui::Text("%s", T(TKEY("fusion_softness_tooltip"),
+									"Regression window on the N grid. Below 0.5 = 3x3, above = 5x5. Wider is smoother gain, less local."));
+							}
+							ImGui::SliderFloat(T(TKEY("fusion_residual"), "Regularization"), &settings.neuralRenderingFusionResidualLimit, 0.01f, 0.5f, "%.2f");
+							if (auto _tt = Util::HoverTooltipWrapper()) {
+								ImGui::Text("%s", T(TKEY("fusion_residual_tooltip"),
+									"Epsilon in gain = cov / (var + eps). Higher damps gain in flat, low-variance areas; lower trusts every small correlation."));
+							}
+							ImGui::SliderFloat(T(TKEY("fusion_residual_gain"), "Max Gain"), &settings.flatPipelineFusionFrequencyGuidance, 0.0f, 1.0f, "%.2f");
+							if (auto _tt = Util::HoverTooltipWrapper()) {
+								ImGui::Text("%s", T(TKEY("fusion_frequency_tooltip"),
+									"Clip for the fitted gain: 0 = 1x, 1 = 3x. Pansharpening keeps this at 2-3 to avoid over-enhancement."));
+							}
+							ImGui::SliderFloat(T(TKEY("fusion_gain_prior"), "Gain Prior"), &settings.fusionGainPrior, 0.0f, 1.5f, "%.2f");
+							if (auto _tt = Util::HoverTooltipWrapper()) {
+								ImGui::Text("%s", T(TKEY("fusion_gain_prior_tooltip"),
+									"gain = (cov + eps x prior) / (var + eps). Where the NR input had no variance the model never saw the structure; 1 lets G restore it, 0 treats NR's silence as a decision."));
+							}
+							ImGui::SliderFloat(T(TKEY("fusion_side_sigma"), "Side Sigma"), &settings.fusionFitSideSigma, 0.02f, 0.5f, "%.2f");
+							if (auto _tt = Util::HoverTooltipWrapper()) {
+								ImGui::Text("%s", T(TKEY("fusion_side_sigma_tooltip"),
+									"Same-side regression: samples across an RD cliff are dropped, then weighted by luma proximity. Lower = stricter."));
+							}
+						}
+						if (ImGui::CollapsingHeader(T(TKEY("fusion_grp_depth"), "Guidance · Depth"), ImGuiTreeNodeFlags_DefaultOpen)) {
+							ImGui::SliderFloat(T(TKEY("fusion_depth"), "Depth Band"), &settings.flatPipelineFusionDepthGuidance, 0.0f, 1.0f, "%.2f");
+							if (auto _tt = Util::HoverTooltipWrapper()) {
+								ImGui::Text("%s", T(TKEY("fusion_depth_tooltip"),
+									"RD cliff threshold on the engine grid. Never use ND. Higher finds weaker Z splits."));
+							}
+						}
+						if (ImGui::CollapsingHeader(T(TKEY("fusion_grp_hf"), "Guidance · Inject"), ImGuiTreeNodeFlags_DefaultOpen)) {
+							ImGui::SliderFloat(T(TKEY("fusion_luma"), "Detail Luma"), &settings.neuralRenderingFusionLuma, 0.0f, 1.5f, "%.2f");
+							if (auto _tt = Util::HoverTooltipWrapper()) {
+								ImGui::Text("%s", T(TKEY("fusion_luma_tooltip"),
+									"Scale on the luma part of gain x detail. 1 reproduces the fitted model."));
+							}
+							ImGui::SliderFloat(T(TKEY("fusion_chroma"), "Detail Chroma"), &settings.neuralRenderingFusionChroma, 0.0f, 1.5f, "%.2f");
+							if (auto _tt = Util::HoverTooltipWrapper()) {
+								ImGui::Text("%s", T(TKEY("fusion_chroma_tooltip"),
+									"Scale on the chroma part of gain x detail. Lower keeps NR's hue where G adds color texture."));
+							}
+						}
+						if (ImGui::CollapsingHeader(T(TKEY("fusion_grp_bands"), "Guidance · NR Bands"), ImGuiTreeNodeFlags_DefaultOpen)) {
+							ImGui::TextDisabled("%s", T(TKEY("fusion_bands_help"),
+								"NR edit E = RC - UD(NR input). Low band = 5x5 mean at N (tone, shadows); high band = the rest (NR's own texture). 1 = as NR made it."));
+							ImGui::SliderFloat(T(TKEY("fusion_tone_gain_luma"), "NR Tone Gain (Luma)"), &settings.fusionToneGainLuma, 0.0f, 3.0f, "%.2f");
+							if (auto _tt = Util::HoverTooltipWrapper()) {
+								ImGui::Text("%s", T(TKEY("fusion_tone_gain_luma_tooltip"),
+									"Scales the luma of NR's low-band edit. Above 1 makes soft low-resolution shading decisions bolder; it cannot narrow them."));
+							}
+							ImGui::SliderFloat(T(TKEY("fusion_tone_gain_chroma"), "NR Tone Gain (Chroma)"), &settings.fusionToneGainChroma, 0.0f, 3.0f, "%.2f");
+							if (auto _tt = Util::HoverTooltipWrapper()) {
+								ImGui::Text("%s", T(TKEY("fusion_tone_gain_chroma_tooltip"),
+									"Scales the chroma of NR's low-band edit. NR hue shifts are usually the part to keep light."));
+							}
+							ImGui::SliderFloat(T(TKEY("fusion_detail_gain"), "NR Detail Gain"), &settings.fusionDetailGain, 0.0f, 3.0f, "%.2f");
+							if (auto _tt = Util::HoverTooltipWrapper()) {
+								ImGui::Text("%s", T(TKEY("fusion_detail_gain_tooltip"),
+									"Scales NR's high-band edit: texture the model added that G does not have. Crisper, never finer than the N grid."));
+							}
+							ImGui::SliderFloat(T(TKEY("fusion_dir_sharpen"), "E_hf Directional Sharpen"), &settings.fusionDirectionalSharpen, 0.0f, 2.0f, "%.2f");
+							if (auto _tt = Util::HoverTooltipWrapper()) {
+								ImGui::Text("%s", T(TKEY("fusion_dir_sharpen_tooltip"),
+									"Unsharp NR's own high band along the G gradient. 0 is off. Does not invent frequencies above N."));
+							}
+							ImGui::SliderFloat(T(TKEY("fusion_dither"), "Band Dither"), &settings.fusionDither, 0.0f, 2.0f, "%.2f");
+							if (auto _tt = Util::HoverTooltipWrapper()) {
+								ImGui::Text("%s", T(TKEY("fusion_dither_tooltip"),
+									"Triangular dither in 8-bit steps, active only while a band gain is not 1. Hides the banding amplified low-band edits expose."));
+							}
+						}
+						if (ImGui::CollapsingHeader(T(TKEY("fusion_grp_compare"), "Guidance · Compare"), ImGuiTreeNodeFlags_DefaultOpen)) {
+							const char* compareModes[] = {
+								T(TKEY("fusion_compare_fitted"), "Fitted gain"),
+								T(TKEY("fusion_compare_unit"), "Force gain = 1"),
+								T(TKEY("fusion_compare_split"), "Split: fitted | gain 1"),
+								T(TKEY("fusion_compare_split_swap"), "Split: gain 1 | fitted")
+							};
+							ImGui::Combo(T(TKEY("fusion_compare_mode"), "Gain A/B"), reinterpret_cast<int*>(&settings.fusionCompareMode), compareModes, IM_ARRAYSIZE(compareModes));
+							if (auto _tt = Util::HoverTooltipWrapper()) {
+								ImGui::Text("%s", T(TKEY("fusion_compare_tooltip"),
+									"Gain 1 adds G's detail band at unit strength everywhere (the OptiScaler matched-residual form). Fitted gain scales it by how much contrast NR kept locally."));
+							}
+							const char* debugViews[] = {
+								T(TKEY("fusion_debug_off"), "Off"),
+								T(TKEY("fusion_debug_gain"), "Gain map (0.5 = 1x)"),
+								T(TKEY("fusion_debug_detail"), "G detail band"),
+								T(TKEY("fusion_debug_edit"), "NR edit"),
+								T(TKEY("fusion_debug_edit_low"), "NR edit: low band"),
+								T(TKEY("fusion_debug_edit_high"), "NR edit: high band"),
+								T(TKEY("fusion_debug_rd"), "RD mask"),
+								T(TKEY("fusion_debug_hard_band"), "Energy-gap w"),
+								T(TKEY("fusion_debug_soft_band"), "(unused)"),
+								T(TKEY("fusion_debug_alias_w"), "Fit ρ²")
+							};
+							ImGui::Combo(T(TKEY("fusion_debug_view"), "Debug View"), reinterpret_cast<int*>(&settings.fusionDebugView), debugViews, IM_ARRAYSIZE(debugViews));
+							if (ImGui::Button(T(TKEY("fusion_export_bands"), "Export bands (G / I / N / RC / Lo / Gain / D)")))
+								NeuralRendering::RequestBandCapture();
+							if (auto _tt = Util::HoverTooltipWrapper()) {
+								ImGui::Text("%s", T(TKEY("fusion_export_bands_tooltip"),
+									"Writes raw float32 dumps and a manifest to Data/SKSE/Plugins/CommunityShaders/PrivateNR for tools/nr_band_analysis.py. D3D11 six-pass only."));
+							}
+						}
+					}
+				}
+			}
+		}
+		if (!supportedRoute)
+			ImGui::EndDisabled();
+		if (showSixPass) {
+			globals::features::upscaling.DrawFinalSharpenSettings();
+			ImGui::Separator();
+			ImGui::TextUnformatted(T(TKEY("act3_header"), "ACT3"));
+			ImGui::Checkbox(T(TKEY("act3_enable"), "ACT3 Center NR"), &settings.act3Enabled);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("%s", T(TKEY("act3_enable_tooltip"),
+					"After Final Sharpen, crop a fixed center of D, run a second NR, and write it back with KIT dither mixing at the crop edge."));
+			}
+			if (settings.act3Enabled) {
+				ImGui::SliderFloat(T(TKEY("act3_scale"), "Center Scale"), &settings.act3Scale, 0.0f, 0.9f, "%.2f");
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::Text("%s", T(TKEY("act3_scale_tooltip"),
+						"Fixed center crop. 0.50 = half the full D width and height. 0 skips ACT3."));
+				}
+				ImGui::SliderFloat(T(TKEY("act3_feather"), "Writeback Feather"), &settings.act3FeatherWidth, 2.0f, 128.0f, "%.0f px");
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::Text("%s", T(TKEY("act3_feather_tooltip"),
+						"Width of the KIT dither band. Interior stays 100% ACT3; the band mixes with the first-pass D."));
+				}
+				ImGui::SliderFloat(T(TKEY("act3_dither"), "Writeback Dither"), &settings.act3DitherStrength, 0.0f, 2.0f, "%.2f");
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::Text("%s", T(TKEY("act3_dither_tooltip"),
+						"Directional and spatially locked. Outer edge stays background, inner edge stays ACT3. 0 is a smooth ramp; 1 adds static grain in the band only."));
+				}
+				ImGui::Checkbox(T(TKEY("act3_guidance"), "ACT3 Guidance"), &settings.act3GuidanceEnabled);
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::Text("%s", T(TKEY("act3_guidance_tooltip"),
+						"Same Guidance equation as ACT2, only on the ACT3 crop: G and ACT2 Lo stay shared, RC is ACT3 NR, knobs are this set. Crops the pre-Guidance RC so the center is not first-guided twice. Compare and debug stay off."));
+				}
+				if (settings.act3GuidanceEnabled) {
+					ImGui::TextDisabled("%s", T(TKEY("act3_guidance_help"),
+						"Background keeps the first Guidance. The crop runs ACT3 NR then this Guidance. The dither band picks one or the other: inward ACT3, outward background."));
+					ImGui::SliderFloat(T(TKEY("act3_guidance_luma"), "ACT3 Detail Luma"), &settings.act3GuidanceLuma, 0.0f, 1.5f, "%.2f");
+					if (auto _tt = Util::HoverTooltipWrapper()) {
+						ImGui::Text("%s", T(TKEY("fusion_luma_tooltip"),
+							"Scale on the luma part of gain x detail. 1 reproduces the fitted model."));
+					}
+					ImGui::SliderFloat(T(TKEY("act3_guidance_chroma"), "ACT3 Detail Chroma"), &settings.act3GuidanceChroma, 0.0f, 1.5f, "%.2f");
+					if (auto _tt = Util::HoverTooltipWrapper()) {
+						ImGui::Text("%s", T(TKEY("fusion_chroma_tooltip"),
+							"Scale on the chroma part of gain x detail. Lower keeps NR's hue where G adds color texture."));
+					}
+					ImGui::SliderFloat(T(TKEY("act3_guidance_prior"), "ACT3 Gain Prior"), &settings.act3GuidancePrior, 0.0f, 1.5f, "%.2f");
+					if (auto _tt = Util::HoverTooltipWrapper()) {
+						ImGui::Text("%s", T(TKEY("fusion_gain_prior_tooltip"),
+							"gain = (cov + eps x prior) / (var + eps). Where the NR input had no variance the model never saw the structure; 1 lets G restore it, 0 treats NR's silence as a decision."));
+					}
+					ImGui::SliderFloat(T(TKEY("act3_guidance_max_gain"), "ACT3 Max Gain"), &settings.act3GuidanceMaxGain, 0.0f, 1.0f, "%.2f");
+					if (auto _tt = Util::HoverTooltipWrapper()) {
+						ImGui::Text("%s", T(TKEY("fusion_frequency_tooltip"),
+							"Clip for the fitted gain: 0 = 1x, 1 = 3x. Pansharpening keeps this at 2-3 to avoid over-enhancement."));
+					}
+					ImGui::SliderFloat(T(TKEY("act3_guidance_tone_luma"), "ACT3 NR Tone Gain (Luma)"), &settings.act3GuidanceToneLuma, 0.0f, 3.0f, "%.2f");
+					if (auto _tt = Util::HoverTooltipWrapper()) {
+						ImGui::Text("%s", T(TKEY("fusion_tone_gain_luma_tooltip"),
+							"Scales the luma of NR's low-band edit. Above 1 makes soft low-resolution shading decisions bolder; it cannot narrow them."));
+					}
+					ImGui::SliderFloat(T(TKEY("act3_guidance_tone_chroma"), "ACT3 NR Tone Gain (Chroma)"), &settings.act3GuidanceToneChroma, 0.0f, 3.0f, "%.2f");
+					if (auto _tt = Util::HoverTooltipWrapper()) {
+						ImGui::Text("%s", T(TKEY("fusion_tone_gain_chroma_tooltip"),
+							"Scales the chroma of NR's low-band edit. NR hue shifts are usually the part to keep light."));
+					}
+					ImGui::SliderFloat(T(TKEY("act3_guidance_detail_gain"), "ACT3 NR Detail Gain"), &settings.act3GuidanceDetailGain, 0.0f, 3.0f, "%.2f");
+					if (auto _tt = Util::HoverTooltipWrapper()) {
+						ImGui::Text("%s", T(TKEY("fusion_detail_gain_tooltip"),
+							"Scales NR's high-band edit: texture the model added that G does not have. Crisper, never finer than the N grid."));
+					}
+					ImGui::SliderFloat(T(TKEY("act3_guidance_dir_sharpen"), "ACT3 E_hf Directional Sharpen"), &settings.act3GuidanceDirSharpen, 0.0f, 2.0f, "%.2f");
+					if (auto _tt = Util::HoverTooltipWrapper()) {
+						ImGui::Text("%s", T(TKEY("fusion_dir_sharpen_tooltip"),
+							"Unsharp NR's own high band along the G gradient. 0 is off. Does not invent frequencies above N."));
+					}
+					ImGui::SliderFloat(T(TKEY("act3_guidance_dither"), "ACT3 Band Dither"), &settings.act3GuidanceDither, 0.0f, 2.0f, "%.2f");
+					if (auto _tt = Util::HoverTooltipWrapper()) {
+						ImGui::Text("%s", T(TKEY("fusion_dither_tooltip"),
+							"Triangular dither in 8-bit steps, active only while a band gain is not 1. Hides the banding amplified low-band edits expose."));
+					}
+				}
+				const char* act3Presets[] = {
+					T(TKEY("nr_preset_custom"), "Custom"),
+					T(TKEY("nr_preset_balanced"), "Balanced"),
+					T(TKEY("nr_preset_fabric"), "Fabric Detail"),
+					T(TKEY("nr_preset_natural"), "Natural"),
+					T(TKEY("nr_preset_strong"), "Strong")
+				};
+				int act3Preset = static_cast<int>(settings.act3Preset);
+				if (ImGui::Combo(T(TKEY("act3_preset"), "ACT3 Tuning Preset"), &act3Preset, act3Presets, IM_ARRAYSIZE(act3Presets))) {
+					settings.act3Preset = static_cast<uint>(act3Preset);
+					switch (settings.act3Preset) {
+					case 1: settings.act3Intensity = 1.0f; settings.act3LocalTone = 1.0f; settings.act3LocalStructure = 1.0f; settings.act3SkinStructure = 1.0f; break;
+					case 2: settings.act3Intensity = 1.35f; settings.act3LocalTone = 0.9f; settings.act3LocalStructure = 1.6f; settings.act3SkinStructure = 1.15f; break;
+					case 3: settings.act3Intensity = 0.8f; settings.act3LocalTone = 0.75f; settings.act3LocalStructure = 0.9f; settings.act3SkinStructure = 0.9f; break;
+					case 4: settings.act3Intensity = 1.75f; settings.act3LocalTone = 1.25f; settings.act3LocalStructure = 1.5f; settings.act3SkinStructure = 1.3f; break;
+					default: break;
+					}
+				}
+				bool act3Custom = false;
+				act3Custom |= ImGui::SliderFloat(T(TKEY("act3_intensity"), "ACT3 Intensity"), &settings.act3Intensity, 0.0f, 2.0f, "%.2f");
+				act3Custom |= ImGui::SliderFloat(T(TKEY("act3_local_tone"), "ACT3 Local Tone"), &settings.act3LocalTone, 0.0f, 2.0f, "%.2f");
+				act3Custom |= ImGui::SliderFloat(T(TKEY("act3_local_structure"), "ACT3 Local Structure"), &settings.act3LocalStructure, 0.0f, 2.0f, "%.2f");
+				act3Custom |= ImGui::SliderFloat(T(TKEY("act3_skin_structure"), "ACT3 Skin Structure"), &settings.act3SkinStructure, 0.0f, 2.0f, "%.2f");
+				const char* act3Styles[] = {
+					T(TKEY("nr_style_0"), "Style 0"),
+					T(TKEY("nr_style_1"), "Style 1"),
+					T(TKEY("nr_style_2"), "Style 2"),
+					T(TKEY("nr_style_3"), "Style 3")
+				};
+				int act3Style = static_cast<int>(settings.act3Style);
+				if (ImGui::Combo(T(TKEY("act3_style"), "ACT3 Style"), &act3Style, act3Styles, IM_ARRAYSIZE(act3Styles))) {
+					settings.act3Style = static_cast<uint>(act3Style);
+					act3Custom = true;
+				}
+				act3Custom |= ImGui::Checkbox(T(TKEY("act3_auto_mask"), "ACT3 Automatic Mask"), &settings.act3AutoMask);
+				act3Custom |= ImGui::Checkbox(T(TKEY("act3_ui_correction"), "ACT3 UI Correction"), &settings.act3UICorrection);
+				ImGui::Checkbox(T(TKEY("act3_reset"), "ACT3 Reset Every Frame"), &settings.act3ResetEveryFrame);
+				ImGui::Checkbox(T(TKEY("act3_sharpen"), "ACT3 Fullscreen RCAS"), &settings.act3Sharpen);
+				if (settings.act3Sharpen)
+					ImGui::SliderFloat(T(TKEY("act3_sharpness"), "ACT3 RCAS Sharpness"), &settings.act3Sharpness, 0.0f, 1.0f, "%.2f");
+				if (act3Custom)
+					settings.act3Preset = 0;
+			}
+		}
+		if (!supportedRoute)
+			ImGui::BeginDisabled();
+
+		if (settings.neuralRenderingEnabled) {
 			if (ImGui::TreeNodeEx(T(TKEY("diagnostics"), "Diagnostics"))) {
+				if (globals::game::isVR)
+					ImGui::TextDisabled("%s", T(TKEY("pipeline_arise_vr_blocked"),
+						"ARISE owns DXGI Present. VR submits through OpenVR. Six-pass runs on D3D11 before UI."));
 				if (!globals::game::isVR) {
 					if (ImGui::Checkbox(T(TKEY("pipeline_arise"), "ARISE Async PerfMode"), &settings.ariseModel3) && settings.ariseModel3) {
 						settings.singleThreadPerfMode = false;
@@ -1527,7 +2053,7 @@ void FoveatedRender::DrawNeuralRenderingSettings(bool wrapHeader)
 				ImGui::TextDisabled(T(TKEY("diag_model3_path"), "ARISE Model 3: %s%s"), model3Stats.graphPath.c_str(),
 					model3Stats.tailNrAvailable ? "" : T(TKEY("diag_passthrough"), " (runtime unavailable; passthrough)"));
 				ImGui::TextDisabled(T(TKEY("diag_graph_passes"),
-					"Graph passes: ACT1 bypass %llu | Lanczos %llu | NR %llu | Fusion %llu | RCAS %llu"),
+					"Graph passes: ACT1 bypass %llu | Lanczos %llu | NR %llu | Guidance %llu | RCAS %llu"),
 					static_cast<unsigned long long>(model3Stats.graph.act1Bypass),
 					static_cast<unsigned long long>(model3Stats.graph.lanczos),
 					static_cast<unsigned long long>(model3Stats.graph.neuralRendering),

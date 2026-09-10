@@ -100,7 +100,14 @@ float ShapeRamp(float normalizedDistance, float curve)
 	// We're in the feather band — need background
 	float4 bg = DstTex[dstPos];
 
-	if (BlendMode == 1) {
+	if (BlendMode == 2) {
+		// Inward, spatially locked. t=0 (outer) is always dst, t=1 (inner) is always src.
+		// FrameIndex is ignored so the band does not flicker. Noise dies at both ends.
+		float t = smoothstep(0.0, 1.0, saturate(edgeDist / max(FeatherWidth, 1e-5)));
+		float noise = BlueNoise(dstPos, 0);
+		float wobble = (noise - 0.5) * DitherStrength * t * (1.0 - t);
+		DstTex[dstPos] = lerp(bg, dlss, saturate(t + wobble));
+	} else if (BlendMode == 1) {
 		// Dither: noise-perturbed continuous gradient
 		// Noise shifts the blend threshold per-pixel → natural irregular boundary
 		float t = edgeDist / FeatherWidth;  // 0 at edge, 1 at band end

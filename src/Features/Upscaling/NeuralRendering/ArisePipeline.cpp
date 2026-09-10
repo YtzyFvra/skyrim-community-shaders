@@ -3,6 +3,7 @@
 #include "../../../Globals.h"
 #include "../../../State.h"
 #include "../FoveatedRender.h"
+#include "../VrSubmitDlssg.h"
 
 #include <dxgi.h>
 
@@ -18,6 +19,9 @@ namespace NeuralRendering::ARISE
 		static vr::EVRCompositorError thunk(RE::BSOpenVR* openVR, const vr::Texture_t* texture,
 			const vr::VRTextureBounds_t* bounds, vr::EVRSubmitFlags flags)
 		{
+			vr::EVRCompositorError ownedError = vr::VRCompositorError_None;
+			if (VrSubmitDlssg::TrySubmit(openVR, texture, bounds, flags, func, ownedError))
+				return ownedError;
 			auto& pipeline = Pipeline::Instance();
 			if (pipeline.IsEnabled() && texture) {
 				pipeline.Enqueue({

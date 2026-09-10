@@ -1,3 +1,4 @@
+// Destination pixels are N texel centers: (n + 0.5) * src/dst - 0.5.
 Texture2D<float4> SourceColor : register(t0);
 RWTexture2D<float4> DestinationColor : register(u0);
 

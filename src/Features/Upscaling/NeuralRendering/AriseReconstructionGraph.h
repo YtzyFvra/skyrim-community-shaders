@@ -29,22 +29,59 @@ namespace NeuralRendering
 			kFSR3,
 			kNIS,
 			kLanczos,
+			kMitchell,
+			kEasu,
+			kTent,
 		};
 
 		struct FusionParameters
 		{
-			float luma = 0.85f;
-			float chroma = 0.65f;
-			float edgeProtection = 0.25f;
-			float residualLimit = 0.16f;
-			std::uint32_t direction = 0;
-			std::uint32_t denoise = 1;
-			float denoiseStrength = 0.45f;
-			float softness = 0.35f;
-			float frequencyGuidance = 0.65f;
-			float depthGuidance = 0.75f;
-			std::uint32_t enhancedGuidance = 0;
-			float colorGuidance = 0.70f;
+			float detailLuma = 1.0f;
+			float detailChroma = 0.7f;
+			float rdEdgeFloor = 0.3f;
+			float regularization = 0.14f;
+			std::uint32_t compareMode = 0;
+			std::uint32_t debugView = 0;
+			float gainPrior = 1.0f;
+			float fitWindow = 0.2f;
+			float maxGain = 0.7f;
+			float depthGuidance = 0.65f;
+			float depthDilate = 1.0f;
+			float detailGain = 1.0f;
+			float toneGainLuma = 1.0f;
+			float toneGainChroma = 1.0f;
+			float ditherStrength = 1.0f;
+			std::uint32_t edgeBlockMode = 0;  ///< Unused; kept for CB layout.
+			float edgeBlockGThresh = 0.15f;
+			float edgeBlockSkip = 0.20f;
+			float edgeBlockDilateD = 0.0f;
+			float edgeBlockMix = 0.0f;
+		};
+
+		struct Act3Parameters
+		{
+			bool enabled = false;
+			float scale = 0.50f;
+			std::uint32_t cropX = 0;
+			std::uint32_t cropY = 0;
+			std::uint32_t cropWidth = 0;
+			std::uint32_t cropHeight = 0;
+			Tuning tuning{};
+			bool sharpen = false;
+			float sharpness = 1.0f;
+			bool resetEveryFrame = false;
+			float featherWidth = 64.0f;
+			float ditherStrength = 1.0f;
+			bool guidanceEnabled = false;
+			float guidanceLuma = 1.0f;
+			float guidanceChroma = 0.70f;
+			float guidancePrior = 1.0f;
+			float guidanceMaxGain = 0.70f;
+			float guidanceToneLuma = 1.0f;
+			float guidanceToneChroma = 1.0f;
+			float guidanceDetailGain = 1.0f;
+			float guidanceDither = 1.0f;
+			float guidanceDirSharpen = 0.0f;
 		};
 
 		struct Plan
@@ -63,6 +100,8 @@ namespace NeuralRendering
 			Act1Backend act1 = Act1Backend::kBypass;
 			Act2SrBackend act2Sr = Act2SrBackend::kLanczos;
 			bool fusionEnabled = false;
+			std::uint32_t act1Downsample = 0;
+			std::uint32_t act1DepthDownsample = 0;
 			std::uint32_t act1Quality = 1;
 			std::uint32_t act1Preset = 0;
 			std::uint32_t act2Quality = 1;
@@ -70,6 +109,7 @@ namespace NeuralRendering
 			AriseDlssProvider::CameraConstants act1Camera{};
 			AriseDlssProvider::CameraConstants act2Camera{};
 			FusionParameters fusion{};
+			Act3Parameters act3{};
 			Tuning tuning{};
 			float motionVectorScaleX = 1.0f;
 			float motionVectorScaleY = 1.0f;

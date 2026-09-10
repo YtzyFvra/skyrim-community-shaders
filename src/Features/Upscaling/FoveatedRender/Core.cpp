@@ -8,6 +8,7 @@
 #include "../FoveatedRender.h"
 #include "../NeuralRendering/Integration.h"
 
+#include <algorithm>
 #include <cstring>
 #include <mutex>
 
@@ -747,9 +748,18 @@ namespace FoveatedRenderImpl::Ops
 	void BlendSubrectToOutput(ID3D11Resource* dlssSrc, ID3D11Resource* dst, ID3D11UnorderedAccessView* dstUAV,
 		uint32_t dstOffsetX, uint32_t dstOffsetY, uint32_t subWidth, uint32_t subHeight, uint32_t srcOffsetX)
 	{
-		auto context = globals::d3d::context;
 		auto& foveated = globals::features::upscaling.foveatedRender;
-		auto blendMode = foveated.GetSubrectBlendMode();
+		BlendSubrectToOutput(dlssSrc, dst, dstUAV, dstOffsetX, dstOffsetY, subWidth, subHeight, srcOffsetX,
+			static_cast<uint32_t>(foveated.GetSubrectBlendMode()),
+			foveated.settings.subrectFeatherWidth, foveated.settings.subrectDitherStrength);
+	}
+
+	void BlendSubrectToOutput(ID3D11Resource* dlssSrc, ID3D11Resource* dst, ID3D11UnorderedAccessView* dstUAV,
+		uint32_t dstOffsetX, uint32_t dstOffsetY, uint32_t subWidth, uint32_t subHeight, uint32_t srcOffsetX,
+		uint32_t blendModeValue, float featherWidth, float ditherStrength)
+	{
+		auto context = globals::d3d::context;
+		const auto blendMode = static_cast<FoveatedRender::SubrectBlendMode>(std::min(blendModeValue, 3u));
 
 		// Fast path: hard copy (original behaviour)
 		if (blendMode == FoveatedRender::SubrectBlendMode::kHardCopy) {
@@ -789,8 +799,11 @@ namespace FoveatedRenderImpl::Ops
 			Util::SetResourceName(Core::vrSubrectBlendCB.get(), "FoveatedRender::SubrectBlendCB");
 		}
 
-		if (!Core::vrSubrectBlendCS || !Core::vrSubrectBlendCB)
+		if (!Core::vrSubrectBlendCS || !Core::vrSubrectBlendCB) {
+			D3D11_BOX srcBox = { srcOffsetX, 0, 0, srcOffsetX + subWidth, subHeight, 1 };
+			context->CopySubresourceRegion(dst, 0, dstOffsetX, dstOffsetY, 0, dlssSrc, 0, &srcBox);
 			return;
+		}
 
 		// Get or create cached SRV on the DLSS output
 		if (Core::vrBlendSrcSRVOwner != dlssSrc) {
@@ -820,7 +833,9 @@ namespace FoveatedRenderImpl::Ops
 		{
 			D3D11_MAPPED_SUBRESOURCE mapped;
 			if (FAILED(context->Map(Core::vrSubrectBlendCB.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
-				logger::error("[FOVEATED] BlendSubrectToOutput Map(vrSubrectBlendCB) failed; skipping dispatch");
+				logger::error("[FOVEATED] BlendSubrectToOutput Map(vrSubrectBlendCB) failed; hard-copying");
+				D3D11_BOX srcBox = { srcOffsetX, 0, 0, srcOffsetX + subWidth, subHeight, 1 };
+				context->CopySubresourceRegion(dst, 0, dstOffsetX, dstOffsetY, 0, dlssSrc, 0, &srcBox);
 				return;
 			}
 			BlendCB* cb = reinterpret_cast<BlendCB*>(mapped.pData);
@@ -828,9 +843,10 @@ namespace FoveatedRenderImpl::Ops
 			cb->DstOffsetY = dstOffsetY;
 			cb->SubWidth = subWidth;
 			cb->SubHeight = subHeight;
-			cb->BlendMode = (blendMode == FoveatedRender::SubrectBlendMode::kDither) ? 1 : 0;
-			cb->FeatherWidth = foveated.settings.subrectFeatherWidth;
-			cb->FrameIndex = globals::state->frameCount;
+			cb->BlendMode = blendMode == FoveatedRender::SubrectBlendMode::kInwardDither ? 2u :
+				(blendMode == FoveatedRender::SubrectBlendMode::kDither ? 1u : 0u);
+			cb->FeatherWidth = featherWidth;
+			cb->FrameIndex = globals::state ? globals::state->frameCount : 0;
 			cb->SrcOffsetX = srcOffsetX;
 			cb->DitherStrength = foveated.settings.subrectDitherStrength;
 			cb->MaskMode = static_cast<uint32_t>(foveated.GetSubrectMaskMode());

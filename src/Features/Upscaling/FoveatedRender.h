@@ -30,9 +30,11 @@
 struct FoveatedRender
 {
 	enum class FlatAct1Backend : uint { kBypass, kDLSS, kFSR3 };
-	enum class FlatAct2Backend : uint { kDLSS, kFSR3, kNIS, kFusion, kLanczos };
-	enum class FlatAct2SrBackend : uint { kDLSS, kFSR3, kNIS, kLanczos };
-	enum class ResampleFilter : uint { kLanczos, kStandard, kFootprint };
+	enum class FlatAct2Backend : uint { kDLSS, kFSR3, kNIS, kFusion, kLanczos, kMitchell, kEasu };
+	enum class FlatAct2SrBackend : uint { kDLSS, kFSR3, kNIS, kLanczos, kMitchell, kEasu, kTent };
+	enum class FusionReconstruct : uint { kTent, kMitchell, kEasu, kLanczos };
+	enum class ResampleFilter : uint { kLanczos, kTent, kFootprint };
+	enum class DepthResampleFilter : uint { kMin2x2, kTent, kLanczos };
 
 	struct Extent
 	{
@@ -45,11 +47,13 @@ struct FoveatedRender
 		bool act1Srss = true;
 		uint act1SrssQuality = 4;
 		uint act1SrssPreset = 4;
-		float guidanceScale = 1.23f;
-		uint act1Downsample = static_cast<uint>(ResampleFilter::kLanczos);
-		uint act2SrBackend = static_cast<uint>(FlatAct2SrBackend::kLanczos);
+		float guidanceScale = 1.5f;
+		uint act1Downsample = static_cast<uint>(ResampleFilter::kTent);
+		uint act1DepthDownsample = static_cast<uint>(DepthResampleFilter::kTent);
+		uint act2SrBackend = static_cast<uint>(FlatAct2SrBackend::kMitchell);
 		uint act2Upsample = static_cast<uint>(ResampleFilter::kLanczos);
 		bool fusionEnabled = true;
+		uint fusionReconstruct = static_cast<uint>(FusionReconstruct::kMitchell);
 	};
 
 	inline static constexpr Util::Settings::RestartTable<UnifiedPipelineSettings, 4> kUnifiedRestartFields{ {
@@ -80,7 +84,9 @@ struct FoveatedRender
 		FlatAct1Backend act1Backend = FlatAct1Backend::kBypass;
 		FlatAct2Backend act2Backend = FlatAct2Backend::kNIS;
 		FlatAct2SrBackend act2SrBackend = FlatAct2SrBackend::kNIS;
+		FusionReconstruct fusionReconstruct = FusionReconstruct::kMitchell;
 		ResampleFilter act1Downsample = ResampleFilter::kLanczos;
+		DepthResampleFilter act1DepthDownsample = DepthResampleFilter::kMin2x2;
 		ResampleFilter act2Upsample = ResampleFilter::kLanczos;
 		uint32_t act1Quality = 1;
 		uint32_t act1Preset = 0;
@@ -88,6 +94,7 @@ struct FoveatedRender
 		bool act1Dsr = false;
 		bool srss = false;
 		bool fusion = false;
+		bool act3Guidance = false;
 		bool sharpen = false;
 	};
 	// DLSS execution mode for VR
@@ -102,7 +109,8 @@ struct FoveatedRender
 	{
 		kHardCopy = 0,  // CopySubresourceRegion (no blending — sharp edge)
 		kFeather = 1,   // smoothstep alpha ramp over N pixels
-		kDither = 2,    // Blue-noise binary threshold in feather band
+		kDither = 2,            // Blue-noise binary threshold in feather band
+		kInwardDither = 3,      ///< ACT3: binary pick, inward src / outward dst.
 	};
 
 	// Composite mask shape only; the upscaler's input and output stay rectangular.
@@ -172,6 +180,7 @@ struct FoveatedRender
 		uint flatPipelineAct1Jitter = 0;
 		bool flatPipelineAct1Dsr = false;
 		float flatPipelineNrScale = 0.62f;
+		bool flatPipelineNrNative = false;  ///< N == D; skip NR downsample and ACT2 upsample.
 		uint flatPipelineAct2Backend = static_cast<uint>(FlatAct2Backend::kLanczos);
 		UnifiedPipelineSettings unifiedPipeline{};
 		uint flatPipelineAct2Preset = 0;
@@ -180,10 +189,10 @@ struct FoveatedRender
 		uint flatPipelineFusionDenoise = 1;
 		float flatPipelineFusionDenoiseStrength = 0.40f;
 		float flatPipelineFusionSoftness = 0.20f;
-		bool flatPipelineFusionEnhancedGuidance = true;
-		float flatPipelineFusionFrequencyGuidance = 0.45f;
+		bool flatPipelineFusionEnhancedGuidance = false;
+		float flatPipelineFusionFrequencyGuidance = 0.70f;
 		float flatPipelineFusionDepthGuidance = 0.65f;
-		float flatPipelineFusionColorGuidance = 0.70f;
+		float flatPipelineFusionColorGuidance = 0.45f;
 		bool flatPipelineSharpen = true;
 		float flatPipelineSharpness = 1.0f;
 		bool flatAct1Enabled = true;
@@ -210,11 +219,69 @@ struct FoveatedRender
 		uint neuralRenderingOutputMode = 0;
 		float neuralRenderingNisSharpness = 0.35f;
 		uint neuralRenderingFusionPreset = 4;
-		float neuralRenderingFusionLuma = 0.80f;
-		float neuralRenderingFusionChroma = 0.45f;
+		float neuralRenderingFusionLuma = 1.0f;
+		float neuralRenderingFusionChroma = 0.70f;
 		float neuralRenderingFusionEdgeProtection = 0.30f;
 		float neuralRenderingFusionResidualLimit = 0.14f;
+		float fusionDepthDilate = 1.0f;
+		float fusionGEdge = 0.45f;
+		float fusionNEdge = 0.40f;
+		float fusionEdgePower = 0.55f;
+		float fusionHfLumaSuppress = 0.80f;
+		float fusionHfTowardN = 0.50f;
+		float fusionNcDilate = 1.0f;
+		float fusionAlignG = 1.0f;
+		uint fusionCompareMode = 0;     ///< 0 fitted gain, 1 force a=1, 2 split fitted|1, 3 split 1|fitted.
+		uint fusionDebugView = 0;       ///< 0 off … 6 RD, 7 energy-gap w, 8 unused, 9 ρ².
+		float fusionToneGainLuma = 1.0f;
+		float fusionToneGainChroma = 1.0f;
+		float fusionDetailGain = 1.0f;
+		float fusionDither = 1.0f;
+		float fusionGainPrior = 1.0f;   ///< Gain where NR's input carried no variance: 1 trusts G, 0 trusts NR's silence.
+		bool fusionWedge = false;                 ///< Truncate the ACT2 4x4 on G∩RD (and optional G∩N) lines.
+		bool fusionWedgeConstCount = false;       ///< After the cut, keep gathering until 4 same-side taps.
+		float fusionEdgeBlockGThresh = 0.15f;     ///< G∩R detection inside the RD mask; low = more hard lines.
+		float fusionFitSideSigma = 0.20f;         ///< 6.2 luma proximity σ for same-side regression.
+		float fusionDirectionalSharpen = 0.0f;    ///< Unsharp E_hf along the G gradient; 0 is off.
+		float fusionSoftEdge = 0.0f;              ///< G∩N soft-line range weights; 0 is off.
+		bool act3Enabled = false;                 ///< Second NR on a fixed center crop of D after RCAS.
+		float act3Scale = 0.50f;                  ///< Center crop as a fraction of the full D texture; 0–0.9.
+		uint act3Preset = 0;
+		float act3Intensity = 2.0f;
+		float act3LocalTone = 2.0f;
+		float act3LocalStructure = 2.0f;
+		float act3SkinStructure = 2.0f;
+		uint act3Style = 0;
+		bool act3AutoMask = true;
+		bool act3UICorrection = false;
+		bool act3ResetEveryFrame = false;
+		bool act3Sharpen = false;                 ///< Fullscreen RCAS after the crop is written back.
+		float act3Sharpness = 1.0f;
+		float act3FeatherWidth = 64.0f;           ///< KIT dither band in pixels at the crop edge.
+		float act3DitherStrength = 1.0f;          ///< Noise amplitude in that band; 1 matches KIT VR.
+		bool act3GuidanceEnabled = false;         ///< ACT2 Guidance partition on the ACT3 crop.
+		float act3GuidanceLuma = 1.0f;
+		float act3GuidanceChroma = 0.70f;
+		float act3GuidancePrior = 1.0f;
+		float act3GuidanceMaxGain = 0.70f;
+		float act3GuidanceToneLuma = 1.0f;
+		float act3GuidanceToneChroma = 1.0f;
+		float act3GuidanceDetailGain = 1.0f;
+		float act3GuidanceDither = 1.0f;
+		float act3GuidanceDirSharpen = 0.0f;
 	};
+
+	struct Act3Crop
+	{
+		uint32_t x = 0;
+		uint32_t y = 0;
+		uint32_t width = 0;
+		uint32_t height = 0;
+		[[nodiscard]] bool Valid() const { return width >= 8 && height >= 8; }
+	};
+
+	/** @brief Fixed-center crop; scale is the fraction of the full texture (0–0.9). */
+	static Act3Crop MakeAct3Crop(uint32_t displayWidth, uint32_t displayHeight, float scale);
 
 	inline static constexpr Util::Settings::RestartTable<Settings, 5> kRestartFields{ {
 		UTIL_RESTART_FIELD(Settings, enabled, "Foveated DLSS"),
@@ -403,9 +470,11 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	act1SrssPreset,
 	guidanceScale,
 	act1Downsample,
+	act1DepthDownsample,
 	act2SrBackend,
 	act2Upsample,
-	fusionEnabled);
+	fusionEnabled,
+	fusionReconstruct);
 
 // Settings has 65 fields; nlohmann's NON_INTRUSIVE macros cap at 64.
 void to_json(nlohmann::json& j, const FoveatedRender::Settings& s);

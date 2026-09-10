@@ -694,10 +694,10 @@ void Upscaling::DrawDlssModelControls()
 
 void Upscaling::DrawFrameGenerationSettings()
 {
-	if (globals::game::isVR)
-		return;
-
 	if (ImGui::TreeNodeEx(T(TKEY("frame_generation"), "Frame Generation"), ImGuiTreeNodeFlags_DefaultOpen)) {
+		if (globals::game::isVR)
+			ImGui::TextWrapped("%s", T(TKEY("frame_generation_vr_submit"),
+				"VR DLSS-G is single-thread: we own BSOpenVR::Submit, Present a hidden full-eye chain, then Submit. Center-only FG comes later."));
 		ImGui::Text("%s", T(TKEY("frame_generation_desc"),
 							  "Frame Generation interpolates real frames with generated ones for a smoother experience"));
 
@@ -728,7 +728,7 @@ void Upscaling::DrawFrameGenerationSettings()
 									  "AMD FSR Frame Generation is available."));
 		}
 
-		if (streamlineDX12.featureDLSSG) {
+		if (!globals::game::isVR && streamlineDX12.featureDLSSG) {
 			ImGui::Checkbox(T(TKEY("prefer_fsr_frame_gen"), "Prefer AMD FSR Frame Generation"), &settings.preferFSRFrameGen);
 			Util::UI::RestartGatedAnnotate(bootSnapshot, settings, &Settings::preferFSRFrameGen,
 				T(TKEY("prefer_fsr_frame_gen_tooltip"),
@@ -748,10 +748,10 @@ void Upscaling::DrawFrameGenerationSettings()
 			ImGui::Text("%s", T(TKEY("fsr_frame_gen_fixed_multiplier"), "AMD FSR Frame Generation: Fixed 2x"));
 		}
 
-		ImGui::Text("%s", T(TKEY("frame_generation_proxy_note"), "Requires a D3D11 to D3D12 proxy which can create compatibility issues"));
-
-		if (!isWindowed) {
-			Util::Text::Warning(T(TKEY("fg_warn_windowed"), "Warning: Requires windowed mode"));
+		if (!globals::game::isVR) {
+			ImGui::Text("%s", T(TKEY("frame_generation_proxy_note"), "Requires a D3D11 to D3D12 proxy which can create compatibility issues"));
+			if (!isWindowed)
+				Util::Text::Warning(T(TKEY("fg_warn_windowed"), "Warning: Requires windowed mode"));
 		}
 
 		if (lowRefreshRate && !settings.frameGenerationForceEnable) {
@@ -876,6 +876,19 @@ void Upscaling::DrawReflexSettings()
 		ImGui::EndDisabled();
 
 	ImGui::TreePop();
+}
+
+void Upscaling::DrawFinalSharpenSettings()
+{
+	ImGui::Separator();
+	ImGui::TextUnformatted(T(TKEY("final_sharpen"), "Final Sharpen"));
+	ImGui::Checkbox(T(TKEY("rcas_enable"), "Enable RCAS"), &foveatedRender.settings.flatPipelineSharpen);
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::Text("%s", T(TKEY("rcas_independent_tooltip"),
+			"Sharpens Display D after Guidance, or after ACT2 when Guidance is off, or after ACT1 when Neural Rendering is off."));
+	}
+	if (foveatedRender.settings.flatPipelineSharpen)
+		ImGui::SliderFloat(T(TKEY("rcas_sharpness"), "RCAS Sharpness"), &foveatedRender.settings.flatPipelineSharpness, 0.0f, 1.0f, "%.2f");
 }
 
 void Upscaling::DrawSettings()
@@ -2548,7 +2561,9 @@ double Upscaling::GetRefreshRate(HWND a_window)
 
 bool Upscaling::IsFrameGenerationDx12PathActive() const
 {
-	return d3d12SwapChainActive && !globals::game::isVR;
+	if (globals::game::isVR)
+		return dx12SwapChain.useDLSSG && !dx12SwapChain.useArise;
+	return d3d12SwapChainActive;
 }
 
 bool Upscaling::IsFrameGenerationActive() const
@@ -2664,6 +2679,11 @@ bool Upscaling::HasFrameGenModule() const
 
 Upscaling::FrameGenMethod Upscaling::GetFrameGenMethod() const
 {
+	if (globals::game::isVR) {
+		if (UsesDLSSGFrameGen())
+			return FrameGenMethod::kDLSSG;
+		return FrameGenMethod::kNone;
+	}
 	if (!d3d12SwapChainActive)
 		return FrameGenMethod::kNone;
 	if (dx12SwapChain.useDLSSG)
@@ -2675,6 +2695,8 @@ Upscaling::FrameGenMethod Upscaling::GetFrameGenMethod() const
 
 bool Upscaling::UsesDLSSGFrameGen() const
 {
+	if (globals::game::isVR)
+		return dx12SwapChain.useDLSSG && !dx12SwapChain.useArise;
 	return d3d12SwapChainActive && dx12SwapChain.useDLSSG;
 }
 
@@ -2685,6 +2707,20 @@ bool Upscaling::IsFlatDlssPostInjectActive() const
 	return !globals::game::isVR && GetUpscaleMethod() == UpscaleMethod::kDLSS &&
 		foveatedRender.settings.neuralRenderingEnabled &&
 		!IsFrameGenerationConfiguredForSession() && !hdrConfigured;
+}
+
+bool Upscaling::IsVrDlssPostInjectActive() const
+{
+	if (!globals::game::isVR || !perfMode.IsHookActive())
+		return false;
+	if (GetUpscaleMethod() != UpscaleMethod::kDLSS)
+		return false;
+	if (!foveatedRender.settings.neuralRenderingEnabled)
+		return false;
+	if (!perfMode.GetRenderEyeWidth() || !perfMode.GetRenderEyeHeight() ||
+		!perfMode.GetDisplayEyeWidth() || !perfMode.GetDisplayEyeHeight())
+		return false;
+	return true;
 }
 
 bool Upscaling::IsFlatAct1BypassActive() const
@@ -2712,7 +2748,37 @@ json Upscaling::GetDiagnostics()
 	                                                                   "None";
 	diagnostics["frameGenActive"] = IsFrameGenerationActive();
 	diagnostics["frameGenMultiplier"] = GetFrameGenerationMultiplier();
-	if (!globals::game::isVR) {
+	if (globals::game::isVR) {
+		const auto& cropUV = foveatedRender.subrectController.GetUV();
+		const uint32_t cropInW = std::max(1u, static_cast<uint32_t>(perfMode.GetRenderEyeWidth() * cropUV.w));
+		const uint32_t cropInH = std::max(1u, static_cast<uint32_t>(perfMode.GetRenderEyeHeight() * cropUV.h));
+		const uint32_t cropOutW = std::max(1u, static_cast<uint32_t>(perfMode.GetDisplayEyeWidth() * cropUV.w));
+		const uint32_t cropOutH = std::max(1u, static_cast<uint32_t>(perfMode.GetDisplayEyeHeight() * cropUV.h));
+		const auto plan = foveatedRender.BuildFlatPipelinePlan(cropOutW, cropOutH, cropInW, cropInH);
+		diagnostics["vrSixPass"] = {
+			{ "injectPoint", "BeforeUIComposite" },
+			{ "postInjectActive", IsVrDlssPostInjectActive() },
+			{ "centerCrop", !cropUV.IsFullEye() },
+			{ "cropU", cropUV.x },
+			{ "cropV", cropUV.y },
+			{ "cropW", cropUV.w },
+			{ "cropH", cropUV.h },
+			{ "cropRenderWidth", cropInW },
+			{ "cropRenderHeight", cropInH },
+			{ "cropDisplayWidth", cropOutW },
+			{ "cropDisplayHeight", cropOutH },
+			{ "nrEnabled", foveatedRender.settings.neuralRenderingEnabled },
+			{ "renderEyeWidth", perfMode.GetRenderEyeWidth() },
+			{ "renderEyeHeight", perfMode.GetRenderEyeHeight() },
+			{ "displayEyeWidth", perfMode.GetDisplayEyeWidth() },
+			{ "displayEyeHeight", perfMode.GetDisplayEyeHeight() },
+			{ "nrWidth", plan.nrWidth },
+			{ "nrHeight", plan.nrHeight },
+			{ "act1OutputWidth", plan.act1OutputWidth },
+			{ "act1OutputHeight", plan.act1OutputHeight },
+			{ "submitDlssg", UsesDLSSGFrameGen() },
+		};
+	} else {
 		const auto& nr = foveatedRender.settings;
 		const bool model3 = dx12SwapChain.useArise;
 		const uint32_t displayWidth = model3 ? dx12SwapChain.PhysicalWidth() :
@@ -2729,7 +2795,9 @@ json Upscaling::GetDiagnostics()
 			{ "act1Mode", act1Mode },
 			{ "act2Mode", act2Mode },
 			{ "nrEnabled", nr.neuralRenderingEnabled },
-			{ "nrScale", nr.flatPipelineNrScale },
+			{ "nrNative", nr.flatPipelineNrNative },
+			{ "nrScale", nr.flatPipelineNrNative ? 1.0f : nr.flatPipelineNrScale },
+			{ "fusionReconstruct", std::string(magic_enum::enum_name(plan.fusionReconstruct)) },
 			{ "nrWidth", plan.nrWidth },
 			{ "nrHeight", plan.nrHeight },
 			{ "renderWidth", lastDlssRenderWidth },
@@ -2997,7 +3065,7 @@ void Upscaling::Upscale()
 				streamline.DestroyDLSSResources();
 			}
 
-			if (IsFlatDlssPostInjectActive() || IsFlatAct1BypassActive())
+			if (IsDlssPostInjectActive() || IsFlatAct1BypassActive())
 				return;
 
 			const bool routeHandled = tryFoveatedRoute(
@@ -3032,7 +3100,7 @@ void Upscaling::PerformUpscaling()
 	const bool renderDocCompatibility = dx12SwapChain.IsRenderDocCompatibility();
 	if (!renderDocCompatibility)
 		Upscale();
-	if (!renderDocCompatibility && !IsFlatDlssPostInjectActive() && !IsFlatAct1BypassActive())
+	if (!renderDocCompatibility && !IsDlssPostInjectActive() && !IsFlatAct1BypassActive())
 		UpscaleDepth();
 
 	auto& runtimeData = globals::game::graphicsState->GetRuntimeData();
@@ -3439,7 +3507,7 @@ void Upscaling::Main_PostProcessing::thunk(RE::ImageSpaceManager* a_this, uint32
 	}
 
 	if (!upscaling.dx12SwapChain.IsRenderDocCompatibility() &&
-		upscaleMethod == UpscaleMethod::kDLSS && !upscaling.IsFlatDlssPostInjectActive() &&
+		upscaleMethod == UpscaleMethod::kDLSS && !upscaling.IsDlssPostInjectActive() &&
 		!upscaling.IsFlatAct1BypassActive() &&
 		(globals::game::isVR || !upscaling.foveatedRender.settings.neuralRenderingEnabled)) {
 		// FoveatedRender's DLSS output doesn't land in sharpenerTexture the
@@ -3479,7 +3547,8 @@ void Upscaling::Main_PostProcessing::thunk(RE::ImageSpaceManager* a_this, uint32
 	const bool upscalerWritesTestTexture =
 		upscaleMethod == UpscaleMethod::kDLSS ||
 		upscaleMethod == UpscaleMethod::kFSR;
-	if (upscalerWritesTestTexture && globals::features::upscaling.perfMode.ShouldHandlePost()) {
+	if (upscalerWritesTestTexture && globals::features::upscaling.perfMode.ShouldHandlePost() &&
+		!globals::features::upscaling.IsVrDlssPostInjectActive()) {
 		globals::features::upscaling.perfMode.HandlePostProcessing([&]() {
 			func(a_this, a3, a_target, a_4, a_5);
 		});

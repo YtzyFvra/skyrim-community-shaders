@@ -12,6 +12,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
@@ -252,6 +253,12 @@ public:
 	void ApplyLogicalRenderExtents() const;
 	[[nodiscard]] bool IsRenderDocCompatibility() const { return ariseRenderDocCompatibility; }
 	[[nodiscard]] bool IsAriseAsyncTail() const { return ariseAsyncTail; }
+	/**
+	 * @brief Reconstructed Display D + UI after the Tail graph (not the DXGI backbuffer).
+	 * @param holder Keeps the D3D11 texture alive for the caller.
+	 * @param waitForIdle When true, drains in-flight Tail work before the D3D11 copy.
+	 */
+	ID3D11Texture2D* GetScreenshotComposite(winrt::com_ptr<ID3D11Texture2D>& holder, bool waitForIdle);
 
 private:
 	enum class AriseSlotState : std::uint8_t
@@ -289,6 +296,8 @@ private:
 	bool RecordAriseComposite(ArisePresentSlot& slot, ID3D12Resource* scene,
 		ID3D12Resource* physicalBuffer, UINT backBufferIndex);
 	bool SealAriseCapture(ArisePresentSlot& slot, std::uint64_t presentFrameId);
+	void ResetScreenshotComposite();
+	bool RecordScreenshotComposite(ID3D12GraphicsCommandList* commandList);
 	bool WaitForAriseTail(UINT64 value);
 	bool WaitForAriseIdle();
 	void ReapAriseSlotsLocked();
@@ -308,6 +317,8 @@ private:
 	winrt::com_ptr<ID3D11Fence> ariseEngineFence11;
 	winrt::com_ptr<ID3D12Fence> ariseEngineFence12;
 	winrt::com_ptr<ID3D12Fence> ariseTailFence12;
+	winrt::com_ptr<ID3D11Fence> ariseTailFence11;
+	std::unique_ptr<WrappedResource> ariseScreenshotComposite;
 	mutable std::mutex ariseMutex;
 	std::condition_variable ariseCondition;
 	std::timed_mutex arisePhysicalPresentMutex;

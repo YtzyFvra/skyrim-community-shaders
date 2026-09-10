@@ -290,12 +290,13 @@ namespace NeuralRendering
 		bool ExecuteModel3(ID3D12GraphicsCommandList* commandList, ID3D12Resource* color,
 			ID3D12Resource* depth, ID3D12Resource* motionVectors, ID3D12Resource* output,
 			std::uint32_t width, std::uint32_t height,
-			float motionVectorScaleX, float motionVectorScaleY, const Tuning& tuning, bool reset)
+			float motionVectorScaleX, float motionVectorScaleY, const Tuning& tuning, bool reset,
+			std::uint32_t slot)
 		{
 			std::scoped_lock lock(submissionMutex);
-			if (!model3Device || runtime.Status() != RuntimeStatus::Initialized)
+			if (!model3Device || runtime.Status() != RuntimeStatus::Initialized || slot >= 2)
 				return false;
-			return runtime.Execute(commandList, 0, color, depth, motionVectors, output,
+			return runtime.Execute(commandList, slot, color, depth, motionVectors, output,
 				width, height, width, height, width, height,
 				motionVectorScaleX, motionVectorScaleY, tuning, reset);
 		}
@@ -306,6 +307,7 @@ namespace NeuralRendering
 			if (!model3Device)
 				return;
 			runtime.ResetFeature(0);
+			runtime.ResetFeature(1);
 			runtime.Shutdown();
 			model3Device = nullptr;
 			model3DrainOwner = {};
@@ -715,10 +717,11 @@ namespace NeuralRendering
 	bool Renderer::ExecuteModel3(ID3D12GraphicsCommandList* commandList, ID3D12Resource* color,
 		ID3D12Resource* depth, ID3D12Resource* motionVectors, ID3D12Resource* output,
 		std::uint32_t width, std::uint32_t height,
-		float motionVectorScaleX, float motionVectorScaleY, const Tuning& tuning, bool reset)
+		float motionVectorScaleX, float motionVectorScaleY, const Tuning& tuning, bool reset,
+		std::uint32_t slot)
 	{
 		return state_->ExecuteModel3(commandList, color, depth, motionVectors, output, width, height,
-			motionVectorScaleX, motionVectorScaleY, tuning, reset);
+			motionVectorScaleX, motionVectorScaleY, tuning, reset, slot);
 	}
 	void Renderer::ResetModel3() { state_->ResetModel3(); }
 

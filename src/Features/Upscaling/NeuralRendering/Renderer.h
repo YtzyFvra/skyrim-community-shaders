@@ -61,7 +61,8 @@ namespace NeuralRendering
 		bool ExecuteModel3(ID3D12GraphicsCommandList* commandList, ID3D12Resource* color,
 			ID3D12Resource* depth, ID3D12Resource* motionVectors, ID3D12Resource* output,
 			std::uint32_t width, std::uint32_t height,
-			float motionVectorScaleX, float motionVectorScaleY, const Tuning& tuning, bool reset);
+			float motionVectorScaleX, float motionVectorScaleY, const Tuning& tuning, bool reset,
+			std::uint32_t slot = 0);
 		/** @brief Shuts down Model 3 after its owner has drained all submitted GPU work. */
 		void ResetModel3();
 		void Reset();

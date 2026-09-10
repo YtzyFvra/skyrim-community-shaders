@@ -48,6 +48,7 @@ namespace
 		to.flatPipelineAct1Jitter = from.flatPipelineAct1Jitter;
 		to.flatPipelineAct1Dsr = from.flatPipelineAct1Dsr;
 		to.flatPipelineNrScale = from.flatPipelineNrScale;
+		to.flatPipelineNrNative = from.flatPipelineNrNative;
 		to.flatPipelineAct2Backend = from.flatPipelineAct2Backend;
 		to.unifiedPipeline = from.unifiedPipeline;
 		to.flatPipelineAct2Preset = from.flatPipelineAct2Preset;
@@ -145,7 +146,7 @@ namespace
 		s.flatPipelineFusionDenoise = 1;
 		s.flatPipelineFusionDenoiseStrength = 0.40f;
 		s.flatPipelineFusionSoftness = 0.20f;
-		s.flatPipelineFusionEnhancedGuidance = true;
+		s.flatPipelineFusionEnhancedGuidance = false;
 		s.flatPipelineFusionFrequencyGuidance = 0.45f;
 		s.flatPipelineFusionDepthGuidance = 0.65f;
 		s.flatPipelineFusionColorGuidance = 0.70f;
@@ -161,7 +162,7 @@ namespace
 		s.unifiedPipeline.act1Srss = true;
 		s.unifiedPipeline.act1SrssQuality = 4;
 		s.unifiedPipeline.act1SrssPreset = 4;
-		s.unifiedPipeline.guidanceScale = 1.23f;
+		s.unifiedPipeline.guidanceScale = 1.5f;
 		s.flatPipelineNrScale = 0.62f;
 		s.unifiedPipeline.fusionEnabled = true;
 		ApplyFusionDetail(s);
@@ -175,7 +176,8 @@ namespace
 		s.unifiedPipeline.act1SrssPreset = 4;
 		s.unifiedPipeline.guidanceScale = 2.0f;
 		s.flatPipelineNrScale = 0.95f;
-		s.unifiedPipeline.fusionEnabled = false;
+		s.unifiedPipeline.fusionEnabled = true;
+		s.unifiedPipeline.fusionReconstruct = static_cast<uint>(FoveatedRender::FusionReconstruct::kMitchell);
 	}
 
 	uint ClassifyReconstructionPreset(const FoveatedRender::Settings& s)
@@ -183,12 +185,13 @@ namespace
 		const bool srss = s.unifiedPipeline.act1Srss &&
 			s.unifiedPipeline.act1SrssQuality == 4 &&
 			s.unifiedPipeline.act1SrssPreset == 4;
-		if (srss && Near(s.unifiedPipeline.guidanceScale, 1.23f) &&
-			Near(s.flatPipelineNrScale, 0.62f) && s.unifiedPipeline.fusionEnabled &&
+		if (srss && !s.flatPipelineNrNative && Near(s.unifiedPipeline.guidanceScale, 1.5f) &&
+			Near(s.flatPipelineNrScale, 0.62f) &&
+			!s.flatPipelineFusionEnhancedGuidance &&
 			s.neuralRenderingFusionPreset == 4)
 			return 0;
-		if (srss && Near(s.unifiedPipeline.guidanceScale, 2.0f) &&
-			Near(s.flatPipelineNrScale, 0.95f) && !s.unifiedPipeline.fusionEnabled)
+		if (srss && !s.flatPipelineNrNative && Near(s.unifiedPipeline.guidanceScale, 2.0f) &&
+			Near(s.flatPipelineNrScale, 0.95f))
 			return 1;
 		return 2;
 	}
@@ -240,6 +243,8 @@ void DLSSBooster::RestoreDefaultSettings()
 {
 	const bool wasOverride = settings.overrideEnabled;
 	settings = {};
+	ApplyConservativePreset(settings.reconstruction);
+	settings.reconstructionPreset = 0;
 	if (wasOverride)
 		PushToRuntime();
 }

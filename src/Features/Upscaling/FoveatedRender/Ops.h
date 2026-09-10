@@ -76,9 +76,12 @@ namespace FoveatedRenderImpl::Ops
 
 	// Blend a DLSS subrect output onto the destination at (offsetX, offsetY).
 	// kHardCopy fast-paths to CopySubresourceRegion; Feather/Dither dispatch
-	// SubrectBlendCS into dstUAV.
+	// SubrectBlendCS into dstUAV. The 8-argument form reads VR Edge Blend settings.
 	void BlendSubrectToOutput(ID3D11Resource* dlssSrc, ID3D11Resource* dst, ID3D11UnorderedAccessView* dstUAV,
 		uint32_t dstOffsetX, uint32_t dstOffsetY, uint32_t subWidth, uint32_t subHeight, uint32_t srcOffsetX = 0);
+	void BlendSubrectToOutput(ID3D11Resource* dlssSrc, ID3D11Resource* dst, ID3D11UnorderedAccessView* dstUAV,
+		uint32_t dstOffsetX, uint32_t dstOffsetY, uint32_t subWidth, uint32_t subHeight, uint32_t srcOffsetX,
+		uint32_t blendMode, float featherWidth, float ditherStrength);
 
 	// Hash of per-eye UVs + mode for change detection (forces SL DLSS resource
 	// recreation). Both eyes are mixed in so asymmetric presets — e.g. Nasal

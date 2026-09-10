@@ -355,6 +355,7 @@ namespace
 
 	// Picks the capture source:
 	//   VR                 -> kTOTAL (final SBS composite submitted to the HMD).
+	//   Flat Model 3       -> reconstructed Display D + UI (not the DXGI backbuffer).
 	//   HDR + CS menu open -> clean HDR composite (no UI, no menu blur).
 	//   HDR enabled        -> swap-chain back buffer after ApplyHDR (PQ HDR10 / PQ float).
 	//   Flat SDR           -> kFRAMEBUFFER (tonemapped UNORM).
@@ -377,6 +378,13 @@ namespace
 			src.texture = ResolveSlotTexture(slot, holder);
 			src.srv = Util::AsReal(slot.SRV);
 			src.description = "kVR_FRAMEBUFFER (VR final composite)";
+			return src;
+		}
+
+		if (globals::features::upscaling.dx12SwapChain.useArise) {
+			src.texture = globals::features::upscaling.dx12SwapChain.GetScreenshotComposite(holder, forCapture);
+			src.needsPreviewCache = true;
+			src.description = "ARISE Display D + UI";
 			return src;
 		}
 

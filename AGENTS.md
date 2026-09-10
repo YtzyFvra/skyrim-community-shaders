@@ -119,7 +119,9 @@ Each rule is stated once, in the section named in brackets.
 -   **New feature:** start from `docs/new-feature-template/`, inherit `Feature` (`DrawSettings()`, `LoadSettings()`, `SaveSettings()`, rendering hooks), and register in `globals::features`.
 -   **Fast iteration:** use `Dev-Fast` for C++-only changes, the `CommunityShaders` target alone under a `*-WITH-AUTO-DEPLOYMENT` preset for a DLL-only deploy, `COPY_SHADERS` for shader-only; use a separate build directory or worktree per branch for A/B testing. Details: [Shader Development Workflow](docs/development/shader-workflow.md#fast-iteration-without-paying-a-full-shader-recompile).
 -   **Flat ARISE menus:** Title/loading blit and Map logical-target scope only. ESC/TAB stay unpatched. Do not blit `kMENUBG` on pause or install a global viewport hook — see [Flat ARISE Menu Extents](docs/development/flat-arise-menu.md). Working notes (git-excluded): `开发说明/OSDLSSNR/`.
--   More: [VSCode Setup](docs/development/vscode-setup.md), [Development README](docs/development/README.md), [Shader Development Workflow](docs/development/shader-workflow.md), [In-game A/B Testing](docs/development/shader-runtime-ab.md).
+-   **Flat ARISE menus:** Title/loading blit and Map logical-target scope only. ESC/TAB stay unpatched. Do not blit `kMENUBG` on pause or install a global viewport hook — see [Flat ARISE Menu Extents](docs/development/flat-arise-menu.md). Working notes (git-excluded): `开发说明/OSDLSSNR/`.
+-   **VR six-pass:** When PerfMode + DLSS + NR are on, run the same R→G→N→D graph on the foveated center (PostInject DLSS extents) before UI and write `kTOTAL`; periphery stretch. Do not flip `useArise` on VR. Single-thread DLSS-G owns `BSOpenVR::Submit` via a hidden full-eye chain. ARISE / DX12 Tail / physical DXGI Present stay flat-only.
+-   _For detailed setup, options, and commands, see [VSCode Setup](docs/development/vscode-setup.md), [Development README](docs/development/README.md), [Shader Development Workflow](docs/development/shader-workflow.md), [In-game A/B Testing](docs/development/shader-runtime-ab.md), and [Repository Architecture](docs/development/architecture.md)._
 
 ---
 

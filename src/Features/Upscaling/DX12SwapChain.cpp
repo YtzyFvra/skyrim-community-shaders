@@ -205,17 +205,26 @@ void DX12SwapChain::CreateSwapChainDirect(IDXGIAdapter* adapter, DXGI_SWAP_CHAIN
 	DXGI_FORMAT negotiatedFormat = DXGI_FORMAT_R10G10B10A2_UNORM;
 	bool fallbackUsed = false;
 
-	D3D12_FEATURE_DATA_FORMAT_SUPPORT formatSupport = { DXGI_FORMAT_R10G10B10A2_UNORM, D3D12_FORMAT_SUPPORT1_RENDER_TARGET, D3D12_FORMAT_SUPPORT2_NONE };
-	if (SUCCEEDED(d3d12Device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &formatSupport, sizeof(formatSupport)))) {
-		if ((formatSupport.Support1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET) == 0) {
-			logger::warn("[DX12SwapChain] R10G10B10A2_UNORM not supported as render target, falling back to R8G8B8A8_UNORM");
+	if (globals::game::isVR) {
+		negotiatedFormat = a_swapChainDesc.BufferDesc.Format;
+		if (negotiatedFormat == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)
+			negotiatedFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+		else if (negotiatedFormat == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB)
+			negotiatedFormat = DXGI_FORMAT_B8G8R8A8_UNORM;
+		fallbackUsed = true;
+	} else {
+		D3D12_FEATURE_DATA_FORMAT_SUPPORT formatSupport = { DXGI_FORMAT_R10G10B10A2_UNORM, D3D12_FORMAT_SUPPORT1_RENDER_TARGET, D3D12_FORMAT_SUPPORT2_NONE };
+		if (SUCCEEDED(d3d12Device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &formatSupport, sizeof(formatSupport)))) {
+			if ((formatSupport.Support1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET) == 0) {
+				logger::warn("[DX12SwapChain] R10G10B10A2_UNORM not supported as render target, falling back to R8G8B8A8_UNORM");
+				negotiatedFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+				fallbackUsed = true;
+			}
+		} else {
+			logger::warn("[DX12SwapChain] CheckFeatureSupport failed for R10G10B10A2_UNORM, falling back to R8G8B8A8_UNORM");
 			negotiatedFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
 			fallbackUsed = true;
 		}
-	} else {
-		logger::warn("[DX12SwapChain] CheckFeatureSupport failed for R10G10B10A2_UNORM, falling back to R8G8B8A8_UNORM");
-		negotiatedFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
-		fallbackUsed = true;
 	}
 
 	logger::info("[DX12SwapChain] Direct swap chain format negotiation: attempted={}, negotiated={}, fallback={}",
@@ -393,6 +402,7 @@ void DX12SwapChain::CreateArisePresentResources()
 		ariseEngineFence11 = nullptr;
 		ariseEngineFence12 = nullptr;
 		ariseTailFence12 = nullptr;
+		ResetScreenshotComposite();
 	};
 	try {
 		ariseTailNrAvailable.store(false, std::memory_order_release);
@@ -403,7 +413,14 @@ void DX12SwapChain::CreateArisePresentResources()
 		const HRESULT openFenceResult = d3d11Device->OpenSharedFence(sharedFenceHandle, IID_PPV_ARGS(ariseEngineFence11.put()));
 		CloseHandle(sharedFenceHandle);
 		DX::ThrowIfFailed(openFenceResult);
-		DX::ThrowIfFailed(d3d12Device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(ariseTailFence12.put())));
+		DX::ThrowIfFailed(d3d12Device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(ariseTailFence12.put())));
+		HANDLE sharedTailFenceHandle = nullptr;
+		DX::ThrowIfFailed(d3d12Device->CreateSharedHandle(
+			ariseTailFence12.get(), nullptr, GENERIC_ALL, nullptr, &sharedTailFenceHandle));
+		const HRESULT openTailFenceResult = d3d11Device->OpenSharedFence(
+			sharedTailFenceHandle, IID_PPV_ARGS(ariseTailFence11.put()));
+		CloseHandle(sharedTailFenceHandle);
+		DX::ThrowIfFailed(openTailFenceResult);
 		ariseEngineValue = 0;
 		ariseTailValue = 0;
 
@@ -438,6 +455,20 @@ void DX12SwapChain::CreateArisePresentResources()
 			slot.engineReady = 0;
 			slot.tailDone = 0;
 		}
+		D3D11_TEXTURE2D_DESC screenshotDesc{};
+		screenshotDesc.Width = swapChainDesc.Width;
+		screenshotDesc.Height = swapChainDesc.Height;
+		screenshotDesc.MipLevels = 1;
+		screenshotDesc.ArraySize = 1;
+		screenshotDesc.Format = swapChainDesc.Format;
+		screenshotDesc.SampleDesc.Count = 1;
+		screenshotDesc.Usage = D3D11_USAGE_DEFAULT;
+		screenshotDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+		ariseScreenshotComposite = std::make_unique<WrappedResource>(screenshotDesc, d3d11Device.get(),
+			d3d12Device.get(), "ARISE::ScreenshotComposite");
+		const float screenshotClear[4]{};
+		if (ariseScreenshotComposite->rtv)
+			d3d11Context->ClearRenderTargetView(ariseScreenshotComposite->rtv, screenshotClear);
 		DX::ThrowIfFailed(CreateAriseCompositeResources());
 		const bool graphReady = ariseReconstructionGraph.Initialize(
 			d3d12Device.get(), swapChainDesc.Format, kAriseSlotCount,
@@ -570,7 +601,7 @@ HRESULT DX12SwapChain::CreateAriseCompositeResources()
 		return fail(result);
 	D3D12_DESCRIPTOR_HEAP_DESC rtvHeapDesc{};
 	rtvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-	rtvHeapDesc.NumDescriptors = swapChainDesc.BufferCount + kAriseSlotCount;
+		rtvHeapDesc.NumDescriptors = swapChainDesc.BufferCount + kAriseSlotCount + 1;
 	result = d3d12Device->CreateDescriptorHeap(&rtvHeapDesc,
 		IID_PPV_ARGS(ariseCompositeRtvHeap.put()));
 	if (FAILED(result))
@@ -599,6 +630,9 @@ HRESULT DX12SwapChain::CreateAriseCompositeResources()
 		d3d12Device->CreateRenderTargetView(slot.displayUI->resource.get(), nullptr, rtvHandle);
 		rtvHandle.ptr += rtvStride;
 	}
+	if (!ariseScreenshotComposite || !ariseScreenshotComposite->resource)
+		return fail(E_FAIL);
+	d3d12Device->CreateRenderTargetView(ariseScreenshotComposite->resource.get(), nullptr, rtvHandle);
 	return S_OK;
 }
 
@@ -666,6 +700,7 @@ bool DX12SwapChain::ReleaseArisePresentResources()
 	ariseEngineFence11 = nullptr;
 	ariseEngineFence12 = nullptr;
 	ariseTailFence12 = nullptr;
+	ResetScreenshotComposite();
 	arisePendingDepth.reset();
 	arisePendingMotionVectors.reset();
 	arisePendingCapture = {};
@@ -933,7 +968,27 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 				swapChainBufferWrapped ? swapChainBufferWrapped->resource.get() : nullptr,
 				uiBufferWrapped ? uiBufferWrapped->resource.get() : nullptr,
 				swapChainDesc.Width, swapChainDesc.Height);
-			streamlineDX12.ConfigureDLSSG(upscaling.ShouldUseFrameGenerationThisFrame());
+			if (globals::game::isVR) {
+				const uint32_t guideW = upscaling.perfMode.GetRenderEyeWidth() * 2;
+				const uint32_t guideH = upscaling.perfMode.GetRenderEyeHeight();
+				DXGI_FORMAT motionFormat = DXGI_FORMAT_UNKNOWN;
+				DXGI_FORMAT uiFormat = DXGI_FORMAT_UNKNOWN;
+				if (motionVectorBufferShared12 && motionVectorBufferShared12->resource11) {
+					D3D11_TEXTURE2D_DESC motionDesc{};
+					motionVectorBufferShared12->resource11->GetDesc(&motionDesc);
+					motionFormat = motionDesc.Format;
+				}
+				if (uiBufferWrapped && uiBufferWrapped->resource11) {
+					D3D11_TEXTURE2D_DESC uiDesc{};
+					uiBufferWrapped->resource11->GetDesc(&uiDesc);
+					uiFormat = uiDesc.Format;
+				}
+				streamlineDX12.ConfigureDLSSG(upscaling.ShouldUseFrameGenerationThisFrame(),
+					guideW, guideH, swapChainDesc.Width, swapChainDesc.Height,
+					DXGI_FORMAT_R32_FLOAT, motionFormat, swapChainDesc.Format, uiFormat, 3);
+			} else {
+				streamlineDX12.ConfigureDLSSG(upscaling.ShouldUseFrameGenerationThisFrame());
+			}
 		} else {
 			streamlineDX12.ConfigureDLSSG(false);
 		}
@@ -970,7 +1025,7 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	d3d11Context->ClearRenderTargetView(uiBufferWrapped->rtv, clearColor);
 
 	// If VSync is disabled, use frame limiter to prevent tearing and optimise pacing
-	if (SyncInterval == 0)
+	if (SyncInterval == 0 && !globals::game::isVR)
 		upscaling.FrameLimiter();
 
 	// Main_PostProcessing::thunk doesn't run on loading-screen frames, so its own
@@ -1276,6 +1331,7 @@ HRESULT DX12SwapChain::ExecuteArisePresent(std::size_t slotIndex)
 	slot.commandList->ResourceBarrier(static_cast<UINT>(std::size(compositeBarriers)), compositeBarriers);
 	if (!RecordAriseComposite(slot, sceneSource, physicalBuffer, frameIndex))
 		return fail(E_FAIL, "tail scene/UI composite recording", false);
+	(void)RecordScreenshotComposite(slot.commandList.get());
 	D3D12_RESOURCE_BARRIER presentBarriers[]{
 		CD3DX12_RESOURCE_BARRIER::Transition(sceneSource,
 			D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
@@ -1472,6 +1528,63 @@ bool DX12SwapChain::RecordAriseComposite(ArisePresentSlot& slot, ID3D12Resource*
 	slot.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 	slot.commandList->DrawInstanced(3, 1, 0, 0);
 	return true;
+}
+
+void DX12SwapChain::ResetScreenshotComposite()
+{
+	ariseScreenshotComposite.reset();
+	ariseTailFence11 = nullptr;
+}
+
+bool DX12SwapChain::RecordScreenshotComposite(ID3D12GraphicsCommandList* commandList)
+{
+	if (!commandList || !ariseCompositeRtvHeap || !ariseScreenshotComposite || !ariseScreenshotComposite->resource)
+		return false;
+	ID3D12Resource* dest = ariseScreenshotComposite->resource.get();
+	D3D12_RESOURCE_BARRIER toRt[]{
+		CD3DX12_RESOURCE_BARRIER::Transition(dest,
+			D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET),
+	};
+	commandList->ResourceBarrier(static_cast<UINT>(std::size(toRt)), toRt);
+	const UINT rtvStride = d3d12Device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+	auto rtvHandle = ariseCompositeRtvHeap->GetCPUDescriptorHandleForHeapStart();
+	rtvHandle.ptr += static_cast<SIZE_T>(swapChainDesc.BufferCount + kAriseSlotCount) * rtvStride;
+	commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
+	commandList->DrawInstanced(3, 1, 0, 0);
+	D3D12_RESOURCE_BARRIER toCommon[]{
+		CD3DX12_RESOURCE_BARRIER::Transition(dest,
+			D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COMMON),
+	};
+	commandList->ResourceBarrier(static_cast<UINT>(std::size(toCommon)), toCommon);
+	return true;
+}
+
+ID3D11Texture2D* DX12SwapChain::GetScreenshotComposite(winrt::com_ptr<ID3D11Texture2D>& holder, bool waitForIdle)
+{
+	holder = nullptr;
+	if (!useArise || !d3d11Context || !ariseScreenshotComposite || !ariseScreenshotComposite->resource11)
+		return nullptr;
+	if (!ariseTailValue)
+		return nullptr;
+	if (waitForIdle) {
+		if (!DrainModel3Tail())
+			return nullptr;
+	} else if (!ariseTailFence12) {
+		return nullptr;
+	} else {
+		const UINT64 completed = ariseTailFence12->GetCompletedValue();
+		if (completed == UINT64_MAX || completed < ariseTailValue)
+			return nullptr;
+	}
+	if (ariseTailFence11) {
+		const HRESULT waitResult = d3d11Context->Wait(ariseTailFence11.get(), ariseTailValue);
+		if (FAILED(waitResult)) {
+			logger::warn("[ARISE] Screenshot composite D3D11 wait failed: {:08X}", static_cast<unsigned>(waitResult));
+			return nullptr;
+		}
+	}
+	holder.copy_from(ariseScreenshotComposite->resource11);
+	return holder.get();
 }
 
 bool DX12SwapChain::WaitForAriseTail(UINT64 value)
