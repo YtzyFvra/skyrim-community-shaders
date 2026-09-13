@@ -86,9 +86,6 @@ public:
 		uint frameGenerationForceEnable = 0;
 		bool frameGenerationAllowInMenus = false;
 		// VR FG pump isolation. Runtime-only; first 80 breadcrumbs always land.
-		bool vrFgPumpTrace = true;
-		bool vrFgPumpSkipSubmit = false;
-		bool vrFgPumpDisableTearing = false;
 		// Workaround for adapters where DLSS-G initializes successfully but silently
 		// produces no interpolated frames; forces the FSR3 FG backend instead.
 		bool preferFSRFrameGen = false;

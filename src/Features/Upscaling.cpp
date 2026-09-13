@@ -17,7 +17,6 @@
 #include "Upscaling/NeuralRendering/Integration.h"
 #include "Upscaling/PerfMode.h"
 #include "Upscaling/Streamline.h"
-#include "Upscaling/VrFgPump.h"
 #include "Utils/DevBenchUx.h"
 #include "Utils/Game.h"
 #include "Utils/UI.h"
@@ -43,9 +42,6 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	frameGenerationMode,
 	frameGenerationForceEnable,
 	frameGenerationAllowInMenus,
-	vrFgPumpTrace,
-	vrFgPumpSkipSubmit,
-	vrFgPumpDisableTearing,
 	preferFSRFrameGen,
 	dlssgFramesToGenerate,
 	streamlineLogLevel,
@@ -659,21 +655,6 @@ std::string Upscaling::GetProfilePreviewText(PerfProfile profile) const
 		std::make_format_args(cropLabel, dlssModeName, stretchModeName, peripheryAAName, blendModeName));
 }
 
-json QueryVrFgPump(const Feature*, const json&)
-{
-	const auto snap = VrFgPump::Snapshot();
-	return json{
-		{ "lastStep", snap.lastStep },
-		{ "active", snap.active },
-		{ "busy", snap.busy },
-		{ "windowVisible", snap.windowVisible },
-		{ "appPresents", snap.appPresents },
-		{ "hookSubmits", snap.hookSubmits },
-		{ "lastHr", snap.lastHr },
-		{ "busyMs", snap.busyMs },
-	};
-}
-
 void Upscaling::RegisterUxActions()
 {
 	FEATURE_COMMAND("applyFoveationPreset",
@@ -681,9 +662,6 @@ void Upscaling::RegisterUxActions()
 		[](Feature*, const json& args) {
 			foveatedRender.subrectController.ApplyPresetByName(args.value("name", std::string{}));
 		});
-	FEATURE_QUERY("vrFgPump",
-		"VR DLSS-G pump breadcrumbs (lastStep, busy, windowVisible, appPresents, hookSubmits, lastHr, busyMs). hookSubmits is not VDXR compositor fps.",
-		QueryVrFgPump);
 }
 
 void Upscaling::DrawDlssModelControls()
@@ -718,35 +696,9 @@ void Upscaling::DrawDlssModelControls()
 void Upscaling::DrawFrameGenerationSettings()
 {
 	if (ImGui::TreeNodeEx(T(TKEY("frame_generation"), "Frame Generation"), ImGuiTreeNodeFlags_DefaultOpen)) {
-		if (globals::game::isVR) {
-			ImGui::TextWrapped("%s", T(TKEY("frame_generation_vr_submit"),
-				"VR: packed SBS is HUDLess for a private DXGI Present pump. Each inner Present is submitted to OpenVR. Overlay Submit is unchanged."));
-			if (ImGui::TreeNodeEx(T(TKEY("frame_generation_vr_pump_debug"), "VR FG pump debug"), 0)) {
-				const auto snap = VrFgPump::Snapshot();
-				ImGui::Text("last=%s busy=%d vis=%d app=%u hook=%u hr=0x%08X busyMs=%u",
-					snap.lastStep, snap.busy ? 1 : 0, snap.windowVisible ? 1 : 0,
-					snap.appPresents, snap.hookSubmits, snap.lastHr, snap.busyMs);
-				ImGui::Checkbox(T(TKEY("frame_generation_vr_pump_trace"), "Verbose pump breadcrumbs"),
-					&settings.vrFgPumpTrace);
-				if (auto _tt = Util::HoverTooltipWrapper()) {
-					ImGui::TextUnformatted(T(TKEY("frame_generation_vr_pump_trace_tooltip"),
-						"Log every pump/hook step to CommunityShaders.log. The first 80 steps and all failures are always logged."));
-				}
-				ImGui::Checkbox(T(TKEY("frame_generation_vr_pump_skip_submit"), "Skip OpenVR Submit (isolate hang)"),
-					&settings.vrFgPumpSkipSubmit);
-				if (auto _tt = Util::HoverTooltipWrapper()) {
-					ImGui::TextUnformatted(T(TKEY("frame_generation_vr_pump_skip_submit_tooltip"),
-						"Hook still copies and presents, but does not call BSOpenVR::Submit. If the freeze disappears, the hang is in Submit."));
-				}
-				ImGui::Checkbox(T(TKEY("frame_generation_vr_pump_disable_tearing"), "Disable ALLOW_TEARING"),
-					&settings.vrFgPumpDisableTearing);
-				if (auto _tt = Util::HoverTooltipWrapper()) {
-					ImGui::TextUnformatted(T(TKEY("frame_generation_vr_pump_disable_tearing_tooltip"),
-						"Present without DXGI_PRESENT_ALLOW_TEARING. Use if worker Present returns E_ABORT."));
-				}
-				ImGui::TreePop();
-			}
-		}
+		if (globals::game::isVR)
+			ImGui::TextWrapped("%s", T(TKEY("frame_generation_vr_unavailable"),
+				"VR: frame generation is not wired on this build. Neural Rendering writes back to the engine frame; the engine submits."));
 		ImGui::Text("%s", T(TKEY("frame_generation_desc"),
 							  "Frame Generation interpolates real frames with generated ones for a smoother experience"));
 
@@ -2635,7 +2587,7 @@ double Upscaling::GetRefreshRate(HWND a_window)
 bool Upscaling::IsFrameGenerationDx12PathActive() const
 {
 	if (globals::game::isVR)
-		return VrFgPump::WantsPump() || VrFgPump::IsActive();
+		return false;
 	return d3d12SwapChainActive;
 }
 
@@ -2644,8 +2596,7 @@ bool Upscaling::IsFrameGenerationActive() const
 	if (!IsFrameGenerationConfiguredForSession())
 		return false;
 	if (globals::game::isVR)
-		return VrFgPump::IsActive() && streamlineDX12.featureDLSSG &&
-			streamlineDX12.lastDLSSGStatus == sl::DLSSGStatus::eOk;
+		return false;
 	if (dx12SwapChain.useDLSSG)
 		// featureDLSSG is a one-time boot flag; lastDLSSGStatus is live per-session.
 		return streamlineDX12.featureDLSSG && streamlineDX12.lastDLSSGStatus == sl::DLSSGStatus::eOk;
@@ -2772,7 +2723,7 @@ Upscaling::FrameGenMethod Upscaling::GetFrameGenMethod() const
 bool Upscaling::UsesDLSSGFrameGen() const
 {
 	if (globals::game::isVR)
-		return VrFgPump::IsActive();
+		return false;
 	return d3d12SwapChainActive && dx12SwapChain.useDLSSG;
 }
 

@@ -11,7 +11,6 @@
 #include "Features/Upscaling/FoveatedRender/Core.h"
 #include "Features/Upscaling/FoveatedRender/Ops.h"
 #ifdef ENABLE_SKYRIM_VR
-#	include "Features/Upscaling/VrFgPump.h"
 #	include "Features/Upscaling/VrSubmitDlssg.h"
 #endif
 #include "Globals.h"
@@ -1965,14 +1964,6 @@ namespace NeuralRendering
 				}
 				eyeReady[eye] = true;
 			}
-
-#ifdef ENABLE_SKYRIM_VR
-			D3D11_TEXTURE2D_DESC sbsDesc{};
-			postTemp->GetDesc(&sbsDesc);
-			if (eyeReady[0] && eyeReady[1] && sbsDesc.Width && sbsDesc.Height &&
-				!VrFgPump::PresentOwnedSbs(postTemp, sbsDesc.Width, sbsDesc.Height))
-				VrSubmitDlssg::NoteOwnedFrame(UINT32_MAX);
-#endif
 
 			vrSixPassDoneFrame = frame;
 			if (!vrSixPassLogged) {

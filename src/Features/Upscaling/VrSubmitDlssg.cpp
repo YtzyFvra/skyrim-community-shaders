@@ -108,16 +108,6 @@ void VrSubmitDlssg::NoteOwnedFrame(std::uint32_t frame)
 		ownedSubmitted = false;
 }
 
-bool VrSubmitDlssg::HasPendingOwnedSbs()
-{
-	return ownedSubmitted;
-}
-
-void VrSubmitDlssg::ArmWorldSwallow()
-{
-	ownedSubmitted = true;
-}
-
 #ifdef ENABLE_SKYRIM_VR
 bool VrSubmitDlssg::SubmitOwnedSbs(ID3D11Texture2D* sbs, std::uint32_t width, std::uint32_t height)
 {
@@ -146,11 +136,6 @@ bool VrSubmitDlssg::SubmitOwnedSbs(ID3D11Texture2D* sbs, std::uint32_t width, st
 		loggedSubmit = true;
 	}
 	return true;
-}
-
-bool VrSubmitDlssg::SubmitOwnedEye(std::uint32_t, ID3D11Resource*, std::uint32_t, std::uint32_t)
-{
-	return false;
 }
 
 bool VrSubmitDlssg::TrySubmit(RE::BSOpenVR*, const vr::Texture_t* texture,
