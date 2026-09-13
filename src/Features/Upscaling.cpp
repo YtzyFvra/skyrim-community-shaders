@@ -17,6 +17,7 @@
 #include "Upscaling/NeuralRendering/Integration.h"
 #include "Upscaling/PerfMode.h"
 #include "Upscaling/Streamline.h"
+#include "Upscaling/VrFgPump.h"
 #include "Utils/DevBenchUx.h"
 #include "Utils/Game.h"
 #include "Utils/UI.h"
@@ -29,6 +30,7 @@
 #include <mutex>
 
 #include "Features/PostProcessing.h"
+#include "Features/DLSSBooster.h"
 
 #define I18N_KEY_PREFIX "feature.upscaling."
 
@@ -41,6 +43,9 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	frameGenerationMode,
 	frameGenerationForceEnable,
 	frameGenerationAllowInMenus,
+	vrFgPumpTrace,
+	vrFgPumpSkipSubmit,
+	vrFgPumpDisableTearing,
 	preferFSRFrameGen,
 	dlssgFramesToGenerate,
 	streamlineLogLevel,
@@ -654,6 +659,21 @@ std::string Upscaling::GetProfilePreviewText(PerfProfile profile) const
 		std::make_format_args(cropLabel, dlssModeName, stretchModeName, peripheryAAName, blendModeName));
 }
 
+json QueryVrFgPump(const Feature*, const json&)
+{
+	const auto snap = VrFgPump::Snapshot();
+	return json{
+		{ "lastStep", snap.lastStep },
+		{ "active", snap.active },
+		{ "busy", snap.busy },
+		{ "windowVisible", snap.windowVisible },
+		{ "appPresents", snap.appPresents },
+		{ "hookSubmits", snap.hookSubmits },
+		{ "lastHr", snap.lastHr },
+		{ "busyMs", snap.busyMs },
+	};
+}
+
 void Upscaling::RegisterUxActions()
 {
 	FEATURE_COMMAND("applyFoveationPreset",
@@ -661,6 +681,9 @@ void Upscaling::RegisterUxActions()
 		[](Feature*, const json& args) {
 			foveatedRender.subrectController.ApplyPresetByName(args.value("name", std::string{}));
 		});
+	FEATURE_QUERY("vrFgPump",
+		"VR DLSS-G pump breadcrumbs (lastStep, busy, windowVisible, appPresents, hookSubmits, lastHr, busyMs). hookSubmits is not VDXR compositor fps.",
+		QueryVrFgPump);
 }
 
 void Upscaling::DrawDlssModelControls()
@@ -695,9 +718,35 @@ void Upscaling::DrawDlssModelControls()
 void Upscaling::DrawFrameGenerationSettings()
 {
 	if (ImGui::TreeNodeEx(T(TKEY("frame_generation"), "Frame Generation"), ImGuiTreeNodeFlags_DefaultOpen)) {
-		if (globals::game::isVR)
+		if (globals::game::isVR) {
 			ImGui::TextWrapped("%s", T(TKEY("frame_generation_vr_submit"),
-				"VR: per-eye 8-pass then our Submit. Engine world Submit is swallowed. DLSS-G Present needs per-eye chains."));
+				"VR: packed SBS is HUDLess for a private DXGI Present pump. Each inner Present is submitted to OpenVR. Overlay Submit is unchanged."));
+			if (ImGui::TreeNodeEx(T(TKEY("frame_generation_vr_pump_debug"), "VR FG pump debug"), 0)) {
+				const auto snap = VrFgPump::Snapshot();
+				ImGui::Text("last=%s busy=%d vis=%d app=%u hook=%u hr=0x%08X busyMs=%u",
+					snap.lastStep, snap.busy ? 1 : 0, snap.windowVisible ? 1 : 0,
+					snap.appPresents, snap.hookSubmits, snap.lastHr, snap.busyMs);
+				ImGui::Checkbox(T(TKEY("frame_generation_vr_pump_trace"), "Verbose pump breadcrumbs"),
+					&settings.vrFgPumpTrace);
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::TextUnformatted(T(TKEY("frame_generation_vr_pump_trace_tooltip"),
+						"Log every pump/hook step to CommunityShaders.log. The first 80 steps and all failures are always logged."));
+				}
+				ImGui::Checkbox(T(TKEY("frame_generation_vr_pump_skip_submit"), "Skip OpenVR Submit (isolate hang)"),
+					&settings.vrFgPumpSkipSubmit);
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::TextUnformatted(T(TKEY("frame_generation_vr_pump_skip_submit_tooltip"),
+						"Hook still copies and presents, but does not call BSOpenVR::Submit. If the freeze disappears, the hang is in Submit."));
+				}
+				ImGui::Checkbox(T(TKEY("frame_generation_vr_pump_disable_tearing"), "Disable ALLOW_TEARING"),
+					&settings.vrFgPumpDisableTearing);
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::TextUnformatted(T(TKEY("frame_generation_vr_pump_disable_tearing_tooltip"),
+						"Present without DXGI_PRESENT_ALLOW_TEARING. Use if worker Present returns E_ABORT."));
+				}
+				ImGui::TreePop();
+			}
+		}
 		ImGui::Text("%s", T(TKEY("frame_generation_desc"),
 							  "Frame Generation interpolates real frames with generated ones for a smoother experience"));
 
@@ -1509,6 +1558,9 @@ bool Upscaling::PerfModePrerequisitesMet() const
 
 bool Upscaling::ShouldEngagePerfMode() const
 {
+	// No-FG DB writeback keeps engine E at native. TD UI via PerfMode is a later cut.
+	if (IsVrDlssPostInjectActive() || ShouldSkipUpscalingDlss())
+		return false;
 	return settings.renderAtUpscaleRes && PerfModePrerequisitesMet();
 }
 
@@ -2183,19 +2235,38 @@ void Upscaling::ConfigureUpscaling(RE::BSGraphics::State* a_viewport)
 			a_viewport->projectionPosScaleY = 2.0f * jitter.y / static_cast<int>(perfMode.GetRenderEyeHeight());
 		} else {
 			const bool flatPipeline = IsFlatDlssPostInjectActive();
-			const auto plan = foveatedRender.BuildFlatPipelinePlan(screenWidth, screenHeight);
+			const bool vrPostInject = IsVrDlssPostInjectActive();
+			const bool skipUpscalingDlss = ShouldSkipUpscalingDlss();
+			uint32_t vrEyeW = 0, vrEyeH = 0, vrDisplayW = 0, vrDisplayH = 0;
+			if (vrPostInject)
+				NeuralRendering::GetVrOwnedEyeSizes(vrEyeW, vrEyeH, vrDisplayW, vrDisplayH);
+			const auto& vrCropUV = foveatedRender.subrectController.GetUV();
+			const uint32_t vrPlanEyeW = vrEyeW ? vrEyeW : static_cast<uint32_t>(std::max(1, screenWidth / 2));
+			const uint32_t vrPlanEyeH = vrEyeH ? vrEyeH : static_cast<uint32_t>(screenHeight);
+			const uint32_t vrPlanDisplayW = vrDisplayW ? vrDisplayW : vrPlanEyeW;
+			const uint32_t vrPlanDisplayH = vrDisplayH ? vrDisplayH : vrPlanEyeH;
+			const uint32_t vrPlanInW = std::max(1u, static_cast<uint32_t>(vrPlanEyeW * vrCropUV.w));
+			const uint32_t vrPlanInH = std::max(1u, static_cast<uint32_t>(vrPlanEyeH * vrCropUV.h));
+			const uint32_t vrPlanOutW = std::max(1u, static_cast<uint32_t>(vrPlanDisplayW * vrCropUV.w));
+			const uint32_t vrPlanOutH = std::max(1u, static_cast<uint32_t>(vrPlanDisplayH * vrCropUV.h));
+			const auto plan = vrPostInject ?
+				foveatedRender.BuildFlatPipelinePlan(vrPlanOutW, vrPlanOutH, vrPlanInW, vrPlanInH) :
+				foveatedRender.BuildFlatPipelinePlan(screenWidth, screenHeight);
 			const uint32_t qm = globals::features::upscaling.perfMode.IsHookActive() ?
 				bootSnapshot.Boot(&Settings::qualityMode) : settings.qualityMode;
-			auto renderWidth = flatPipeline ? static_cast<int>(plan.engineWidth) :
-				static_cast<int>(std::lround(screenWidth / GetQualityModeRatio(qm)));
-			auto renderHeight = flatPipeline ? static_cast<int>(plan.engineHeight) :
-				static_cast<int>(std::lround(screenHeight / GetQualityModeRatio(qm)));
+			// Booster override and VR no-FG writeback keep engine RTs at native E.
+			auto renderWidth = (vrPostInject || skipUpscalingDlss) ? screenWidth :
+				(flatPipeline ? static_cast<int>(plan.engineWidth) :
+					static_cast<int>(std::lround(screenWidth / GetQualityModeRatio(qm))));
+			auto renderHeight = (vrPostInject || skipUpscalingDlss) ? screenHeight :
+				(flatPipeline ? static_cast<int>(plan.engineHeight) :
+					static_cast<int>(std::lround(screenHeight / GetQualityModeRatio(qm))));
 
 			resolutionScale.x = static_cast<float>(renderWidth) / static_cast<float>(screenWidth);
 			resolutionScale.y = static_cast<float>(renderHeight) / static_cast<float>(screenHeight);
 
 			int phaseCount = GetJitterPhaseCount(renderWidth, screenWidth);
-			if (flatPipeline) {
+			if (flatPipeline || vrPostInject) {
 				if (plan.act1Backend != FoveatedRender::FlatAct1Backend::kBypass)
 					phaseCount = std::max(phaseCount, GetJitterPhaseCount(plan.engineWidth, plan.act1OutputWidth));
 				if (plan.act2Backend == FoveatedRender::FlatAct2Backend::kDLSS ||
@@ -2205,7 +2276,7 @@ void Upscaling::ConfigureUpscaling(RE::BSGraphics::State* a_viewport)
 
 			GetJitterOffset(&jitter.x, &jitter.y, state->frameCount, phaseCount);
 			// Loading screens reset the upscaler every frame; unintegrated jitter only wobbles the image.
-			if (globals::state->isLoadingMenuOpen)
+			if (globals::state->isLoadingMenuOpen || (skipUpscalingDlss && !vrPostInject && !flatPipeline))
 				jitter = float2{ 0.0f, 0.0f };
 
 			if (globals::game::isVR)
@@ -2353,6 +2424,8 @@ void Upscaling::ClearShaderCache()
 
 bool Upscaling::CopySharedD3D12Resources()
 {
+	if (!d3d12SwapChainActive)
+		return;
 	CS_GPU_PASS("Upscaling::CopySharedD3D12Resources");
 
 	auto* vs = GetUpscaleVS();
@@ -2562,7 +2635,7 @@ double Upscaling::GetRefreshRate(HWND a_window)
 bool Upscaling::IsFrameGenerationDx12PathActive() const
 {
 	if (globals::game::isVR)
-		return dx12SwapChain.useDLSSG && !dx12SwapChain.useArise;
+		return VrFgPump::WantsPump() || VrFgPump::IsActive();
 	return d3d12SwapChainActive;
 }
 
@@ -2570,6 +2643,9 @@ bool Upscaling::IsFrameGenerationActive() const
 {
 	if (!IsFrameGenerationConfiguredForSession())
 		return false;
+	if (globals::game::isVR)
+		return VrFgPump::IsActive() && streamlineDX12.featureDLSSG &&
+			streamlineDX12.lastDLSSGStatus == sl::DLSSGStatus::eOk;
 	if (dx12SwapChain.useDLSSG)
 		// featureDLSSG is a one-time boot flag; lastDLSSGStatus is live per-session.
 		return streamlineDX12.featureDLSSG && streamlineDX12.lastDLSSGStatus == sl::DLSSGStatus::eOk;
@@ -2696,7 +2772,7 @@ Upscaling::FrameGenMethod Upscaling::GetFrameGenMethod() const
 bool Upscaling::UsesDLSSGFrameGen() const
 {
 	if (globals::game::isVR)
-		return dx12SwapChain.useDLSSG && !dx12SwapChain.useArise;
+		return VrFgPump::IsActive();
 	return d3d12SwapChainActive && dx12SwapChain.useDLSSG;
 }
 
@@ -2716,6 +2792,17 @@ bool Upscaling::IsVrDlssPostInjectActive() const
 	if (GetUpscaleMethod() != UpscaleMethod::kDLSS)
 		return false;
 	return foveatedRender.settings.neuralRenderingEnabled;
+}
+
+bool Upscaling::IsBoosterOverrideActive() const
+{
+	return globals::features::dlssBooster.loaded &&
+		globals::features::dlssBooster.settings.overrideEnabled;
+}
+
+bool Upscaling::ShouldSkipUpscalingDlss() const
+{
+	return IsBoosterOverrideActive() && GetUpscaleMethod() == UpscaleMethod::kDLSS;
 }
 
 bool Upscaling::IsFlatAct1BypassActive() const
@@ -2753,7 +2840,7 @@ json Upscaling::GetDiagnostics()
 		const uint32_t cropOutH = std::max(1u, static_cast<uint32_t>(displayH * cropUV.h));
 		const auto plan = foveatedRender.BuildFlatPipelinePlan(cropOutW, cropOutH, cropInW, cropInH);
 		diagnostics["vrSixPass"] = {
-			{ "injectPoint", "AfterPostOwnedSubmit" },
+			{ "injectPoint", "AfterPostWriteback" },
 			{ "postInjectActive", IsVrDlssPostInjectActive() },
 			{ "centerCrop", !cropUV.IsFullEye() },
 			{ "cropU", cropUV.x },
@@ -2947,7 +3034,17 @@ void Upscaling::Upscale()
 	else
 		menuCameraMVsValid = false;
 
-	{
+	if (ShouldSkipUpscalingDlss()) {
+		static bool boosterSkipLogged = false;
+		if (!boosterSkipLogged) {
+			boosterSkipLogged = true;
+			logger::info("[DLSSBooster] Override owns DLSS; Upscaling Encode/Evaluate is off");
+		}
+		return;
+	}
+
+	const bool skipEncodeForVrBooster = IsVrDlssPostInjectActive();
+	if (!skipEncodeForVrBooster) {
 		CS_GPU_PASS("Upscaling::EncodeTextures");
 
 		// VR: ensure per-eye intermediate textures exist before the dispatch writes into them
@@ -3057,7 +3154,8 @@ void Upscaling::Upscale()
 			// regression in the DLSS feature that only clears on a manual mode/preset toggle.
 			// Mirror that toggle by tearing down the DLSS feature on LoadingMenu close — the next
 			// SetDLSSOptions/slEvaluateFeature call below recreates it with current per-eye extents.
-			if (globals::game::isVR && pendingDLSSReset.exchange(false, std::memory_order_relaxed)) {
+			if (globals::game::isVR && pendingDLSSReset.exchange(false, std::memory_order_relaxed) &&
+				!IsDlssPostInjectActive()) {
 				logger::debug("[Upscaling] LoadingMenu close detected — rebuilding DLSS feature");
 				streamline.DestroyDLSSResources();
 			}
@@ -3097,7 +3195,8 @@ void Upscaling::PerformUpscaling()
 	const bool renderDocCompatibility = dx12SwapChain.IsRenderDocCompatibility();
 	if (!renderDocCompatibility)
 		Upscale();
-	if (!renderDocCompatibility && !IsDlssPostInjectActive() && !IsFlatAct1BypassActive())
+	if (!renderDocCompatibility && !IsDlssPostInjectActive() && !IsFlatAct1BypassActive() &&
+		!ShouldSkipUpscalingDlss())
 		UpscaleDepth();
 
 	auto& runtimeData = globals::game::graphicsState->GetRuntimeData();
@@ -3491,7 +3590,7 @@ void Upscaling::Main_PostProcessing::thunk(RE::ImageSpaceManager* a_this, uint32
 	auto upscaleMethod = upscaling.GetUpscaleMethod();
 
 	upscaling.frameGenerationPrepared = false;
-	if (upscaling.ShouldPrepareFrameGeneration()) {
+	if (upscaling.ShouldUseFrameGenerationThisFrame() && upscaling.d3d12SwapChainActive) {
 		if (postProcessing.loaded)
 			postProcessing.ClearBorderMotionVectorsForFrameGen();
 		upscaling.frameGenerationPrepared = upscaling.CopySharedD3D12Resources();

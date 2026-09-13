@@ -12,12 +12,16 @@ namespace NeuralRendering
 		std::uint64_t fsrSucceeded = 0;
 	};
 
-	/** VR: Post kTEMP 8-pass then owned Submit. Flat: PostInject pipeline. */
+	/** Flat: PostInject pipeline after engine Post. VR waits for `ApplyVrAfterTonemap`. */
 	bool ApplyFoveatedLdr();
-	/** Render eye from kTEMP, display eye from OpenVR recommended or kTOTAL. */
+	/** VR: after ISHDR Tonemap, read kTEMP, run per-eye 8-pass, Submit ourselves. */
+	bool ApplyVrAfterTonemap();
+	/** Owned SBS: both eyes from kTEMP half-eye (TD = E on this cut). */
 	bool GetVrOwnedEyeSizes(uint32_t& renderW, uint32_t& renderH, uint32_t& displayW, uint32_t& displayH);
-	/** Private SBS after a successful owned submit this session; null before the first frame. */
+	/** Private SBS packed after a successful owned Submit; null if that frame fell back. */
 	ID3D11Texture2D* GetVrOwnedComposite(ID3D11ShaderResourceView** outSrv = nullptr);
+	/** One E×E owned eye; null if that frame fell back to engine Submit. */
+	ID3D11Texture2D* GetVrOwnedEye(uint32_t eye);
 	Act2BackendStats GetAct2BackendStats();
 	/** Dumps G / I / N / RC / Lo / Gain / EditLow / D of the next Guidance frame as raw float32 for offline band analysis. */
 	void RequestBandCapture();

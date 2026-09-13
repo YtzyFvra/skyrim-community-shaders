@@ -314,10 +314,9 @@ struct FoveatedRender
 	void BlitTitleBackgroundToSwapChain() const;
 	Util::Subrect::Controller subrectController;
 
-	// Called from Upscaling::DrawSettings. DrawEnable renders the always-visible
-	// header + Enable checkbox at the parent's top level; DrawSettings renders
-	// the body knobs inside a collapsible TreeNode (Upscaling wraps it in
-	// BeginDisabled when settings.enabled == 0).
+	// DrawEnable / DrawSettings: VR crop editor on the Upscaling panel.
+	// DrawNeuralRenderingSettings: 8-pass on Upscaling and RTX DLSS Booster.
+	// Booster override pushes that blob so the Booster page can be tuned alone.
 	void DrawEnable();
 	void DrawSettings();
 	void DrawNeuralRenderingSettings(bool wrapHeader = true);

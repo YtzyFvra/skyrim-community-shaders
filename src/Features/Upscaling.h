@@ -85,6 +85,10 @@ public:
 		uint frameGenerationMode = 1;
 		uint frameGenerationForceEnable = 0;
 		bool frameGenerationAllowInMenus = false;
+		// VR FG pump isolation. Runtime-only; first 80 breadcrumbs always land.
+		bool vrFgPumpTrace = true;
+		bool vrFgPumpSkipSubmit = false;
+		bool vrFgPumpDisableTearing = false;
 		// Workaround for adapters where DLSS-G initializes successfully but silently
 		// produces no interpolated frames; forces the FSR3 FG backend instead.
 		bool preferFSRFrameGen = false;
@@ -217,8 +221,12 @@ public:
 	bool ShouldUseFrameGenerationThisFrame() const;
 	bool IsUpscalingActive() const;
 	bool IsFlatDlssPostInjectActive() const;
-	/** @brief VR + DLSS + NR: Post kTEMP 8-pass, owned Submit. Skips hybrid Post. */
+	/** @brief VR + DLSS + NR: Post kTEMP 8-pass, write the box back to engine SBS. */
 	bool IsVrDlssPostInjectActive() const;
+	/** @brief RTX DLSS Booster override is loaded and pushing its settings blob. */
+	bool IsBoosterOverrideActive() const;
+	/** @brief Booster override owns reconstruction; Upscaling must not Encode/Evaluate DLSS. */
+	bool ShouldSkipUpscalingDlss() const;
 	bool IsDlssPostInjectActive() const
 	{
 		return IsFlatDlssPostInjectActive() || IsVrDlssPostInjectActive();
@@ -282,13 +290,13 @@ public:
 	/// panel and the Performance hub. VR-only; self-gates via IsRuntimeSupported()
 	/// (shown disabled off-VR rather than hidden).
 	void DrawFoveationControls(bool showTuning = true);
-	/** @brief DLSS model preset and RCAS sharpening. Shared with RTX DLSS Booster. */
+	/** @brief Engine DLSS model preset and engine RCAS. Shared with RTX DLSS Booster. */
 	void DrawDlssModelControls();
-	/** @brief Flat Frame Generation / DLSS-G tree. Shared with RTX DLSS Booster. */
+	/** @brief Frame Generation / DLSS-G tree. Shared with RTX DLSS Booster. */
 	void DrawFrameGenerationSettings();
 	/** @brief NVIDIA Reflex latency controls. Shared with RTX DLSS Booster. */
 	void DrawReflexSettings();
-	/** @brief Display-D RCAS, independent of Neural Rendering. Shared with RTX DLSS Booster. */
+	/** @brief Display-D RCAS after the 8-pass stack. Shared with RTX DLSS Booster. */
 	void DrawFinalSharpenSettings();
 	const char* GetQualityModeName(uint qualityMode) const;
 	virtual void SaveSettings(json& o_json) override;

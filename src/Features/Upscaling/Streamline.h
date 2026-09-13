@@ -250,6 +250,13 @@ public:
 	static sl::DLSSMode DLSSModeForQualityMode(uint32_t a_qualityMode);
 
 	/**
+	 * @brief Queries NGX min/max render extents for a quality mode and output size.
+	 * @return false when DLSS or the optimal-settings query is unavailable.
+	 */
+	bool QueryDLSSRenderRange(uint32_t a_qualityMode, uint32_t a_outputWidth, uint32_t a_outputHeight,
+		uint32_t& a_renderWidthMin, uint32_t& a_renderHeightMin, uint32_t& a_renderWidthMax, uint32_t& a_renderHeightMax);
+
+	/**
 	 * @brief Clamps a per-eye render extent into the NGX-supported range for the
 	 * given quality mode and output size. No-op when DLSS or the optimal-settings
 	 * query is unavailable.

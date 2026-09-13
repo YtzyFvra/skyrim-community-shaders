@@ -6,8 +6,10 @@
 #include "Menu/ThemeManager.h"
 #include "Upscaling.h"
 #include "Upscaling/NeuralRendering/ArisePipeline.h"
+#include "Upscaling/NeuralRendering/Integration.h"
 #include "Utils/UI.h"
 
+#include <algorithm>
 #include <cmath>
 #include <imgui.h>
 #include <nlohmann/json.hpp>
@@ -35,62 +37,70 @@ namespace
 {
 	void CopyReconstruction(const FoveatedRender::Settings& from, FoveatedRender::Settings& to)
 	{
-		to.neuralRenderingEnabled = from.neuralRenderingEnabled;
-		to.ariseShadowScheduler = from.ariseShadowScheduler;
-		to.ariseVisualValidation = from.ariseVisualValidation;
-		to.ariseWorkerNr = from.ariseWorkerNr;
-		to.ariseModel3 = from.ariseModel3;
-		to.singleThreadPerfMode = from.singleThreadPerfMode;
-		to.ariseBufferCount = from.ariseBufferCount;
-		to.flatPipelineAct1Backend = from.flatPipelineAct1Backend;
-		to.flatPipelineAct1Quality = from.flatPipelineAct1Quality;
-		to.flatPipelineAct1Preset = from.flatPipelineAct1Preset;
-		to.flatPipelineAct1Jitter = from.flatPipelineAct1Jitter;
-		to.flatPipelineAct1Dsr = from.flatPipelineAct1Dsr;
-		to.flatPipelineNrScale = from.flatPipelineNrScale;
-		to.flatPipelineNrNative = from.flatPipelineNrNative;
-		to.flatPipelineAct2Backend = from.flatPipelineAct2Backend;
-		to.unifiedPipeline = from.unifiedPipeline;
-		to.flatPipelineAct2Preset = from.flatPipelineAct2Preset;
-		to.flatPipelineAct2Jitter = from.flatPipelineAct2Jitter;
-		to.flatPipelineFusionDirection = from.flatPipelineFusionDirection;
-		to.flatPipelineFusionDenoise = from.flatPipelineFusionDenoise;
-		to.flatPipelineFusionDenoiseStrength = from.flatPipelineFusionDenoiseStrength;
-		to.flatPipelineFusionSoftness = from.flatPipelineFusionSoftness;
-		to.flatPipelineFusionEnhancedGuidance = from.flatPipelineFusionEnhancedGuidance;
-		to.flatPipelineFusionFrequencyGuidance = from.flatPipelineFusionFrequencyGuidance;
-		to.flatPipelineFusionDepthGuidance = from.flatPipelineFusionDepthGuidance;
-		to.flatPipelineFusionColorGuidance = from.flatPipelineFusionColorGuidance;
-		to.flatPipelineSharpen = from.flatPipelineSharpen;
-		to.flatPipelineSharpness = from.flatPipelineSharpness;
-		to.flatAct1Enabled = from.flatAct1Enabled;
-		to.flatAct1QualityMode = from.flatAct1QualityMode;
-		to.flatAct1Preset = from.flatAct1Preset;
-		to.flatAct1Sharpness = from.flatAct1Sharpness;
-		to.flatAct2QualityMode = from.flatAct2QualityMode;
-		to.flatAct2Preset = from.flatAct2Preset;
-		to.flatAct2Sharpness = from.flatAct2Sharpness;
-		to.neuralRenderingPreset = from.neuralRenderingPreset;
-		to.neuralRenderingIntensity = from.neuralRenderingIntensity;
-		to.neuralRenderingLocalTone = from.neuralRenderingLocalTone;
-		to.neuralRenderingLocalStructure = from.neuralRenderingLocalStructure;
-		to.neuralRenderingSkinStructure = from.neuralRenderingSkinStructure;
-		to.neuralRenderingStyle = from.neuralRenderingStyle;
-		to.neuralRenderingAutoMask = from.neuralRenderingAutoMask;
-		to.neuralRenderingUICorrection = from.neuralRenderingUICorrection;
-		to.neuralRenderingBypassOutput = from.neuralRenderingBypassOutput;
-		to.neuralRenderingResetEveryFrame = from.neuralRenderingResetEveryFrame;
-		to.neuralRenderingInputPrefilter = from.neuralRenderingInputPrefilter;
-		to.neuralRenderingMotionVectorMode = from.neuralRenderingMotionVectorMode;
-		to.neuralRenderingHalfResolution = from.neuralRenderingHalfResolution;
-		to.neuralRenderingWorkingScale = from.neuralRenderingWorkingScale;
-		to.neuralRenderingOutputMode = from.neuralRenderingOutputMode;
-		to.neuralRenderingNisSharpness = from.neuralRenderingNisSharpness;
-		to.neuralRenderingFusionPreset = from.neuralRenderingFusionPreset;
-		to.neuralRenderingFusionLuma = from.neuralRenderingFusionLuma;
-		to.neuralRenderingFusionChroma = from.neuralRenderingFusionChroma;
-		to.neuralRenderingFusionEdgeProtection = from.neuralRenderingFusionEdgeProtection;
-		to.neuralRenderingFusionResidualLimit = from.neuralRenderingFusionResidualLimit;
+		const uint enabled = to.enabled;
+		const uint dlssMode = to.dlssMode;
+		const uint stretchMode = to.stretchMode;
+		const float peripheryBlurRadius = to.peripheryBlurRadius;
+		const uint debugVisualize = to.debugVisualize;
+		const uint peripheryAAMode = to.peripheryAAMode;
+		const float peripheryTemporalAlpha = to.peripheryTemporalAlpha;
+		const uint subrectBlendMode = to.subrectBlendMode;
+		const float subrectFeatherWidth = to.subrectFeatherWidth;
+		const float subrectDitherStrength = to.subrectDitherStrength;
+		to = from;
+		to.enabled = enabled;
+		to.dlssMode = dlssMode;
+		to.stretchMode = stretchMode;
+		to.peripheryBlurRadius = peripheryBlurRadius;
+		to.debugVisualize = debugVisualize;
+		to.peripheryAAMode = peripheryAAMode;
+		to.peripheryTemporalAlpha = peripheryTemporalAlpha;
+		to.subrectBlendMode = subrectBlendMode;
+		to.subrectFeatherWidth = subrectFeatherWidth;
+		to.subrectDitherStrength = subrectDitherStrength;
+	}
+
+	void DrawReconstructionExtents(Upscaling& upscaling, FoveatedRender& foveated)
+	{
+		Util::DrawSectionHeader(T(TKEY("pipeline"), "Reconstruction Pipeline"), false, false);
+		if (!globals::game::isVR) {
+			foveated.DrawLogicalPerfModeControls();
+			if (upscaling.dx12SwapChain.useArise || foveated.settings.neuralRenderingEnabled) {
+				const auto preview = foveated.BuildFlatPipelinePlan(
+					upscaling.dx12SwapChain.useArise ? upscaling.dx12SwapChain.PhysicalWidth() :
+						(globals::state ? static_cast<uint32_t>(globals::state->screenSize.x) : 0u),
+					upscaling.dx12SwapChain.useArise ? upscaling.dx12SwapChain.PhysicalHeight() :
+						(globals::state ? static_cast<uint32_t>(globals::state->screenSize.y) : 0u),
+					upscaling.dx12SwapChain.useArise ? upscaling.dx12SwapChain.LogicalWidth() : 0u,
+					upscaling.dx12SwapChain.useArise ? upscaling.dx12SwapChain.LogicalHeight() : 0u);
+				ImGui::TextDisabled(T(TKEY("extents"),
+					"R %ux%u  ->  G %ux%u  ->  N %ux%u  ->  D %ux%u"),
+					preview.renderR.width, preview.renderR.height,
+					preview.guidanceG.width, preview.guidanceG.height,
+					preview.neuralN.width, preview.neuralN.height,
+					preview.displayD.width, preview.displayD.height);
+			}
+			return;
+		}
+
+		ImGui::TextDisabled("%s", T(TKEY("pipeline_vr"),
+			"VR: per-eye 8-pass on kTEMP, write the box back to engine SBS. No FG. ARISE stays Flat-only."));
+		if (!foveated.settings.neuralRenderingEnabled)
+			return;
+		const auto& previewUV = foveated.subrectController.GetUV();
+		uint32_t vrRenderW = 0, vrRenderH = 0, vrDisplayW = 0, vrDisplayH = 0;
+		NeuralRendering::GetVrOwnedEyeSizes(vrRenderW, vrRenderH, vrDisplayW, vrDisplayH);
+		const uint32_t inW = std::max(1u, static_cast<uint32_t>(vrRenderW * previewUV.w));
+		const uint32_t inH = std::max(1u, static_cast<uint32_t>(vrRenderH * previewUV.h));
+		const uint32_t outW = std::max(1u, static_cast<uint32_t>(vrDisplayW * previewUV.w));
+		const uint32_t outH = std::max(1u, static_cast<uint32_t>(vrDisplayH * previewUV.h));
+		const auto preview = foveated.BuildFlatPipelinePlan(outW, outH, inW, inH);
+		ImGui::TextDisabled(T(TKEY("extents"),
+			"R %ux%u  ->  G %ux%u  ->  N %ux%u  ->  D %ux%u"),
+			preview.renderR.width, preview.renderR.height,
+			preview.guidanceG.width, preview.guidanceG.height,
+			preview.neuralN.width, preview.neuralN.height,
+			preview.displayD.width, preview.displayD.height);
 	}
 
 	void CopyFrameGenReflex(const Upscaling::Settings& from, DLSSBooster::Settings& to)
@@ -281,7 +291,7 @@ void DLSSBooster::DrawIntro()
 		&settings.overrideEnabled);
 	if (ImGui::IsItemHovered())
 		ImGui::SetTooltip("%s", T(TKEY("override_enable_tooltip"),
-			"Pushes this page every frame. Overlapping Upscaling knobs still draw, but they do not stick."));
+			"Pushes this page every frame and turns off Upscaling's own DLSS Evaluate. Overlapping Upscaling knobs still draw, but they do not stick."));
 	Util::UI::RestartGatedAnnotate(bootSnapshot, settings, &Settings::overrideEnabled,
 		T(TKEY("override_restart"),
 			"May latch a different Present path. Restart to apply."));
@@ -349,26 +359,7 @@ void DLSSBooster::DrawSettings()
 	FoveatedRender::Settings reconstructionBackup = foveated.settings;
 	CopyReconstruction(settings.reconstruction, foveated.settings);
 
-	if (!globals::game::isVR) {
-		Util::DrawSectionHeader(T(TKEY("pipeline"), "Reconstruction Pipeline"), false, false);
-		foveated.DrawLogicalPerfModeControls();
-
-		if (upscaling.dx12SwapChain.useArise || foveated.settings.neuralRenderingEnabled) {
-			const auto preview = foveated.BuildFlatPipelinePlan(
-				upscaling.dx12SwapChain.useArise ? upscaling.dx12SwapChain.PhysicalWidth() :
-					(globals::state ? static_cast<uint32_t>(globals::state->screenSize.x) : 0u),
-				upscaling.dx12SwapChain.useArise ? upscaling.dx12SwapChain.PhysicalHeight() :
-					(globals::state ? static_cast<uint32_t>(globals::state->screenSize.y) : 0u),
-				upscaling.dx12SwapChain.useArise ? upscaling.dx12SwapChain.LogicalWidth() : 0u,
-				upscaling.dx12SwapChain.useArise ? upscaling.dx12SwapChain.LogicalHeight() : 0u);
-			ImGui::TextDisabled(T(TKEY("extents"),
-				"R %ux%u  ->  G %ux%u  ->  N %ux%u  ->  D %ux%u"),
-				preview.renderR.width, preview.renderR.height,
-				preview.guidanceG.width, preview.guidanceG.height,
-				preview.neuralN.width, preview.neuralN.height,
-				preview.displayD.width, preview.displayD.height);
-		}
-	}
+	DrawReconstructionExtents(upscaling, foveated);
 
 	if (ImGui::CollapsingHeader(T(TKEY("six_pass"), "Six-Pass Reconstruction"), ImGuiTreeNodeFlags_DefaultOpen))
 		foveated.DrawNeuralRenderingSettings(false);

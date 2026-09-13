@@ -201,7 +201,10 @@ void FoveatedRender::PostPostLoad()
 	NeuralRendering::ARISE::Pipeline::Instance().SetWorkerNrEnabled(settings.ariseWorkerNr);
 	NeuralRendering::ARISE::Pipeline::Instance().SetEnabled(settings.ariseShadowScheduler);
 	stl::write_vfunc<0x1, UICompositeRenderHook>(RE::VTABLE_BSImagespaceShaderCopyDynamicFetchDisabled[3]);
-	if (!globals::game::isVR && WantsLogicalPerfMode()) {
+	if (globals::game::isVR) {
+		stl::write_vfunc<0x1, HDRTonemapRenderHook>(RE::VTABLE_BSImagespaceShaderHDRTonemapBlendCinematic[3]);
+		stl::write_vfunc<0x1, HDRTonemapFadeRenderHook>(RE::VTABLE_BSImagespaceShaderHDRTonemapBlendCinematicFade[3]);
+	} else if (WantsLogicalPerfMode()) {
 		// Title/loading blit + Map/ISHDR scopes. ESC/TAB stay unpatched — see docs/development/flat-arise-menu.md.
 		stl::write_vfunc<0x1, MapRenderHook>(RE::VTABLE_BSImagespaceShaderMap[3]);
 		stl::write_vfunc<0x1, WorldMapRenderHook>(RE::VTABLE_BSImagespaceShaderWorldMap[3]);
@@ -217,7 +220,6 @@ void FoveatedRender::PostPostLoad()
 
 void FoveatedRender::UICompositeRenderHook::thunk(void* imageSpaceShader, RE::BSTriShape* shape, RE::ImageSpaceEffectParam* param)
 {
-	NeuralRendering::ApplyFoveatedLdr();
 	func(imageSpaceShader, shape, param);
 }
 
@@ -537,12 +539,22 @@ void FoveatedRender::WorldMapNoSkyBlurRenderHook::thunk(
 void FoveatedRender::HDRTonemapRenderHook::thunk(
 	void* imageSpaceShader, RE::BSTriShape* shape, RE::ImageSpaceEffectParam* param)
 {
+	if (globals::game::isVR) {
+		func(imageSpaceShader, shape, param);
+		NeuralRendering::ApplyVrAfterTonemap();
+		return;
+	}
 	RunImagespaceAtDestinationViewport<HDRTonemapRenderHook>(imageSpaceShader, shape, param);
 }
 
 void FoveatedRender::HDRTonemapFadeRenderHook::thunk(
 	void* imageSpaceShader, RE::BSTriShape* shape, RE::ImageSpaceEffectParam* param)
 {
+	if (globals::game::isVR) {
+		func(imageSpaceShader, shape, param);
+		NeuralRendering::ApplyVrAfterTonemap();
+		return;
+	}
 	RunImagespaceAtDestinationViewport<HDRTonemapFadeRenderHook>(imageSpaceShader, shape, param);
 }
 
@@ -1469,11 +1481,11 @@ void FoveatedRender::DrawNeuralRenderingSettings(bool wrapHeader)
 				vrSixPreview ? vrPreviewInH :
 					(model3Preview ? upscaling.dx12SwapChain.LogicalHeight() : 0u));
 			ImGui::TextDisabled("%s", globals::game::isVR ?
-				T(TKEY("injection_point_vr"), "Injection Point: After Post on kTEMP, owned per-eye Submit") :
+				T(TKEY("injection_point_vr"), "Injection Point: After Tonemap on kTEMP (KIT TS)") :
 				T(TKEY("injection_point"), "Injection Point: PostInject LDR / Before UI (fixed)"));
 			if (globals::game::isVR)
 				ImGui::TextDisabled("%s", T(TKEY("vr_six_pass_note"),
-					"kTEMP 8-pass per eye, then our Submit. Engine world Submit is swallowed."));
+					"Read/write kTEMP per eye, then engine blit to kTOTAL. Engine Submit is unchanged. No FG."));
 			DrawSixPassOverview(previewPlan, settings.unifiedPipeline.fusionEnabled,
 				settings.flatPipelineSharpen);
 			ImGui::Separator();

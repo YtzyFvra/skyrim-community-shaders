@@ -58,16 +58,19 @@ namespace NeuralRendering
 		[[nodiscard]] std::uint32_t ApiVersion() const { return apiVersion_; }
 		[[nodiscard]] std::uint64_t SuccessfulFrames() const { return successfulFrames_; }
 
+		static constexpr std::uint32_t kFeatureSlotCount = 4;
+		static constexpr std::uint32_t kAct3FeatureSlotBase = 2;
+
 	private:
 		void* module_ = nullptr;
 		void* parameters_ = nullptr;
-		void* featureHandles_[2]{};
-		std::uint32_t featureInputWidth_[2]{};
-		std::uint32_t featureInputHeight_[2]{};
-		std::uint32_t featureColorWidth_[2]{};
-		std::uint32_t featureColorHeight_[2]{};
-		std::uint32_t featureOutputWidth_[2]{};
-		std::uint32_t featureOutputHeight_[2]{};
+		void* featureHandles_[kFeatureSlotCount]{};
+		std::uint32_t featureInputWidth_[kFeatureSlotCount]{};
+		std::uint32_t featureInputHeight_[kFeatureSlotCount]{};
+		std::uint32_t featureColorWidth_[kFeatureSlotCount]{};
+		std::uint32_t featureColorHeight_[kFeatureSlotCount]{};
+		std::uint32_t featureOutputWidth_[kFeatureSlotCount]{};
+		std::uint32_t featureOutputHeight_[kFeatureSlotCount]{};
 		ID3D12Device* device_ = nullptr;
 		RuntimeStatus status_ = RuntimeStatus::NotProbed;
 		std::filesystem::path path_;

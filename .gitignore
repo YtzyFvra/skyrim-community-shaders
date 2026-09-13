@@ -31,3 +31,6 @@ shadertoolsconfig.json
 
 # Proprietary DLSS Neural Rendering runtime; install locally, never distribute.
 **/nvngx_dlssnr.dll
+
+# Local working notes (Fable VR FG). Not shipped.
+/开发说明/

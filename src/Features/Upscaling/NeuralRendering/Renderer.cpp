@@ -8,6 +8,7 @@
 #include <array>
 #include <atomic>
 #include <mutex>
+#include <string>
 #include <utility>
 
 #include <d3d11.h>
@@ -272,7 +273,7 @@ namespace NeuralRendering
 			interop.Shutdown();
 			eyes = {};
 			ResetAsyncSlots();
-			resetPending = { true, true };
+			resetPending.fill(true);
 			failureLatched = false;
 			model3Device = nullptr;
 			if (!runtime.Probe() || !runtime.Initialize(externalDevice)) {
@@ -294,7 +295,7 @@ namespace NeuralRendering
 			std::uint32_t slot)
 		{
 			std::scoped_lock lock(submissionMutex);
-			if (!model3Device || runtime.Status() != RuntimeStatus::Initialized || slot >= 2)
+			if (!model3Device || runtime.Status() != RuntimeStatus::Initialized || slot >= Runtime::kFeatureSlotCount)
 				return false;
 			return runtime.Execute(commandList, slot, color, depth, motionVectors, output,
 				width, height, width, height, width, height,
@@ -306,8 +307,7 @@ namespace NeuralRendering
 			std::scoped_lock lock(submissionMutex);
 			if (!model3Device)
 				return;
-			runtime.ResetFeature(0);
-			runtime.ResetFeature(1);
+			runtime.ResetFeatures();
 			runtime.Shutdown();
 			model3Device = nullptr;
 			model3DrainOwner = {};
@@ -324,7 +324,7 @@ namespace NeuralRendering
 				if (drained) {
 					std::scoped_lock lock(submissionMutex);
 					runtime.ResetFeatures();
-					resetPending = { true, true };
+					resetPending.fill(true);
 					failureLatched = false;
 					copyDepthGuideCS.Reset();
 				}
@@ -339,7 +339,7 @@ namespace NeuralRendering
 				interop.Shutdown();
 				eyes = {};
 				ResetAsyncSlots();
-				resetPending = { true, true };
+				resetPending.fill(true);
 				failureLatched = false;
 				model3Device = nullptr;
 				copyDepthGuideCS.Reset();
@@ -357,7 +357,7 @@ namespace NeuralRendering
 			if (!model3Device)
 				interop.WaitForIdle();
 			runtime.ResetFeatures();
-			resetPending = { true, true };
+			resetPending.fill(true);
 		}
 
 		[[nodiscard]] bool IsFailureLatched() const { return failureLatched; }
@@ -568,13 +568,19 @@ namespace NeuralRendering
 			eye = {};
 			if (eyeIndex == 0)
 				ResetAsyncSlots();
-			const std::string suffix = eyeIndex == 0 ? "Left" : "Right";
-			if (!interop.CreateSharedTexture(colorDesc, eye.color, ("NeuralRendering::Color" + suffix).c_str()) ||
-				!interop.CreateSharedTexture(outputDesc, eye.output, ("NeuralRendering::Output" + suffix).c_str()) ||
-				!interop.CreateSharedTexture(depthDesc, eye.depth, ("NeuralRendering::Depth" + suffix).c_str()) ||
-				!interop.CreateSharedTexture(motionDesc, eye.motionVectors, ("NeuralRendering::Motion" + suffix).c_str()))
+			const char* suffix = "Left";
+			if (eyeIndex == 1)
+				suffix = "Right";
+			else if (eyeIndex == Runtime::kAct3FeatureSlotBase)
+				suffix = "Act3Left";
+			else if (eyeIndex == Runtime::kAct3FeatureSlotBase + 1)
+				suffix = "Act3Right";
+			if (!interop.CreateSharedTexture(colorDesc, eye.color, (std::string("NeuralRendering::Color") + suffix).c_str()) ||
+				!interop.CreateSharedTexture(outputDesc, eye.output, (std::string("NeuralRendering::Output") + suffix).c_str()) ||
+				!interop.CreateSharedTexture(depthDesc, eye.depth, (std::string("NeuralRendering::Depth") + suffix).c_str()) ||
+				!interop.CreateSharedTexture(motionDesc, eye.motionVectors, (std::string("NeuralRendering::Motion") + suffix).c_str()))
 				return false;
-			resetPending = { true, true };
+			resetPending[eyeIndex] = true;
 			logger::info("[DLSSNR] resources eye={} guides={}x{} color={}x{}", eyeIndex, guideWidth, guideHeight, colorWidth, colorHeight);
 			return true;
 		}
@@ -663,9 +669,9 @@ namespace NeuralRendering
 		Runtime runtime;
 		mutable std::mutex submissionMutex;
 		Util::LazyShader<ID3D11ComputeShader> copyDepthGuideCS;
-		std::array<EyeResources, 2> eyes;
+		std::array<EyeResources, Runtime::kFeatureSlotCount> eyes;
 		std::array<AsyncSlot, 3> asyncSlots;
-		std::array<bool, 2> resetPending{ true, true };
+		std::array<bool, Runtime::kFeatureSlotCount> resetPending{ true, true, true, true };
 		std::uint32_t asyncProducerCursor = 0;
 		std::atomic_bool asyncFallbackPending = false;
 		bool failureLatched = false;

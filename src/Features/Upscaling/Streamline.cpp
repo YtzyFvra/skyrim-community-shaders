@@ -555,10 +555,11 @@ sl::DLSSMode Streamline::DLSSModeForQualityMode(uint32_t a_qualityMode)
 	}
 }
 
-void Streamline::ClampToDLSSRenderRange(uint32_t a_qualityMode, uint32_t a_outputWidth, uint32_t a_outputHeight, uint32_t& a_renderWidth, uint32_t& a_renderHeight)
+bool Streamline::QueryDLSSRenderRange(uint32_t a_qualityMode, uint32_t a_outputWidth, uint32_t a_outputHeight,
+	uint32_t& a_renderWidthMin, uint32_t& a_renderHeightMin, uint32_t& a_renderWidthMax, uint32_t& a_renderHeightMax)
 {
-	if (!featureDLSS || !slDLSSGetOptimalSettings)
-		return;
+	if (!featureDLSS || !slDLSSGetOptimalSettings || !a_outputWidth || !a_outputHeight)
+		return false;
 
 	sl::DLSSOptions options{};
 	options.mode = DLSSModeForQualityMode(a_qualityMode);
@@ -566,8 +567,25 @@ void Streamline::ClampToDLSSRenderRange(uint32_t a_qualityMode, uint32_t a_outpu
 	options.outputHeight = a_outputHeight;
 	sl::DLSSOptimalSettings optimal{};
 	if (slDLSSGetOptimalSettings(options, optimal) != sl::Result::eOk)
-		return;
+		return false;
 	if (!optimal.renderWidthMin || !optimal.renderHeightMin || !optimal.renderWidthMax || !optimal.renderHeightMax)
+		return false;
+
+	a_renderWidthMin = optimal.renderWidthMin;
+	a_renderHeightMin = optimal.renderHeightMin;
+	a_renderWidthMax = optimal.renderWidthMax;
+	a_renderHeightMax = optimal.renderHeightMax;
+	return true;
+}
+
+void Streamline::ClampToDLSSRenderRange(uint32_t a_qualityMode, uint32_t a_outputWidth, uint32_t a_outputHeight, uint32_t& a_renderWidth, uint32_t& a_renderHeight)
+{
+	uint32_t renderWidthMin = 0;
+	uint32_t renderHeightMin = 0;
+	uint32_t renderWidthMax = 0;
+	uint32_t renderHeightMax = 0;
+	if (!QueryDLSSRenderRange(a_qualityMode, a_outputWidth, a_outputHeight,
+			renderWidthMin, renderHeightMin, renderWidthMax, renderHeightMax))
 		return;
 
 	// Prefer even dims (half-res buffer alignment) but never leave the NGX range.
@@ -579,12 +597,12 @@ void Streamline::ClampToDLSSRenderRange(uint32_t a_qualityMode, uint32_t a_outpu
 			--v;
 		return v;
 	};
-	const uint32_t clampedW = clampEven(a_renderWidth, optimal.renderWidthMin, optimal.renderWidthMax);
-	const uint32_t clampedH = clampEven(a_renderHeight, optimal.renderHeightMin, optimal.renderHeightMax);
+	const uint32_t clampedW = clampEven(a_renderWidth, renderWidthMin, renderWidthMax);
+	const uint32_t clampedH = clampEven(a_renderHeight, renderHeightMin, renderHeightMax);
 	if (clampedW != a_renderWidth || clampedH != a_renderHeight)
 		logger::info("[Streamline] Render extent {}x{} clamped to DLSS mode {} range [{}x{}..{}x{}] -> {}x{}",
 			a_renderWidth, a_renderHeight, a_qualityMode,
-			optimal.renderWidthMin, optimal.renderHeightMin, optimal.renderWidthMax, optimal.renderHeightMax,
+			renderWidthMin, renderHeightMin, renderWidthMax, renderHeightMax,
 			clampedW, clampedH);
 	a_renderWidth = clampedW;
 	a_renderHeight = clampedH;
@@ -903,16 +921,19 @@ bool Streamline::EvaluateDLSS(sl::ViewportHandle vp, uint32_t eyeIndex,
 
 	SetDLSSOptions(vp, outputWidth, outputHeight, modeOverride, hdrOverride, presetOverride, sharpnessOverride);
 
-	sl::ResourceTag tags[] = {
+	sl::ResourceTag tags[6] = {
 		{ &colorInRes, sl::kBufferTypeScalingInputColor, sl::ResourceLifecycle::eOnlyValidNow, &extentIn },
 		{ &colorOutRes, sl::kBufferTypeScalingOutputColor, sl::ResourceLifecycle::eOnlyValidNow, &extentOut },
 		{ &depthRes, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent, &extentIn },
 		{ &mvecRes, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent, &extentIn },
-		{ &reactiveMaskRes, sl::kBufferTypeBiasCurrentColorHint, sl::ResourceLifecycle::eValidUntilPresent, &extentIn },
-		{ &transparencyMaskRes, sl::kBufferTypeTransparencyHint, sl::ResourceLifecycle::eValidUntilPresent, &extentIn }
 	};
+	uint32_t tagCount = 4;
+	if (reactiveMask)
+		tags[tagCount++] = { &reactiveMaskRes, sl::kBufferTypeBiasCurrentColorHint, sl::ResourceLifecycle::eValidUntilPresent, &extentIn };
+	if (transparencyMask)
+		tags[tagCount++] = { &transparencyMaskRes, sl::kBufferTypeTransparencyHint, sl::ResourceLifecycle::eValidUntilPresent, &extentIn };
 
-	slSetTag(vp, tags, _countof(tags), context);
+	slSetTag(vp, tags, tagCount, context);
 
 	sl::ViewportHandle view(vp);
 	const sl::BaseStructure* inputs[] = { &view };
@@ -977,6 +998,9 @@ bool Streamline::ShouldLogDLSSProblem(DLSSLogKind a_kind, uint32_t a_eye, uint32
 
 void Streamline::Upscale(ID3D11Resource* a_upscalingTexture, ID3D11Resource* a_reactiveMask, ID3D11Resource* a_transparencyCompositionMask, ID3D11Resource* a_motionVectors)
 {
+	if (globals::features::upscaling.ShouldSkipUpscalingDlss())
+		return;
+
 	auto state = globals::state;
 
 	auto renderer = globals::game::renderer;

@@ -23,7 +23,8 @@ namespace NeuralRendering::ARISE
 			if (VrSubmitDlssg::TrySubmit(openVR, texture, bounds, flags, func, ownedError))
 				return ownedError;
 			auto& pipeline = Pipeline::Instance();
-			if (pipeline.IsEnabled() && texture) {
+			const auto textureAddr = reinterpret_cast<std::uintptr_t>(texture);
+			if (pipeline.IsEnabled() && textureAddr >= 0x10000 && textureAddr <= 0x00007FFFFFFFFFFFull) {
 				pipeline.Enqueue({
 					.source = Pipeline::SubmitTicket::Source::kVrSubmit,
 					.frameId = globals::state ? globals::state->frameCount : 0,

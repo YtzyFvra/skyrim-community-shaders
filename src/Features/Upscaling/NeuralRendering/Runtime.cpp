@@ -284,7 +284,7 @@ namespace NeuralRendering
 		std::uint32_t outputWidth, std::uint32_t outputHeight,
 		float motionVectorScaleX, float motionVectorScaleY, const Tuning& tuning, bool reset)
 	{
-		if (status_ != RuntimeStatus::Initialized || !commandList || slot >= 2 || !color || !depth || !motionVectors || !output)
+		if (status_ != RuntimeStatus::Initialized || !commandList || slot >= kFeatureSlotCount || !color || !depth || !motionVectors || !output)
 			return false;
 		auto* parameters = static_cast<NVSDK_NGX_Parameter*>(parameters_);
 		auto create = reinterpret_cast<CreateFeature>(GetProcAddress(static_cast<HMODULE>(module_), "NVSDK_NGX_D3D12_CreateFeature"));
@@ -388,7 +388,7 @@ namespace NeuralRendering
 
 	void Runtime::ResetFeature(std::uint32_t slot)
 	{
-		if (!module_ || slot >= 2)
+		if (!module_ || slot >= kFeatureSlotCount)
 			return;
 		SignedRuntimePathScope scope(static_cast<HMODULE>(module_), path_.parent_path() / L"nvngx.dll");
 		auto release = reinterpret_cast<ReleaseFeature>(GetProcAddress(static_cast<HMODULE>(module_), "NVSDK_NGX_D3D12_ReleaseFeature"));
@@ -400,12 +400,13 @@ namespace NeuralRendering
 		}
 		featureHandles_[slot] = nullptr;
 		featureInputWidth_[slot] = featureInputHeight_[slot] = 0;
+		featureColorWidth_[slot] = featureColorHeight_[slot] = 0;
 		featureOutputWidth_[slot] = featureOutputHeight_[slot] = 0;
 	}
 
 	void Runtime::ResetFeatures()
 	{
-		for (std::uint32_t slot = 0; slot < 2; ++slot)
+		for (std::uint32_t slot = 0; slot < kFeatureSlotCount; ++slot)
 			ResetFeature(slot);
 		successfulFrames_ = 0;
 	}

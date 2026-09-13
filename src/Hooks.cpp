@@ -598,6 +598,9 @@ struct BSShaderRenderTargets_Create
 		// targets — the one place BSOpenVR is available and we can still influence RT allocation.
 		if (globals::features::upscaling.ShouldEngagePerfMode())
 			globals::features::upscaling.perfMode.InstallRenderTargetSizeHook();
+		else if (globals::features::upscaling.IsVrDlssPostInjectActive() &&
+			globals::features::upscaling.settings.renderAtUpscaleRes)
+			logger::info("[PerfMode] Held off for VR DLSS Booster no-FG writeback; engine stays at native E");
 
 		// Open PerfMode's enlarge window across the engine's Create() so
 		// its 3 per-site thunks override props for the displayRes RTs.
