@@ -92,6 +92,10 @@ public:
 		// Generated frames per real frame (1=2x). Clamped at apply time to the
 		// hardware-reported DLSSGState::numFramesToGenerateMax.
 		uint dlssgFramesToGenerate = 1;
+		// VR owned-Submit test. 0 = form 1 (engine Submit). Runtime; VR menu only.
+		uint vrSubmitTest = 0;
+		// VR ARISE Tail owns WaitGetPoses + Submit. Restart-gated; do not flip useArise.
+		bool vrArise = false;
 		uint streamlineLogLevel = 0;  // 0=Off, 1=Default, 2=Verbose
 		// Both default to 0.8, matching AMD's own FSR3 sample default.
 		float sharpnessFSR = 0.8f;
@@ -141,8 +145,9 @@ public:
 	// presetDLSS is deliberately NOT here: Streamline::SetDLSSOptions reads
 	// settings.presetDLSS per-frame and applies it via slDLSSSetOptions, so
 	// it's already runtime-effective.
-	inline static constexpr Util::Settings::RestartTable<Settings, 12> kRestartFields{ {
+	inline static constexpr Util::Settings::RestartTable<Settings, 13> kRestartFields{ {
 		UTIL_RESTART_FIELD(Settings, frameGenerationMode, "Frame Generation"),
+		UTIL_RESTART_FIELD(Settings, vrArise, "VR ARISE"),
 		UTIL_RESTART_FIELD(Settings, frameGenerationForceEnable, "Force Enable Frame Generation"),
 		UTIL_RESTART_FIELD(Settings, preferFSRFrameGen, "Prefer AMD FSR Frame Generation"),
 		UTIL_RESTART_FIELD(Settings, renderAtUpscaleRes, "Render at Upscaled Resolution"),

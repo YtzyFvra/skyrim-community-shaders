@@ -11,6 +11,7 @@
 #include "Features/Upscaling/FoveatedRender/Core.h"
 #include "Features/Upscaling/FoveatedRender/Ops.h"
 #ifdef ENABLE_SKYRIM_VR
+#	include "Features/Upscaling/VrAriseTail.h"
 #	include "Features/Upscaling/VrSubmitDlssg.h"
 #endif
 #include "Globals.h"
@@ -1627,8 +1628,10 @@ namespace NeuralRendering
 					continue;
 				if (!vrSixPassTempLogged) {
 					vrSixPassTempLogged = true;
-					logger::info("[VrSixPass] kTEMP rt={} {}x{} fmt={}", static_cast<int>(slot),
-						desc.Width, desc.Height, static_cast<int>(desc.Format));
+					logger::info("[VrSixPass] kTEMP rt={} {}x{} fmt={} ({})", static_cast<int>(slot),
+						desc.Width, desc.Height, static_cast<int>(desc.Format),
+						desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM ? "RGBA8" :
+						desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM ? "RGB10A2" : "other");
 				}
 				return tex;
 			}
@@ -1973,6 +1976,11 @@ namespace NeuralRendering
 					postDesc.Width, postDesc.Height, engineW, engineH, subInW, subInH, subOutW, subOutH);
 				vrSixPassLogged = true;
 			}
+#ifdef ENABLE_SKYRIM_VR
+			if (VrAriseTail::IsActive())
+				VrAriseTail::PublishKTemp(postTemp);
+			VrSubmitDlssg::RunSubmitTest(postTemp, upscaling.settings.vrSubmitTest);
+#endif
 			return true;
 		}
 

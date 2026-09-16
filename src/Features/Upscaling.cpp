@@ -17,6 +17,8 @@
 #include "Upscaling/NeuralRendering/Integration.h"
 #include "Upscaling/PerfMode.h"
 #include "Upscaling/Streamline.h"
+#include "Upscaling/VrAriseTail.h"
+#include "Upscaling/VrSubmitDlssg.h"
 #include "Utils/DevBenchUx.h"
 #include "Utils/Game.h"
 #include "Utils/UI.h"
@@ -44,6 +46,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	frameGenerationAllowInMenus,
 	preferFSRFrameGen,
 	dlssgFramesToGenerate,
+	vrSubmitTest,
+	vrArise,
 	streamlineLogLevel,
 	sharpnessFSR,
 	sharpnessEnabledDLSS,
@@ -662,6 +666,25 @@ void Upscaling::RegisterUxActions()
 		[](Feature*, const json& args) {
 			foveatedRender.subrectController.ApplyPresetByName(args.value("name", std::string{}));
 		});
+	FEATURE_COMMAND("setVrArise",
+		"Enable or disable VR ARISE Tail takeover (restart-gated X1: Tail owns WaitGetPoses and Submit). Params: enabled (bool).",
+		[](Feature* self, const json& args) {
+			static_cast<Upscaling*>(self)->settings.vrArise = args.value("enabled", false);
+		});
+	FEATURE_QUERY("vrAriseStatus",
+		"X1 Tail status -> {active, path, lastWaitMs, submits, lastWaitErr, lastSubmitL, lastSubmitR}.",
+		([](const Feature*, const json&) -> json {
+			const auto s = VrAriseTail::GetStatus();
+			json out;
+			out["active"] = s.active;
+			out["path"] = s.path;
+			out["lastWaitMs"] = s.lastWaitMs;
+			out["submits"] = s.submits;
+			out["lastWaitErr"] = s.lastWaitErr;
+			out["lastSubmitL"] = s.lastSubmitL;
+			out["lastSubmitR"] = s.lastSubmitR;
+			return out;
+		}));
 }
 
 void Upscaling::DrawDlssModelControls()
@@ -696,9 +719,24 @@ void Upscaling::DrawDlssModelControls()
 void Upscaling::DrawFrameGenerationSettings()
 {
 	if (ImGui::TreeNodeEx(T(TKEY("frame_generation"), "Frame Generation"), ImGuiTreeNodeFlags_DefaultOpen)) {
-		if (globals::game::isVR)
+		if (globals::game::isVR) {
 			ImGui::TextWrapped("%s", T(TKEY("frame_generation_vr_unavailable"),
 				"VR: frame generation is not wired on this build. Neural Rendering writes back to the engine frame; the engine submits."));
+			int submitTest = static_cast<int>(settings.vrSubmitTest);
+			if (ImGui::SliderInt(T(TKEY("vr_submit_test"), "VR Submit Test"), &submitTest, 0, 4))
+				settings.vrSubmitTest = static_cast<uint>(submitTest);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("%s", T(TKEY("vr_submit_test_tooltip"),
+					"0 = form 1. 1–3 = prior Submit tests. 4 = retired (do not use).\n"
+					"Runtime; no restart. Inert while VR ARISE is on."));
+			}
+			ImGui::Checkbox(T(TKEY("vr_arise"), "VR ARISE (X2 Tail)"), &settings.vrArise);
+			Util::UI::RestartGatedAnnotate(bootSnapshot, settings, &Settings::vrArise,
+				T(TKEY("vr_arise_tooltip"),
+					"From the next launch, Tail owns WaitGetPoses and Submit on its own D3D12\n"
+					"device. Engine Submit is swallowed (no HUD this version). Do not enable\n"
+					"without a restart — the runtime session binds on the first Submit."));
+		}
 		ImGui::Text("%s", T(TKEY("frame_generation_desc"),
 							  "Frame Generation interpolates real frames with generated ones for a smoother experience"));
 
@@ -1360,6 +1398,10 @@ bool Upscaling::MenuOpenCloseEventHandler::Register()
 
 void Upscaling::Load()
 {
+#ifdef ENABLE_SKYRIM_VR
+	if (globals::game::isVR)
+		VrSubmitDlssg::Install();
+#endif
 	ApplyOpenCompositeUpscalingBlocker(true);
 	if (const auto& blocker = GetOpenCompositeUpscalingBlocker(); blocker.active) {
 		logger::warn("[Upscaling] Skipping D3D11 device hook because OpenComposite has {}=true.", blocker.settingName);
@@ -2361,6 +2403,7 @@ void Upscaling::SetupResources()
 void Upscaling::ClearShaderCache()
 {
 	foveatedRender.ClearShaderCache();
+	VrSubmitDlssg::ClearShaderCache();
 	for (auto& methodSlot : encodeTexturesCS) {
 		for (auto& outputSlot : methodSlot) {
 			outputSlot.Reset();

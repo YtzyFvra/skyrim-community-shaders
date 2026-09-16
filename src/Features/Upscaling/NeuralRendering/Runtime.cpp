@@ -1,6 +1,7 @@
 #include "Runtime.h"
 
 #include "Util.h"
+#include "Utils/WinApi.h"
 
 #include <Windows.h>
 #include <Psapi.h>
@@ -274,6 +275,7 @@ namespace NeuralRendering
 		}
 		parameters_ = parameters;
 		status_ = RuntimeStatus::Initialized;
+		Util::DisableConsoleQuickEdit();
 		return true;
 	}
 
@@ -336,6 +338,7 @@ namespace NeuralRendering
 			logger::info("[DLSSNR] Feature contract slot={} input={}x{} output={}x{} scalingRatio={:.4f}",
 				slot, inputWidth, inputHeight, outputWidth, outputHeight,
 				static_cast<float>(outputWidth) / inputWidth);
+			Util::DisableConsoleQuickEdit();
 			reset = true;
 		}
 
@@ -383,6 +386,8 @@ namespace NeuralRendering
 			return false;
 		}
 		++successfulFrames_;
+		if (successfulFrames_ <= 8)
+			Util::DisableConsoleQuickEdit();
 		return true;
 	}
 

@@ -20,4 +20,10 @@ namespace Util
 	 * @return The logical processor count for performance cores.
 	 */
 	uint32_t GetPerformanceCoreCount();
+
+	/**
+	 * @brief Turn off console Quick Edit so a click on the NGX log window
+	 * cannot freeze the thread that is writing Eval lines.
+	 */
+	void DisableConsoleQuickEdit();
 }  // namespace Util

@@ -1,7 +1,23 @@
 #include "WinApi.h"
 
+#include <Windows.h>
+
 namespace Util
 {
+	void DisableConsoleQuickEdit()
+	{
+		const HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
+		if (!input || input == INVALID_HANDLE_VALUE)
+			return;
+		DWORD mode = 0;
+		if (!GetConsoleMode(input, &mode))
+			return;
+		mode |= ENABLE_EXTENDED_FLAGS;
+		SetConsoleMode(input, mode);
+		mode &= ~(ENABLE_QUICK_EDIT_MODE | ENABLE_INSERT_MODE);
+		mode |= ENABLE_EXTENDED_FLAGS;
+		SetConsoleMode(input, mode);
+	}
 	std::optional<REL::Version> GetDllVersion(const std::wstring& dllPath)
 	{
 		DWORD handle = 0;

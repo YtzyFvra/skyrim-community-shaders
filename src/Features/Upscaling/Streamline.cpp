@@ -461,20 +461,13 @@ bool Streamline::SetConstants(const sl::FrameToken& token, const sl::Constants& 
 	return initialized && slSetConstants && slSetConstants(constants, token, viewportHandle) == sl::Result::eOk;
 }
 
-bool Streamline::CheckFrameConstants(sl::ViewportHandle p_viewport, uint32_t eyeIndex,
+bool Streamline::FillConstants(sl::Constants& slConstants, uint32_t eyeIndex,
 	bool forceReset, bool forceZeroJitter, float jitterScaleX, float jitterScaleY)
 {
-	if (!initialized)
+	if (!initialized || !globals::state || !globals::game::cameraNear || !globals::game::cameraFar)
 		return false;
-
-	if (!EnsureFrameToken())
-		return false;
-
-	// In VR, we need to set constants for each viewport/eye separately
-	// In non-VR, this is called once per frame
 	auto state = globals::state;
-
-	sl::Constants slConstants = {};
+	slConstants = {};
 
 	// Calculate aspect ratio for the SINGLE EYE
 	float eyeWidth = state->screenSize.x * (globals::game::isVR ? 0.5f : 1.0f);
@@ -530,12 +523,21 @@ bool Streamline::CheckFrameConstants(sl::ViewportHandle p_viewport, uint32_t eye
 	slConstants.orthographicProjection = sl::Boolean::eFalse;
 	slConstants.motionVectorsDilated = sl::Boolean::eFalse;
 	slConstants.motionVectorsJittered = sl::Boolean::eFalse;
+	return true;
+}
 
+bool Streamline::CheckFrameConstants(sl::ViewportHandle p_viewport, uint32_t eyeIndex,
+	bool forceReset, bool forceZeroJitter, float jitterScaleX, float jitterScaleY)
+{
+	if (!EnsureFrameToken())
+		return false;
+	sl::Constants slConstants{};
+	if (!FillConstants(slConstants, eyeIndex, forceReset, forceZeroJitter, jitterScaleX, jitterScaleY))
+		return false;
 	if (SL_FAILED(res, slSetConstants(slConstants, *frameToken, p_viewport))) {
 		logger::error("[Streamline {}] Could not set constants for eye {}", instanceTag, eyeIndex);
 		return false;
 	}
-
 	return true;
 }
 
@@ -1295,6 +1297,14 @@ void Streamline::ConfigureDLSSG(bool enabled, uint32_t guideWidth, uint32_t guid
 	uint32_t colorWidth, uint32_t colorHeight, DXGI_FORMAT depthFormat, DXGI_FORMAT motionFormat,
 	DXGI_FORMAT hudLessFormat, DXGI_FORMAT uiFormat, uint32_t backBufferCount)
 {
+	ConfigureDLSSG(viewport, enabled, guideWidth, guideHeight, colorWidth, colorHeight, depthFormat,
+		motionFormat, hudLessFormat, uiFormat, backBufferCount);
+}
+
+void Streamline::ConfigureDLSSG(sl::ViewportHandle viewportHandle, bool enabled, uint32_t guideWidth,
+	uint32_t guideHeight, uint32_t colorWidth, uint32_t colorHeight, DXGI_FORMAT depthFormat,
+	DXGI_FORMAT motionFormat, DXGI_FORMAT hudLessFormat, DXGI_FORMAT uiFormat, uint32_t backBufferCount)
+{
 	if (!initialized || !slDLSSGSetOptions)
 		return;
 
@@ -1317,7 +1327,7 @@ void Streamline::ConfigureDLSSG(bool enabled, uint32_t guideWidth, uint32_t guid
 		options.uiBufferFormat = static_cast<uint32_t>(uiFormat);
 	}
 
-	if (SL_FAILED(result, slDLSSGSetOptions(viewport, options))) {
+	if (SL_FAILED(result, slDLSSGSetOptions(viewportHandle, options))) {
 		static bool errorLogged = false;
 		if (!errorLogged) {
 			errorLogged = true;
@@ -1327,7 +1337,7 @@ void Streamline::ConfigureDLSSG(bool enabled, uint32_t guideWidth, uint32_t guid
 
 	if (slDLSSGGetState && enabled) {
 		sl::DLSSGState state{};
-		if (SL_FAILED(stateResult, slDLSSGGetState(viewport, state, &options))) {
+		if (SL_FAILED(stateResult, slDLSSGGetState(viewportHandle, state, &options))) {
 			static uint32_t stateFailCount = 0;
 			if (++stateFailCount % 60 == 0) {
 				logger::warn("[Streamline DX12] slDLSSGGetState has failed {} times: {}", stateFailCount, magic_enum::enum_name(stateResult));
@@ -1400,13 +1410,13 @@ void Streamline::TagDX12Resources(ID3D12GraphicsCommandList* cmdList,
 	slSetTagForFrame(*frameToken, viewport, tags, numTags, cmdList);
 }
 
-void Streamline::TagDX12Resources(const sl::FrameToken& token, ID3D12GraphicsCommandList* cmdList,
+bool Streamline::TagDX12Resources(const sl::FrameToken& token, ID3D12GraphicsCommandList* cmdList,
 	ID3D12Resource* depth, ID3D12Resource* mvec, ID3D12Resource* hudLessColor,
 	ID3D12Resource* uiColorAndAlpha, uint32_t guideWidth, uint32_t guideHeight,
-	uint32_t displayWidth, uint32_t displayHeight)
+	uint32_t displayWidth, uint32_t displayHeight, sl::ViewportHandle viewportHandle)
 {
 	if (!initialized || !slSetTagForFrame || !cmdList || !depth || !mvec || !hudLessColor)
-		return;
+		return false;
 	sl::Extent guideExtent{ 0, 0, guideWidth, guideHeight };
 	sl::Extent displayExtent{ 0, 0, displayWidth, displayHeight };
 	sl::Resource depthRes{ sl::ResourceType::eTex2d, depth, D3D12_RESOURCE_STATE_COMMON };
@@ -1421,9 +1431,12 @@ void Streamline::TagDX12Resources(const sl::FrameToken& token, ID3D12GraphicsCom
 	};
 	const uint32_t count = uiColorAndAlpha ? static_cast<uint32_t>(std::size(tags)) :
 		static_cast<uint32_t>(std::size(tags) - 1);
-	const sl::Result tagResult = slSetTagForFrame(token, viewport, tags, count, cmdList);
-	if (tagResult != sl::Result::eOk)
+	const sl::Result tagResult = slSetTagForFrame(token, viewportHandle, tags, count, cmdList);
+	if (tagResult != sl::Result::eOk) {
 		logger::error("[Streamline DX12] ARISE frame resource tagging failed: {}", magic_enum::enum_name(tagResult));
+		return false;
+	}
+	return true;
 }
 
 /**

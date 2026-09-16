@@ -23,6 +23,7 @@
 #include "Features/SkySync.h"
 #include "Features/Upscaling.h"
 #include "Features/Upscaling/FoveatedRender/Bridge.h"
+#include "Features/Upscaling/VrAriseTail.h"
 #include "Features/VR.h"
 #include "Features/VolumetricLighting.h"
 #include "Features/Wind/Wind.h"
@@ -635,11 +636,13 @@ struct BSInputDeviceManager_PollInputDevices
 		// Logical-R modes own the physical DX12 present path, so Reflex acquires the
 		// frame token and sleeps on the game thread through the DX12 SL instance.
 		auto& upscaling = globals::features::upscaling;
-		if ((upscaling.dx12SwapChain.useArise || upscaling.UsesDLSSGFrameGen()) &&
-			upscaling.streamlineDX12.featureReflex)
-			upscaling.streamlineDX12.UpdateReflex();
-		else
-			upscaling.streamline.UpdateReflex();
+		if (!VrAriseTail::IsActive()) {
+			if ((upscaling.dx12SwapChain.useArise || upscaling.UsesDLSSGFrameGen()) &&
+				upscaling.streamlineDX12.featureReflex)
+				upscaling.streamlineDX12.UpdateReflex();
+			else
+				upscaling.streamline.UpdateReflex();
+		}
 
 		bool blockedDevice = true;
 

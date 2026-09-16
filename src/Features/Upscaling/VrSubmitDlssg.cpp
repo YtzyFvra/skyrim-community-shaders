@@ -2,7 +2,13 @@
 
 #include "../../Globals.h"
 #include "../../State.h"
+#include "../Upscaling.h"
+#include "GpuPass.h"
+#include "NeuralRendering/ArisePipeline.h"
+#include "Utils/LazyShader.h"
+#include "VrAriseTail.h"
 
+#include <Windows.h>
 #include <cstring>
 #include <d3d11.h>
 
@@ -43,6 +49,119 @@ namespace
 
 #ifdef ENABLE_SKYRIM_VR
 	thread_local bool g_inOwnedSubmit = false;
+	Util::LazyShader<ID3D11ComputeShader> bandCS;
+	eastl::unique_ptr<Texture2D> testSbsA;
+	eastl::unique_ptr<Texture2D> testSbsB;
+	eastl::unique_ptr<ConstantBuffer> bandCB;
+	bool loggedMode2 = false;
+	bool loggedMode3 = false;
+	bool loggedMode4 = false;
+	bool loggedPaintFail = false;
+	winrt::com_ptr<ID3D11Query> gpuFence;
+
+	struct BandCB
+	{
+		float color[4];
+		std::uint32_t width;
+		std::uint32_t height;
+		std::uint32_t pad[2];
+	};
+	STATIC_ASSERT_ALIGNAS_16(BandCB);
+
+	bool EnsureTestSbs(eastl::unique_ptr<Texture2D>& slot, ID3D11Texture2D* kTemp,
+		const D3D11_TEXTURE2D_DESC& desc, const char* name)
+	{
+		if (slot && slot->resource) {
+			const auto& have = slot->desc;
+			if (have.Width == desc.Width && have.Height == desc.Height && have.Format == desc.Format)
+				return slot->uav != nullptr;
+		}
+		slot = Upscaling::CreateTextureFromSource(kTemp, desc.Width, desc.Height, false, true, true, name);
+		return slot && slot->resource && slot->uav;
+	}
+
+	bool PaintSolid(ID3D11DeviceContext* context, ID3D11UnorderedAccessView* uav,
+		std::uint32_t width, std::uint32_t height, const float color[4])
+	{
+		auto* cs = bandCS.Get(L"Data/Shaders/Upscaling/VrSubmitTestBand.hlsl", {}, "cs_5_0", "main",
+			"VrSubmitDlssg::BandCS");
+		if (!cs || !uav || !width || !height) {
+			if (!loggedPaintFail) {
+				logger::warn("[VrSubmitDlssg] mode 2 solid fill CS missing");
+				loggedPaintFail = true;
+			}
+			return false;
+		}
+		if (!bandCB)
+			bandCB = eastl::make_unique<ConstantBuffer>(ConstantBufferDesc<BandCB>(), "VrSubmitDlssg::BandCB");
+
+		BandCB cb{};
+		cb.color[0] = color[0];
+		cb.color[1] = color[1];
+		cb.color[2] = color[2];
+		cb.color[3] = color[3];
+		cb.width = width;
+		cb.height = height;
+		bandCB->Update(cb);
+
+		CS_GPU_PASS("VrSubmitDlssg::SolidFill");
+		context->CSSetShader(cs, nullptr, 0);
+		ID3D11Buffer* cbs[]{ bandCB->CB() };
+		context->CSSetConstantBuffers(0, 1, cbs);
+		ID3D11UnorderedAccessView* uavs[]{ uav };
+		context->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
+		context->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
+		ID3D11UnorderedAccessView* nullUav[]{ nullptr };
+		ID3D11Buffer* nullCb[]{ nullptr };
+		context->CSSetUnorderedAccessViews(0, 1, nullUav, nullptr);
+		context->CSSetConstantBuffers(0, 1, nullCb);
+		context->CSSetShader(nullptr, nullptr, 0);
+		return true;
+	}
+
+	void FlushAndFence(ID3D11DeviceContext* context)
+	{
+		auto* device = globals::d3d::device;
+		if (!device || !context)
+			return;
+		if (!gpuFence) {
+			D3D11_QUERY_DESC queryDesc{ D3D11_QUERY_EVENT, 0 };
+			if (FAILED(device->CreateQuery(&queryDesc, gpuFence.put())))
+				return;
+		}
+		context->End(gpuFence.get());
+		context->Flush();
+		while (context->GetData(gpuFence.get(), nullptr, 0, 0) == S_FALSE)
+			Sleep(0);
+	}
+
+	bool SubmitCompositorEyes(ID3D11Texture2D* sbs)
+	{
+		auto* compositor = RE::BSOpenVR::GetIVRCompositor();
+		if (!compositor || !sbs) {
+			if (!loggedMode3) {
+				logger::warn("[VrSubmitDlssg] mode 3 GetIVRCompositor missing");
+				loggedMode3 = true;
+			}
+			return false;
+		}
+		// Official OpenVR Texture_t — not the BSOpenVR vfunc 03 slot (that one is the
+		// ID3D11Texture2D* itself). Half-eye bounds; v unflipped (half-width only).
+		vr::Texture_t tex{};
+		tex.handle = sbs;
+		tex.eType = vr::TextureType_DirectX;
+		tex.eColorSpace = vr::ColorSpace_Auto;
+		const vr::VRTextureBounds_t left{ 0.f, 0.f, 0.5f, 1.f };
+		const vr::VRTextureBounds_t right{ 0.5f, 0.f, 1.f, 1.f };
+		const auto errL = compositor->Submit(vr::Eye_Left, &tex, &left, vr::Submit_Default);
+		const auto errR = compositor->Submit(vr::Eye_Right, &tex, &right, vr::Submit_Default);
+		if (!loggedMode3) {
+			logger::info("[VrSubmitDlssg] mode 3 IVRCompositor Submit L={} R={}",
+				static_cast<int>(errL), static_cast<int>(errR));
+			loggedMode3 = true;
+		}
+		return errL == vr::VRCompositorError_None && errR == vr::VRCompositorError_None;
+	}
 
 	const char* RtName(ID3D11Resource* handle)
 	{
@@ -99,6 +218,18 @@ namespace
 
 void VrSubmitDlssg::Install()
 {
+#ifdef ENABLE_SKYRIM_VR
+	if (globals::game::isVR)
+		NeuralRendering::ARISE::Pipeline::Instance().Install();
+#endif
+	VrAriseTail::Install();
+}
+
+void VrSubmitDlssg::ClearShaderCache()
+{
+#ifdef ENABLE_SKYRIM_VR
+	bandCS.Reset();
+#endif
 }
 
 void VrSubmitDlssg::NoteOwnedFrame(std::uint32_t frame)
@@ -111,7 +242,7 @@ void VrSubmitDlssg::NoteOwnedFrame(std::uint32_t frame)
 #ifdef ENABLE_SKYRIM_VR
 bool VrSubmitDlssg::SubmitOwnedSbs(ID3D11Texture2D* sbs, std::uint32_t width, std::uint32_t height)
 {
-	if (!globals::game::isVR || !sbs || !width || !height)
+	if (!globals::game::isVR || !sbs || !width || !height || VrAriseTail::IsActive())
 		return false;
 	auto* openVR = RE::BSOpenVR::GetSingleton();
 	if (!openVR)
@@ -138,19 +269,77 @@ bool VrSubmitDlssg::SubmitOwnedSbs(ID3D11Texture2D* sbs, std::uint32_t width, st
 	return true;
 }
 
+void VrSubmitDlssg::RunSubmitTest(ID3D11Texture2D* kTemp, std::uint32_t mode)
+{
+	if (!kTemp || mode == 0 || VrAriseTail::IsActive())
+		return;
+	D3D11_TEXTURE2D_DESC desc{};
+	kTemp->GetDesc(&desc);
+	if (mode == 1) {
+		SubmitOwnedSbs(kTemp, desc.Width, desc.Height);
+		return;
+	}
+	if (mode == 2) {
+		auto* context = globals::d3d::context;
+		if (!context ||
+			!EnsureTestSbs(testSbsA, kTemp, desc, "VrSubmitDlssg::TestSbsA") ||
+			!EnsureTestSbs(testSbsB, kTemp, desc, "VrSubmitDlssg::TestSbsB"))
+			return;
+		// Private copies only — never paint kTEMP. Magenta = first Submit, lime = second.
+		const float magenta[4]{ 1.f, 0.f, 1.f, 1.f };
+		const float lime[4]{ 0.f, 1.f, 0.f, 1.f };
+		const bool paintedA = PaintSolid(context, testSbsA->uav.get(), desc.Width, desc.Height, magenta);
+		context->Flush();
+		SubmitOwnedSbs(static_cast<ID3D11Texture2D*>(testSbsA->resource.get()), desc.Width, desc.Height);
+		const bool paintedB = PaintSolid(context, testSbsB->uav.get(), desc.Width, desc.Height, lime);
+		context->Flush();
+		SubmitOwnedSbs(static_cast<ID3D11Texture2D*>(testSbsB->resource.get()), desc.Width, desc.Height);
+		if (!loggedMode2) {
+			logger::info("[VrSubmitDlssg] mode 2 magenta then lime private SBS {}x{} paintA={} paintB={}",
+				desc.Width, desc.Height, paintedA, paintedB);
+			loggedMode2 = true;
+		}
+		return;
+	}
+	if (mode == 3) {
+		SubmitOwnedSbs(kTemp, desc.Width, desc.Height);
+		SubmitCompositorEyes(kTemp);
+		return;
+	}
+	if (mode == 4) {
+		if (!loggedMode4) {
+			logger::info("[VrSubmitDlssg] mode 4 retired; cross-thread Submit is not used");
+			loggedMode4 = true;
+		}
+		return;
+	}
+	static bool loggedUnsupported = false;
+	if (!loggedUnsupported) {
+		logger::info("[VrSubmitDlssg] vrSubmitTest mode {} not wired", mode);
+		loggedUnsupported = true;
+	}
+}
+
 bool VrSubmitDlssg::TrySubmit(RE::BSOpenVR*, const vr::Texture_t* texture,
 	const vr::VRTextureBounds_t*, vr::EVRSubmitFlags,
 	const REL::Relocation<SubmitFn>&, vr::EVRCompositorError& outError)
 {
 	outError = vr::VRCompositorError_None;
-	if (g_inOwnedSubmit || !ownedSubmitted)
+	if (g_inOwnedSubmit)
 		return false;
 
-	// See SubmitOwnedSbs: the engine hands the ID3D11Texture2D pointer itself in this slot.
 	ID3D11Resource* handle = nullptr;
 	const auto textureAddr = reinterpret_cast<std::uintptr_t>(texture);
 	if (texture && textureAddr >= 0x10000 && textureAddr <= 0x00007FFFFFFFFFFFull)
 		handle = reinterpret_cast<ID3D11Resource*>(const_cast<vr::Texture_t*>(texture));
+	if (handle && !IsOverlayRt(handle) && VrAriseTail::IsActive())
+		VrAriseTail::PublishKTemp(static_cast<ID3D11Texture2D*>(handle));
+
+	if (VrAriseTail::ShouldSwallowEngineSubmit())
+		return true;
+	if (!ownedSubmitted)
+		return false;
+
 	const bool overlay = IsOverlayRt(handle);
 	if (overlay) {
 		LogEngineSubmit(handle, true, false);

@@ -3,8 +3,10 @@
 #include "../../../Globals.h"
 #include "../../../State.h"
 #include "../FoveatedRender.h"
+#include "../VrAriseTail.h"
 #include "../VrSubmitDlssg.h"
 
+#include <d3d11.h>
 #include <dxgi.h>
 
 #include <Windows.h>
@@ -40,6 +42,23 @@ namespace NeuralRendering::ARISE
 
 		static inline REL::Relocation<decltype(thunk)> func;
 	};
+
+	struct SubmitForEyeHook
+	{
+		static vr::EVRCompositorError thunk(RE::BSOpenVR* openVR, vr::EVREye eye,
+			const vr::Texture_t* texture, const vr::VRTextureBounds_t* bounds, vr::EVRSubmitFlags flags)
+		{
+			const auto textureAddr = reinterpret_cast<std::uintptr_t>(texture);
+			if (texture && textureAddr >= 0x10000 && textureAddr <= 0x00007FFFFFFFFFFFull &&
+				VrAriseTail::IsActive())
+				VrAriseTail::PublishKTemp(reinterpret_cast<ID3D11Texture2D*>(const_cast<vr::Texture_t*>(texture)));
+			if (VrAriseTail::ShouldSwallowEngineSubmit())
+				return vr::VRCompositorError_None;
+			return func(openVR, eye, texture, bounds, flags);
+		}
+
+		static inline REL::Relocation<decltype(thunk)> func;
+	};
 }
 #endif
 
@@ -60,6 +79,7 @@ namespace NeuralRendering::ARISE
 #ifdef ENABLE_SKYRIM_VR
 		if (globals::game::isVR) {
 			stl::write_vfunc<0x03, SubmitHook>(RE::VTABLE_BSOpenVR[0]);
+			stl::write_vfunc<0x04, SubmitForEyeHook>(RE::VTABLE_BSOpenVR[0]);
 		}
 #endif
 	}
