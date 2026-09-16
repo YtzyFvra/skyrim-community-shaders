@@ -55,10 +55,8 @@ namespace
 	constexpr double kHmdHz = 72.0;
 	constexpr double kAppHz = 36.0;
 	constexpr DWORD kFenceWaitMs = 16;
-	// DLSS-G doorbell stays compiled but off: every ingest arrangement ended in a 2 s TDR on the
-	// session-bound queue. Tail ships as X3 (owned loop + throttled engine + kTEMP eyes) until an
-	// operator frame generator replaces the doorbell.
-	constexpr bool kFrameGenerationDoorbell = false;
+	// 09-15 23:20: one SBS chain on Queue12. Extra queues + pair assembly are what TDR'd.
+	constexpr bool kFrameGenerationDoorbell = true;
 
 	bool WaitFenceCpu(ID3D12Fence* fence, HANDLE event, UINT64 value, DWORD ms)
 	{
@@ -137,11 +135,6 @@ namespace
 	std::atomic<bool> publishPausedForLoad{ false };
 	std::atomic<LONGLONG> publishResumeQpc{ 0 };
 	std::atomic<bool> loggedGuides{ false };
-
-	bool DoorbellWarmupReady()
-	{
-		return publishResumeQpc.load(std::memory_order_acquire) != 0;
-	}
 
 	bool CreateSharedTex(ID3D11Device5* device5, UINT width, UINT height, DXGI_FORMAT format, UINT bindFlags,
 		ComPtr<ID3D11Texture2D>& tex, HANDLE& handle, const char* name)
@@ -844,7 +837,7 @@ namespace
 		void SubmitEyes(vr::IVRCompositor* compositor, vr::EVRCompositorError& errL, vr::EVRCompositorError& errR)
 		{
 			const vr::VRTextureBounds_t bounds{ 0.f, 0.f, 1.f, 1.f };
-			const bool withPose = submitInterp && submitPoseValid;
+			const bool withPose = false;
 			auto submitOne = [&](vr::EVREye eyeIndex, ID3D12Resource* resource, vr::EVRCompositorError& err) {
 				vr::D3D12TextureData_t dx12{};
 				dx12.m_pResource = resource;
@@ -1175,12 +1168,13 @@ namespace
 
 		bool PrepareShared(const SharedPublish& published, bool cropEyes)
 		{
-			if (!published.fenceValue || !copyQueue || !ImportShared(published) ||
+			if (!published.fenceValue || !queue || !ImportShared(published) ||
 				!EnsureColorFor(published.width, published.height, published.format))
 				return false;
-			if (!FenceReady(prepareFenceValue))
+			if (!WaitFenceCpu(openedSharedFence.Get(), fenceEvent, published.fenceValue, kFenceWaitMs))
 				return false;
-			copyQueue->Wait(openedSharedFence.Get(), published.fenceValue);
+			if (!WaitFenceTimeout(fenceValue, kFenceWaitMs))
+				return false;
 			if (FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.Get(), nullptr)))
 				return false;
 			if (colorState != D3D12_RESOURCE_STATE_COPY_DEST) {
@@ -1267,9 +1261,9 @@ namespace
 			if (FAILED(list->Close()))
 				return false;
 			ID3D12CommandList* lists[]{ list.Get() };
-			copyQueue->ExecuteCommandLists(1, lists);
+			queue->ExecuteCommandLists(1, lists);
 			++fenceValue;
-			copyQueue->Signal(fence.Get(), fenceValue);
+			queue->Signal(fence.Get(), fenceValue);
 			prepareFenceValue = fenceValue;
 			lastConsumed = published.fenceValue;
 			return true;
@@ -1278,12 +1272,11 @@ namespace
 
 		bool IngestSbs(ID3D12Resource* src, UINT w, UINT h, DXGI_FORMAT format)
 		{
-			if (!src || !copyQueue || !EnsureColorFor(w, h, format)) {
+			if (!src || !queue || !EnsureColorFor(w, h, format)) {
 				logger::error("[VrAriseTail] X4 IngestSbs refused: src={} {}x{}", src != nullptr, w, h);
 				return false;
 			}
-			if ((prepareFenceValue && !WaitFenceTimeout(prepareFenceValue)) ||
-				(ingestFenceValue && !WaitFenceTimeout(ingestFenceValue)))
+			if (!WaitFenceTimeout(fenceValue, kFenceWaitMs))
 				return false;
 			if (FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.Get(), nullptr))) {
 				logger::error("[VrAriseTail] X4 IngestSbs command list reset failed");
@@ -1344,11 +1337,11 @@ namespace
 			if (FAILED(list->Close()))
 				return false;
 			ID3D12CommandList* lists[]{ list.Get() };
-			copyQueue->ExecuteCommandLists(1, lists);
+			queue->ExecuteCommandLists(1, lists);
 			++fenceValue;
-			copyQueue->Signal(fence.Get(), fenceValue);
+			queue->Signal(fence.Get(), fenceValue);
 			ingestFenceValue = fenceValue;
-			return WaitFenceTimeout(ingestFenceValue);
+			return true;
 		}
 
 		bool IngestEyes(ID3D12Resource* left, ID3D12Resource* right, UINT w, UINT h, DXGI_FORMAT format,
@@ -1481,7 +1474,7 @@ namespace
 		}
 	};
 
-	constexpr UINT kRingSlots = 8;
+	constexpr UINT kRingSlots = 4;
 	constexpr UINT kPairSlots = 8;
 	using PresentFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT);
 
@@ -1529,6 +1522,7 @@ namespace
 		ComPtr<ID3D12GraphicsCommandList> kickList;
 		ComPtr<ID3D12Fence> kickFence;
 		HANDLE kickFenceEvent = nullptr;
+		HANDLE snapshotWaitEvent = nullptr;
 		uint64_t kickFenceValue = 0;
 		std::thread worker;
 		std::mutex kickMutex;
@@ -1548,7 +1542,11 @@ namespace
 		PresentFn origPresent[2]{};
 		std::mutex hookMutex;
 		uint64_t slotFence[2][kRingSlots]{};
+		uint64_t slotSeq[kRingSlots]{};
 		UINT writeSlot[2]{};
+		UINT holdSlot = kRingSlots;
+		std::atomic<uint64_t> produceSeq{ 0 };
+		std::atomic<uint64_t> consumeSeq{ 0 };
 		uint64_t kickGen = 0;
 		static constexpr UINT kPending = 32;
 		struct PendingPresent
@@ -1624,22 +1622,24 @@ namespace
 				CloseHandle(kickFenceEvent);
 				kickFenceEvent = nullptr;
 			}
+			if (snapshotWaitEvent) {
+				CloseHandle(snapshotWaitEvent);
+				snapshotWaitEvent = nullptr;
+			}
 		}
 
 		bool WaitRing(uint64_t value)
 		{
-			return WaitFenceCpu(ringFence.Get(), ringFenceEvent, value, kFenceWaitMs);
+			return WaitFenceCpu(ringFence.Get(), ringFenceEvent, value, INFINITE);
 		}
 
 		bool WaitKick()
 		{
-			return WaitFenceCpu(kickFence.Get(), kickFenceEvent, kickFenceValue, kFenceWaitMs);
+			return WaitFenceCpu(kickFence.Get(), kickFenceEvent, kickFenceValue, INFINITE);
 		}
 
 		ID3D12CommandQueue* Gpu() const
 		{
-			if (dx12 && dx12->gQueue)
-				return dx12->gQueue.Get();
 			return dx12 ? dx12->queue.Get() : nullptr;
 		}
 
@@ -1758,7 +1758,7 @@ namespace
 				return false;
 			};
 			auto& sl = globals::features::upscaling.streamlineDX12;
-			if (!dx12 || !dx12->device || !dx12->queue || !dx12->gQueue || !dx12->adapter)
+			if (!dx12 || !dx12->device || !dx12->queue || !dx12->adapter)
 				return fail("no Tail D3D12");
 			if (!sl.initialized || !sl.featureDLSSG || !sl.slUpgradeInterface)
 				return fail("DLSS-G not bound");
@@ -1803,7 +1803,7 @@ namespace
 			desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
 			desc.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
 			ComPtr<IDXGISwapChain1> sc1;
-			if (FAILED(factory->CreateSwapChainForHwnd(dx12->gQueue.Get(), hwnd[0], &desc, nullptr, nullptr, &sc1)))
+			if (FAILED(factory->CreateSwapChainForHwnd(dx12->queue.Get(), hwnd[0], &desc, nullptr, nullptr, &sc1)))
 				return fail("CreateSwapChainForHwnd");
 			if (FAILED(sc1.As(&swapChain[0])))
 				return fail("Query IDXGISwapChain3");
@@ -1818,6 +1818,7 @@ namespace
 			}
 			ringFenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
 			kickFenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+			snapshotWaitEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
 			if (FAILED(dx12->device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
 					IID_PPV_ARGS(&hookAlloc[0]))) ||
 				FAILED(dx12->device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, hookAlloc[0].Get(),
@@ -1833,7 +1834,7 @@ namespace
 				FAILED(kickList->Close()) ||
 				FAILED(dx12->device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&ringFence))) ||
 				FAILED(dx12->device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&kickFence))) ||
-				!ringFenceEvent || !kickFenceEvent || !CreateRing(sbsWidth, sbsHeight, fmt))
+				!ringFenceEvent || !kickFenceEvent || !snapshotWaitEvent || !CreateRing(sbsWidth, sbsHeight, fmt))
 				return fail("ring/hook/kick list");
 
 			void* proxy = swapChain[0].Get();
@@ -2106,6 +2107,7 @@ namespace
 		{
 			if (!ready.load(std::memory_order_acquire) || !self || eye != 0)
 				return;
+			std::lock_guard lock(hookMutex);
 			if (!WaitRing(lastHookFence[eye]))
 				return;
 			ComPtr<IDXGISwapChain3> sc3;
@@ -2117,7 +2119,9 @@ namespace
 				return;
 			if (FAILED(hookAlloc[eye]->Reset()) || FAILED(hookList[eye]->Reset(hookAlloc[eye].Get(), nullptr)))
 				return;
-			const UINT slot = writeSlot[eye];
+			UINT slot = writeSlot[eye];
+			if (slot == holdSlot)
+				slot = (slot + 1) % kRingSlots;
 			writeSlot[eye] = (slot + 1) % kRingSlots;
 			Transition(hookList[eye].Get(), src.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
 			Transition(hookList[eye].Get(), ring[eye][slot].Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -2132,28 +2136,11 @@ namespace
 			Gpu()->Signal(ringFence.Get(), value);
 			lastHookFence[eye] = value;
 			slotFence[eye][slot] = value;
-			uint64_t gen = 0;
-			bool interp = false;
-			std::lock_guard lock(hookMutex);
-			if (!ClassifyPresent(eye, gen, interp)) {
-				++nativePresents;
-				return;
-			}
-			if (auto* rec = RecFor(gen)) {
-				if (interp) {
-					rec->haveI[eye] = true;
-					rec->slotI[eye] = slot;
-					rec->fenceI[eye] = value;
-				} else {
-					rec->haveR[eye] = true;
-					rec->slotR[eye] = slot;
-					rec->fenceR[eye] = value;
-				}
-			}
+			slotSeq[slot] = ++produceSeq;
 			++nativePresents;
 			if (nativePresents <= 8 || (nativePresents % 120) == 0)
-				logger::info("[VrAriseTail] X4 native Present #{} eye={} gen={} kind={} slot={}",
-					nativePresents, eye, gen, interp ? "interp" : "real", slot);
+				logger::info("[VrAriseTail] X4 native Present #{} slot={} seq={}",
+					nativePresents, slot, slotSeq[slot]);
 		}
 
 		bool Snapshot(ID3D12Resource* color, UINT w, UINT h, DXGI_FORMAT fmt)
@@ -2169,71 +2156,68 @@ namespace
 			if (fmt != kDoorbellFmt)
 				return false;
 			const UINT dest = 1u - kickSlot.load(std::memory_order_acquire);
-			const uint64_t colorReady = colorFence.load(std::memory_order_acquire);
-			if (colorReady && !dx12->WaitFenceTimeout(colorReady))
+			if (!dx12->WaitFenceTimeout(dx12->fenceValue, kFenceWaitMs))
 				return false;
-			if (!WaitKick())
-				return false;
-			if (FAILED(kickAlloc->Reset()) || FAILED(kickList->Reset(kickAlloc.Get(), nullptr)))
+			if (FAILED(dx12->allocator->Reset()) || FAILED(dx12->list->Reset(dx12->allocator.Get(), nullptr)))
 				return false;
 			if (dx12->colorState != D3D12_RESOURCE_STATE_COPY_SOURCE) {
-				Transition(kickList.Get(), color, dx12->colorState, D3D12_RESOURCE_STATE_COPY_SOURCE);
+				Transition(dx12->list.Get(), color, dx12->colorState, D3D12_RESOURCE_STATE_COPY_SOURCE);
 				dx12->colorState = D3D12_RESOURCE_STATE_COPY_SOURCE;
 			}
 			if (keepState[0][dest] != D3D12_RESOURCE_STATE_COPY_DEST) {
-				Transition(kickList.Get(), hudlessKeep[0][dest].Get(), keepState[0][dest],
+				Transition(dx12->list.Get(), hudlessKeep[0][dest].Get(), keepState[0][dest],
 					D3D12_RESOURCE_STATE_COPY_DEST);
 				keepState[0][dest] = D3D12_RESOURCE_STATE_COPY_DEST;
 			}
-			kickList->CopyResource(hudlessKeep[0][dest].Get(), color);
+			dx12->list->CopyResource(hudlessKeep[0][dest].Get(), color);
 			keepHasGuides[0][dest] = false;
 			if (keepDepthState[0][dest] != D3D12_RESOURCE_STATE_COPY_DEST) {
-				Transition(kickList.Get(), keepDepth[0][dest].Get(), keepDepthState[0][dest],
+				Transition(dx12->list.Get(), keepDepth[0][dest].Get(), keepDepthState[0][dest],
 					D3D12_RESOURCE_STATE_COPY_DEST);
 				keepDepthState[0][dest] = D3D12_RESOURCE_STATE_COPY_DEST;
 			}
 			if (keepMvecState[0][dest] != D3D12_RESOURCE_STATE_COPY_DEST) {
-				Transition(kickList.Get(), keepMvec[0][dest].Get(), keepMvecState[0][dest],
+				Transition(dx12->list.Get(), keepMvec[0][dest].Get(), keepMvecState[0][dest],
 					D3D12_RESOURCE_STATE_COPY_DEST);
 				keepMvecState[0][dest] = D3D12_RESOURCE_STATE_COPY_DEST;
 			}
 			if (dx12->depthState != D3D12_RESOURCE_STATE_COPY_SOURCE) {
-				Transition(kickList.Get(), dx12->depth.Get(), dx12->depthState, D3D12_RESOURCE_STATE_COPY_SOURCE);
+				Transition(dx12->list.Get(), dx12->depth.Get(), dx12->depthState, D3D12_RESOURCE_STATE_COPY_SOURCE);
 				dx12->depthState = D3D12_RESOURCE_STATE_COPY_SOURCE;
 			}
 			if (dx12->mvecState != D3D12_RESOURCE_STATE_COPY_SOURCE) {
-				Transition(kickList.Get(), dx12->mvec.Get(), dx12->mvecState, D3D12_RESOURCE_STATE_COPY_SOURCE);
+				Transition(dx12->list.Get(), dx12->mvec.Get(), dx12->mvecState, D3D12_RESOURCE_STATE_COPY_SOURCE);
 				dx12->mvecState = D3D12_RESOURCE_STATE_COPY_SOURCE;
 			}
-			kickList->CopyResource(keepDepth[0][dest].Get(), dx12->depth.Get());
-			kickList->CopyResource(keepMvec[0][dest].Get(), dx12->mvec.Get());
-			Transition(kickList.Get(), hudlessKeep[0][dest].Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+			dx12->list->CopyResource(keepDepth[0][dest].Get(), dx12->depth.Get());
+			dx12->list->CopyResource(keepMvec[0][dest].Get(), dx12->mvec.Get());
+			Transition(dx12->list.Get(), hudlessKeep[0][dest].Get(), D3D12_RESOURCE_STATE_COPY_DEST,
 				D3D12_RESOURCE_STATE_COMMON);
 			keepState[0][dest] = D3D12_RESOURCE_STATE_COMMON;
-			Transition(kickList.Get(), keepDepth[0][dest].Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+			Transition(dx12->list.Get(), keepDepth[0][dest].Get(), D3D12_RESOURCE_STATE_COPY_DEST,
 				D3D12_RESOURCE_STATE_COMMON);
 			keepDepthState[0][dest] = D3D12_RESOURCE_STATE_COMMON;
-			Transition(kickList.Get(), keepMvec[0][dest].Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+			Transition(dx12->list.Get(), keepMvec[0][dest].Get(), D3D12_RESOURCE_STATE_COPY_DEST,
 				D3D12_RESOURCE_STATE_COMMON);
 			keepMvecState[0][dest] = D3D12_RESOURCE_STATE_COMMON;
 			keepHasGuides[0][dest] = true;
-			Transition(kickList.Get(), color, dx12->colorState, D3D12_RESOURCE_STATE_COMMON);
+			Transition(dx12->list.Get(), color, dx12->colorState, D3D12_RESOURCE_STATE_COMMON);
 			dx12->colorState = D3D12_RESOURCE_STATE_COMMON;
 			if (dx12->depthState != D3D12_RESOURCE_STATE_COMMON) {
-				Transition(kickList.Get(), dx12->depth.Get(), dx12->depthState, D3D12_RESOURCE_STATE_COMMON);
+				Transition(dx12->list.Get(), dx12->depth.Get(), dx12->depthState, D3D12_RESOURCE_STATE_COMMON);
 				dx12->depthState = D3D12_RESOURCE_STATE_COMMON;
 			}
 			if (dx12->mvecState != D3D12_RESOURCE_STATE_COMMON) {
-				Transition(kickList.Get(), dx12->mvec.Get(), dx12->mvecState, D3D12_RESOURCE_STATE_COMMON);
+				Transition(dx12->list.Get(), dx12->mvec.Get(), dx12->mvecState, D3D12_RESOURCE_STATE_COMMON);
 				dx12->mvecState = D3D12_RESOURCE_STATE_COMMON;
 			}
-			if (FAILED(kickList->Close()))
+			if (FAILED(dx12->list->Close()))
 				return false;
-			ID3D12CommandList* lists[]{ kickList.Get() };
-			Gpu()->ExecuteCommandLists(1, lists);
-			++kickFenceValue;
-			Gpu()->Signal(kickFence.Get(), kickFenceValue);
-			keepFenceValue[dest] = kickFenceValue;
+			ID3D12CommandList* lists[]{ dx12->list.Get() };
+			dx12->queue->ExecuteCommandLists(1, lists);
+			++dx12->fenceValue;
+			dx12->queue->Signal(dx12->fence.Get(), dx12->fenceValue);
+			keepFenceValue[dest] = dx12->fenceValue;
 			publishedKeep = dest;
 			return true;
 		}
@@ -2251,8 +2235,6 @@ namespace
 					Kick();
 					pendingKick.store(false, std::memory_order_release);
 				}
-				if (ready.load(std::memory_order_acquire))
-					AssembleReadyPairs();
 				std::unique_lock lock(kickMutex);
 				kickCv.wait_for(lock, std::chrono::milliseconds(2), [&] {
 					return stop.load(std::memory_order_acquire) || pendingKick.load(std::memory_order_acquire);
@@ -2275,11 +2257,13 @@ namespace
 			}
 		}
 
-		void OfferKick(UINT w, UINT h, DXGI_FORMAT fmt)
+		void OfferKick(ID3D12Resource* color, UINT w, UINT h, DXGI_FORMAT fmt)
 		{
 			reqW = w;
 			reqH = h;
 			reqFmt = fmt;
+			if (!Snapshot(color, w, h, fmt))
+				return;
 			pendingKick.store(true, std::memory_order_release);
 			if (!worker.joinable()) {
 				worker = std::thread([this] { WorkerLoop(); });
@@ -2323,12 +2307,15 @@ namespace
 			const sl::ViewportHandle vp = sl.viewport;
 			const bool enableG = kicks >= 1;
 			gEnabled = enableG;
-			if (!Snapshot(dx12->color.Get(), reqW, reqH, reqFmt))
-				return false;
 			const UINT slot = publishedKeep;
+			if (!hudlessKeep[0][slot] || !keepHasGuides[0][slot] || !keepDepth[0][slot] || !keepMvec[0][slot])
+				return false;
 			if (!WaitKick())
 				return false;
 			kickSlot.store(slot, std::memory_order_release);
+			if (keepFenceValue[slot] &&
+				!WaitFenceCpu(dx12->fence.Get(), snapshotWaitEvent, keepFenceValue[slot], kFenceWaitMs))
+				return false;
 			if (FAILED(kickAlloc->Reset()) || FAILED(kickList->Reset(kickAlloc.Get(), nullptr)))
 				return false;
 			if (sl.featurePCL)
@@ -2380,13 +2367,6 @@ namespace
 			Gpu()->Signal(kickFence.Get(), kickFenceValue);
 			if (!WaitKick())
 				return false;
-			{
-				std::lock_guard lock(hookMutex);
-				++kickGen;
-				const uint32_t remaining = enableG ? 2u : 1u;
-				if (!PushPending(0, kickGen, remaining))
-					logger::warn("[VrAriseTail] X4 pending Present queue full gen={}", kickGen);
-			}
 			if (sl.featurePCL) {
 				sl.EmitPCLMarker(sl::PCLMarker::eRenderSubmitEnd, *token);
 				sl.EmitPCLMarker(sl::PCLMarker::ePresentStart, *token);
@@ -2415,10 +2395,50 @@ namespace
 					kicks, keepGuideW, keepGuideH, width, height);
 			}
 			if (kicks <= 8 || (kicks % 120) == 0)
-				logger::info("[VrAriseTail] X4 G kick={} status={} presented={} pairProduce={}",
+				logger::info("[VrAriseTail] X4 G kick={} status={} presented={} produce={}",
 					kicks, magic_enum::enum_name(sl.lastDLSSGStatus), sl.lastDLSSGFramesPresented,
-					pairProduce);
+					produceSeq.load(std::memory_order_acquire));
 			return true;
+		}
+
+		bool PeekNext(ID3D12Resource*& out, uint64_t& seq)
+		{
+			out = nullptr;
+			seq = 0;
+			if (!ready.load(std::memory_order_acquire) || !ringFence)
+				return false;
+			std::lock_guard lock(hookMutex);
+			const uint64_t completed = ringFence->GetCompletedValue();
+			const uint64_t next = consumeSeq.load(std::memory_order_acquire) + 1;
+			uint64_t oldest = UINT64_MAX;
+			UINT oldestSlot = kRingSlots;
+			for (UINT i = 0; i < kRingSlots; ++i) {
+				if (slotSeq[i] < next || completed < slotFence[0][i])
+					continue;
+				if (slotSeq[i] < oldest) {
+					oldest = slotSeq[i];
+					oldestSlot = i;
+				}
+			}
+			if (oldestSlot >= kRingSlots)
+				return false;
+			out = ring[0][oldestSlot].Get();
+			seq = oldest;
+			holdSlot = oldestSlot;
+			return out != nullptr;
+		}
+
+		void Consume(uint64_t seq)
+		{
+			std::lock_guard lock(hookMutex);
+			consumeSeq.store(seq, std::memory_order_release);
+			holdSlot = kRingSlots;
+		}
+
+		void ReleaseHold()
+		{
+			std::lock_guard lock(hookMutex);
+			holdSlot = kRingSlots;
 		}
 
 		bool PeekNextPair(ID3D12Resource*& sbs, uint64_t& seq, uint64_t& gen,
@@ -2485,7 +2505,6 @@ namespace
 		bool loggedPath = false;
 		bool loggedWaitOk = false;
 		bool submitRing = false;
-		uint64_t heldSeq = 0;
 		std::uint32_t frame = 0;
 		std::uint32_t waitCount = 0;
 		std::uint32_t ingestCount = 0;
@@ -2519,12 +2538,6 @@ namespace
 					continue;
 				}
 				logger::info("[VrAriseTail] color target {}x{} path={}", w, h, local.path);
-			}
-
-			if (path == Path::kDx12 && !dx12.HasSubmitEyes()) {
-				const SharedPublish published = SnapshotShared();
-				if (published.fenceValue > dx12.lastConsumed)
-					dx12.PrepareShared(published, true);
 			}
 
 			auto* compositor = RE::BSOpenVR::GetIVRCompositor();
@@ -2598,13 +2611,55 @@ namespace
 					waitMs, pacedMs, static_cast<int>(waitErr), waitCount, local.path);
 
 			if (path == Path::kDx12) {
-				if (heldSeq) {
-					doorbell.ConsumePair(heldSeq);
-					heldSeq = 0;
+				const SharedPublish published = SnapshotShared();
+				bool prepared = false;
+				if (published.fenceValue > dx12.lastConsumed) {
+					if (dx12.PrepareShared(published, !submitRing)) {
+						if (!submitRing)
+							local.path = "dx12-ktemp";
+						prepared = true;
+						static bool loggedShared = false;
+						if (!loggedShared) {
+							logger::info("[VrAriseTail] X2 shared Submit {}x{} eye={}x{} fence={} slot={} guides={} {}x{}",
+								published.width, published.height, published.width / 2, published.height,
+								published.fenceValue, published.slot, dx12.guidesReady ? 1 : 0,
+								dx12.guideWidth, dx12.guideHeight);
+							loggedShared = true;
+						}
+					} else {
+						static bool loggedSharedFail = false;
+						if (!loggedSharedFail) {
+							logger::error("[VrAriseTail] X2 PrepareShared failed");
+							loggedSharedFail = true;
+						}
+					}
 				}
-				if (dx12.lastConsumed == 0 && !dx12.HasSubmitEyes()) {
+				if (!dx12.HasSubmitEyes()) {
 					dx12.sbsBounds = false;
 					dx12.Paint(frame);
+				}
+				if (kFrameGenerationDoorbell && loggedPath && prepared && dx12.color && dx12.guidesReady)
+					doorbell.OfferKick(dx12.color.Get(), published.width, published.height, published.format);
+				if (kFrameGenerationDoorbell && loggedPath && doorbell.ready.load(std::memory_order_acquire)) {
+					ID3D12Resource* generated = nullptr;
+					uint64_t seq = 0;
+					if (doorbell.PeekNext(generated, seq)) {
+						if (dx12.IngestSbs(generated, doorbell.width, doorbell.height, doorbell.format)) {
+							const uint64_t expected = doorbell.consumeSeq.load(std::memory_order_acquire) + 1;
+							if (seq > expected)
+								logger::warn("[VrAriseTail] X4 ring dropped {} presents ({} -> {})",
+									seq - expected, expected, seq);
+							doorbell.Consume(seq);
+							submitRing = true;
+							local.path = "dx12-g";
+							++ingestCount;
+							if (ingestCount == 1)
+								logger::info("[VrAriseTail] X4 IngestSbs ring seq={}", seq);
+							if (ingestCount <= 16 || (ingestCount % 120) == 0)
+								logger::info("[VrAriseTail] X4 ingest SBS seq={} ingest={}", seq, ingestCount);
+						} else
+							doorbell.ReleaseHold();
+					}
 				}
 			} else
 				deviceB.Paint(frame);
@@ -2651,85 +2706,11 @@ namespace
 				path = Path::kDeviceB;
 				local.path = "deviceB";
 			}
-			if (path == Path::kDx12) {
-				const SharedPublish published = SnapshotShared();
-				ID3D12Resource* sbs = nullptr;
-				uint64_t seq = 0;
-				uint64_t gen = 0;
-				bool interp = false;
-				uint64_t pairFence = 0;
-				const bool havePair = kFrameGenerationDoorbell && loggedPath &&
-					doorbell.ready.load(std::memory_order_acquire) &&
-					doorbell.PeekNextPair(sbs, seq, gen, interp, pairFence);
-				(void)pairFence;
-				const bool canIngest = havePair && sbs;
-				bool prepared = false;
-				if (published.fenceValue > dx12.lastConsumed) {
-					if (dx12.PrepareShared(published, !submitRing && !canIngest)) {
-						if (!submitRing)
-							local.path = "dx12-ktemp";
-						prepared = true;
-						static bool loggedShared = false;
-						if (!loggedShared) {
-							logger::info("[VrAriseTail] X2 shared Submit {}x{} eye={}x{} fence={} slot={} guides={} {}x{}",
-								published.width, published.height, published.width / 2, published.height,
-								published.fenceValue, published.slot, dx12.guidesReady ? 1 : 0,
-								dx12.guideWidth, dx12.guideHeight);
-							loggedShared = true;
-						}
-					} else {
-						static bool loggedSharedFail = false;
-						if (!loggedSharedFail) {
-							logger::error("[VrAriseTail] X2 PrepareShared failed");
-							loggedSharedFail = true;
-						}
-					}
-				}
-				if (kFrameGenerationDoorbell && loggedPath && prepared && dx12.color && dx12.guidesReady &&
-					!doorbell.pendingKick.load(std::memory_order_acquire)) {
-					if (!DoorbellWarmupReady()) {
-						static bool loggedDelay = false;
-						if (!loggedDelay) {
-							logger::info("[VrAriseTail] X4 doorbell waiting for first kTEMP publish");
-							loggedDelay = true;
-						}
-					} else {
-						doorbell.colorFence.store(dx12.fenceValue, std::memory_order_release);
-						doorbell.OfferKick(published.width, published.height, published.format);
-					}
-				}
-				if (canIngest && dx12.IngestSbs(sbs, doorbell.width, doorbell.height, doorbell.format)) {
-					const uint64_t expected = doorbell.pairConsume.load(std::memory_order_acquire) + 1;
-					if (seq != expected) {
-						logger::error("[VrAriseTail] X4 pair order broken expected={} got={} gen={} kind={}",
-							expected, seq, gen, interp ? "interp" : "real");
-					}
-					dx12.submitInterp = interp;
-					if (interp && poseRing.HasPair()) {
-						dx12.submitPose = poseRing.Interpolated(0.5f);
-						dx12.submitPoseValid = true;
-					} else if (!interp && poseRing.Latest().valid) {
-						dx12.submitPose = poseRing.Latest().deviceToAbsolute;
-						dx12.submitPoseValid = true;
-					} else
-						dx12.submitPoseValid = false;
-					doorbell.ConsumePair(seq);
-					submitRing = true;
-					local.path = "dx12-g";
-					++ingestCount;
-					if (ingestCount == 1)
-						logger::info("[VrAriseTail] X4 EndFrame IngestSbs + CPU wait TwP={}",
-							dx12.submitPoseValid ? 1 : 0);
-					if (ingestCount <= 16 || (ingestCount % 120) == 0)
-						logger::info("[VrAriseTail] X4 ingest SBS seq={} gen={} kind={} pose={} ingest={}",
-							seq, gen, interp ? "interp" : "real", dx12.submitPoseValid ? 1 : 0, ingestCount);
-				}
-			}
-			PaceUntil(start, kHmdHz);
 			QueryPerformanceCounter(&paced);
-			local.lastWaitMs = freq.QuadPart ?
-				(static_cast<double>(paced.QuadPart - start.QuadPart) * 1000.0 / static_cast<double>(freq.QuadPart)) :
-				waitMs;
+			local.lastWaitMs = waitMs;
+			if (waitCount <= 8 || (waitCount % 120) == 0)
+				logger::info("[VrAriseTail] beat wait={:.2f} ms (need WaitGetPoses, not sleep) n={} path={} hmdHz={:.0f}",
+					waitMs, waitCount, local.path, kHmdHz);
 			PublishStatus(local);
 		}
 		if (!firstOwnedSubmit.load(std::memory_order_acquire))
