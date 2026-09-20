@@ -96,6 +96,8 @@ public:
 		uint vrSubmitTest = 0;
 		// VR ARISE Tail owns WaitGetPoses + Submit. Restart-gated; do not flip useArise.
 		bool vrArise = false;
+		// VR G master. Hot. On = eOn + G chain. Off = eOff + bridge.
+		bool vrG = false;
 		uint streamlineLogLevel = 0;  // 0=Off, 1=Default, 2=Verbose
 		// Both default to 0.8, matching AMD's own FSR3 sample default.
 		float sharpnessFSR = 0.8f;

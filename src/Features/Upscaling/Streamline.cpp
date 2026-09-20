@@ -1368,6 +1368,18 @@ void Streamline::ConfigureDLSSG(sl::ViewportHandle viewportHandle, bool enabled,
 	}
 }
 
+void Streamline::ShutdownDLSSG()
+{
+	if (!initialized || !slDLSSGSetOptions)
+		return;
+	ConfigureDLSSG(false);
+	if (slFreeResources)
+		slFreeResources(sl::kFeatureDLSS_G, viewport);
+	lastDLSSGFramesPresented = 0;
+	lastDLSSGStatus = sl::DLSSGStatus::eOk;
+	logger::info("[Streamline DX12] DLSS-G eOff + slFreeResources");
+}
+
 void Streamline::TagDX12Resources(ID3D12GraphicsCommandList* cmdList,
 	ID3D12Resource* depth, ID3D12Resource* mvec, ID3D12Resource* hudLessColor,
 	ID3D12Resource* uiColorAndAlpha, uint32_t width, uint32_t height)

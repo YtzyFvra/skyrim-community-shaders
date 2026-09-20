@@ -9,6 +9,7 @@
 #include "VrAriseTail.h"
 
 #include <Windows.h>
+#include <atomic>
 #include <cstring>
 #include <d3d11.h>
 
@@ -332,8 +333,25 @@ bool VrSubmitDlssg::TrySubmit(RE::BSOpenVR*, const vr::Texture_t* texture,
 	const auto textureAddr = reinterpret_cast<std::uintptr_t>(texture);
 	if (texture && textureAddr >= 0x10000 && textureAddr <= 0x00007FFFFFFFFFFFull)
 		handle = reinterpret_cast<ID3D11Resource*>(const_cast<vr::Texture_t*>(texture));
-	if (handle && !IsOverlayRt(handle) && VrAriseTail::IsActive())
+	const bool isOverlay = handle && IsOverlayRt(handle);
+	if (handle && !isOverlay && VrAriseTail::IsActive())
 		VrAriseTail::PublishKTemp(static_cast<ID3D11Texture2D*>(handle));
+
+	// Diagnostic: ShouldSwallowEngineSubmit() below fires unconditionally once
+	// Tail's takeover is live, so it always wins this race and the "let
+	// overlay/menu submits through" branch further down is unreachable dead
+	// code -- every menu/HUD Submit the engine makes gets silently discarded
+	// with nothing in its place. User-reported severe judder is 1:1 with
+	// opening the ESC menu or console; count+name these to confirm before
+	// touching the swallow order (ARISE forbids the engine from Submitting to
+	// OC directly, so "just let overlay through" is not an option here).
+	if (isOverlay) {
+		static std::atomic<std::uint32_t> overlaySwallowed{ 0 };
+		const std::uint32_t n = ++overlaySwallowed;
+		if (n <= 16 || (n % 120) == 0)
+			logger::warn("[VrSubmitDlssg] overlay Submit #{} {} silently swallowed (dead pass-through branch)",
+				n, RtName(handle));
+	}
 
 	if (VrAriseTail::ShouldSwallowEngineSubmit())
 		return true;

@@ -48,6 +48,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	dlssgFramesToGenerate,
 	vrSubmitTest,
 	vrArise,
+	vrG,
 	streamlineLogLevel,
 	sharpnessFSR,
 	sharpnessEnabledDLSS,
@@ -671,8 +672,30 @@ void Upscaling::RegisterUxActions()
 		[](Feature* self, const json& args) {
 			static_cast<Upscaling*>(self)->settings.vrArise = args.value("enabled", false);
 		});
+	FEATURE_COMMAND("setVrG",
+		"Hot VR G master. On = DLSS-G eOn and the G chain. Off = eOff + slFreeResources and the bridge (absolute pose + metronome only). Params: enabled (bool).",
+		[](Feature* self, const json& args) {
+			static_cast<Upscaling*>(self)->settings.vrG = args.value("enabled", false);
+		});
+	FEATURE_QUERY("vrG",
+		"VR G master -> {on, path}. path is g or bridge.",
+		([](const Feature* self, const json&) -> json {
+			const bool on = static_cast<const Upscaling*>(self)->settings.vrG;
+			json out;
+			out["on"] = on;
+			out["path"] = on ? "g" : "bridge";
+			return out;
+		}));
 	FEATURE_QUERY("vrAriseStatus",
-		"X1 Tail status -> {active, path, lastWaitMs, submits, lastWaitErr, lastSubmitL, lastSubmitR}.",
+		"X1 Tail status -> {active, path, lastWaitMs, submits, lastWaitErr, lastSubmitL, lastSubmitR, "
+		"lastKeepSlot, lastSnapshotWaitMs, lastKickWaitMs, droppedGens, sharedPrepareFails, "
+		"lastSharedFailReason, snapshotFails, lastSnapshotFailReason}. lastKeepSlot should alternate 0/1 "
+		"across polls (stuck = the Doorbell ping-pong broke); lastSnapshotWaitMs/lastKickWaitMs spiking "
+		"above a few ms is a frame-pipeline hitch; droppedGens rising means Kick fell behind and one or "
+		"more snapshotted frames were overwritten before it ever read them; sharedPrepareFails/"
+		"snapshotFails climbing every poll (not just once) means PrepareShared (D3D11->D3D12 handoff) or "
+		"Snapshot (keep-buffer copy) is stuck failing every cycle instead of self-correcting from a "
+		"one-off hitch -- the matching lastXFailReason names which check tripped.",
 		([](const Feature*, const json&) -> json {
 			const auto s = VrAriseTail::GetStatus();
 			json out;
@@ -683,6 +706,14 @@ void Upscaling::RegisterUxActions()
 			out["lastWaitErr"] = s.lastWaitErr;
 			out["lastSubmitL"] = s.lastSubmitL;
 			out["lastSubmitR"] = s.lastSubmitR;
+			out["lastKeepSlot"] = s.lastKeepSlot;
+			out["lastSnapshotWaitMs"] = s.lastSnapshotWaitMs;
+			out["lastKickWaitMs"] = s.lastKickWaitMs;
+			out["droppedGens"] = s.droppedGens;
+			out["sharedPrepareFails"] = s.sharedPrepareFails;
+			out["lastSharedFailReason"] = s.lastSharedFailReason;
+			out["snapshotFails"] = s.snapshotFails;
+			out["lastSnapshotFailReason"] = s.lastSnapshotFailReason;
 			return out;
 		}));
 }
@@ -736,6 +767,15 @@ void Upscaling::DrawFrameGenerationSettings()
 					"From the next launch, Tail owns WaitGetPoses and Submit on its own D3D12\n"
 					"device. Engine Submit is swallowed (no HUD this version). Do not enable\n"
 					"without a restart — the runtime session binds on the first Submit."));
+			if (VrAriseTail::IsActive()) {
+				ImGui::Checkbox(T(TKEY("vr_g"), "VR DLSS-G"), &settings.vrG);
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::Text("%s", T(TKEY("vr_g_tooltip"),
+						"Hot master. On: eOn and the G chain (gate, wrapper, P/A, input/output pose).\n"
+						"Off: eOff + slFreeResources, then the bridge. Absolute pose and the\n"
+						"metronome stay on either path."));
+				}
+			}
 		}
 		ImGui::Text("%s", T(TKEY("frame_generation_desc"),
 							  "Frame Generation interpolates real frames with generated ones for a smoother experience"));

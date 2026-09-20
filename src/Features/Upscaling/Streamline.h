@@ -219,6 +219,9 @@ public:
 		uint32_t guideHeight, uint32_t colorWidth, uint32_t colorHeight, DXGI_FORMAT depthFormat,
 		DXGI_FORMAT motionFormat, DXGI_FORMAT hudLessFormat, DXGI_FORMAT uiFormat,
 		uint32_t backBufferCount);
+
+	/** @brief SL/NGX G off: eOff then slFreeResources. */
+	void ShutdownDLSSG();
 	/**
 	 * @brief Emits a PCL latency marker for the current frame token. The marker's frame
 	 * index is how DLSS-G's pacer matches presents to constants -- structural for FG.

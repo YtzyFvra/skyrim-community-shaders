@@ -37,6 +37,24 @@ namespace VrAriseTail
 		int lastWaitErr = 0;
 		int lastSubmitL = 0;
 		int lastSubmitR = 0;
+
+		// Doorbell double-buffer diagnostics (bridge and G paths both feed
+		// this). Correlate a lastSnapshotWaitMs/lastKickWaitMs spike or a
+		// droppedGens increase with "when did it start juddering" in the log.
+		std::uint32_t lastKeepSlot = 0;
+		double lastSnapshotWaitMs = 0.0;
+		double lastKickWaitMs = 0.0;
+		std::uint64_t droppedGens = 0;
+
+		// PrepareShared (X2, D3D11->D3D12 cross-API handoff) failure
+		// tracking. sharedPrepareFails climbing every poll (not just once)
+		// means it's stuck failing every cycle, not a self-corrected hitch.
+		std::uint64_t sharedPrepareFails = 0;
+		const char* lastSharedFailReason = "";
+
+		// Same idea for Snapshot (keep-buffer double-copy before Kick).
+		std::uint64_t snapshotFails = 0;
+		const char* lastSnapshotFailReason = "";
 	};
 
 	/** @brief X1 counters for the menu / devbench. */

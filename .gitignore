@@ -34,3 +34,6 @@ shadertoolsconfig.json
 
 # Local working notes (Fable VR FG). Not shipped.
 /开发说明/
+
+# Local OpenComposite fork (own git). Not part of CommunityShaders.
+/OpenOVR/
