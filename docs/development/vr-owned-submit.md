@@ -15,10 +15,13 @@ Engine world @ native E SBS
     -> pack both eyes into a private 2E×E SBS
     -> BSOpenVR::Submit once on that SBS (vfunc 0x03 already does both eyes)
     -> same path as the engine; VDXR sits here. Do not call GetIVRCompositor from the DLL
-    -> engine world Submit is swallowed; overlay RTs still call through
+    -> engine world Submit is swallowed. Overlay RTs are not passed through.
+    -> kMENUBG (VR HUD, the slot KIT enlarges) is copied aside and stamped onto the real and generated SBS after FG
 ```
 
-Do not write the box back to kTEMP. Do not invent per-eye `{0,1}–{1,0}` bounds (that flipped and zoomed the first cut). Do not flip `useArise` on VR. Do not engage VR PerfMode on this path. TD equals E. No fake Present. No DLSS-G.
+Do not write the box back to kTEMP. Do not invent per-eye `{0,1}–{1,0}` bounds (that flipped and zoomed the first cut). Do not flip `useArise` on VR. Do not engage the enlarge-RT PerfMode (kTEMP/kTOTAL grown to display size) on this path. Single-thread logical eye is the VR size lie; without it, TD equals E. No fake Present. No DLSS-G.
+
+`LoadingMenu` clears kTEMP. The live window is the menu, not that texture. `PublishKTemp` returns without publishing while the menu is open. Do not scale kTEMP to true-display and kick it: the HMD stays black, recreating the shared slots resets the D3D11 fence to 0, and a tail that only prepares when `fenceValue > lastConsumed` then never kicks again. The first real publish after the menu closes resumes and resets frame generation once.
 
 ## Inject
 
@@ -32,9 +35,14 @@ Early `Upscale()` encode + KIT/standard DLSS are skipped when `IsVrDlssPostInjec
 
 | Symbol | Source |
 |---|---|
-| E | `kIMAGESPACE_TEMP_COPY` half-eye |
-| R | E × UV box |
-| D / TD | E on this cut (PerfMode / larger TD later) |
+| E | `kIMAGESPACE_TEMP_COPY` half-eye. Single-thread PerfMode makes this logical R |
+| R | E × UV box. ACT1 and NR see only this center |
+| D | TD × UV box. The center's place in the HMD image |
+| TD | HMD eye. Submit and FG are the full 2·TD×TD SBS |
+
+Current DB sequence and which stage eats 4K vs TD: `开发说明/VR-FSRFG知识谱/DB架构-时序与逻辑-2026-09-25.md`.
+
+Single-thread PerfMode (restart) spoofs `GetRenderTargetSize` to logical R from the ACT1 preset, the HMD eye, and SRSS. The engine renders that size at scale 1. kTEMP, depth, and motion stay small. The fork upsamples the low-res eye to TD, then composites the ACT1 center. It does not enlarge engine RTs.
 
 Owned pixels live in a private `2E×E` SBS. We call `BSOpenVR::Submit` once; the game splits both eyes. FG 2× means VDXR compositor fps, not hook Present count.
 
@@ -63,7 +71,7 @@ Worker
   │     G native Present real   → hook copy+Submit that BB
 ```
 
-Upgrade the DXGI factory, then create the chain (a bare factory makes `NvPresent64` AV). The native Present hook is installed on a cloned swapchain vtable. The hook copies the current backbuffer on the same queue, waits the copy fence on the CPU, then `BSOpenVR::Submit`s that ring slot in G Present order. Do not reorder or hold. No harvest / `WaitGetPoses`. Do not blend `kMENUBG`. Depth/MVec are engine SBS size (equal to TD=E). Do not flip `useArise`. Loading/menus keep Upscaling's FG-off rule (`ShouldUseFrameGenerationThisFrame`). If the pump never owns the frame, Submit the packed SBS at Tonemap. If the pump is live but the previous doorbell is still presenting, leave the engine Submit live — do not Tonemap-Submit. Never Submit from inside the engine Submit hook.
+Upgrade the DXGI factory, then create the chain (a bare factory makes `NvPresent64` AV). The native Present hook is installed on a cloned swapchain vtable. The hook copies the current backbuffer on the same queue, waits the copy fence on the CPU, then `BSOpenVR::Submit`s that ring slot in G Present order. Do not reorder or hold. No harvest / `WaitGetPoses`. Do not blend `kMENUBG` into the engine RT. Depth and motion stay at the engine SBS. FG color is the TD SBS. `motionVectorScale` is one eye of that presented image; FSR samples the smaller guides itself. Do not flip `useArise`. Loading/menus keep Upscaling's FG-off rule (`ShouldUseFrameGenerationThisFrame`). If the pump never owns the frame, Submit the packed SBS at Tonemap. If the pump is live but the previous doorbell is still presenting, leave the engine Submit live — do not Tonemap-Submit. Never Submit from inside the engine Submit hook.
 
 Working notes: `开发说明/OSDLSSNR/VR帧生成-任务板.md`. FG 2× is unverified on VDXR.
 

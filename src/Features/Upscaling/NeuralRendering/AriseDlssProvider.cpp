@@ -43,15 +43,15 @@ namespace NeuralRendering
 	void AriseDlssProvider::Reset()
 	{
 		if (streamline_ && streamline_->featureDLSS && streamline_->slFreeResources) {
-			streamline_->slFreeResources(sl::kFeatureDLSS, sl::ViewportHandle(kAct1Viewport));
-			streamline_->slFreeResources(sl::kFeatureDLSS, sl::ViewportHandle(kAct2Viewport));
+			const std::uint32_t viewports[]{ kAct1Viewport, kAct2Viewport, kAct1ViewportRight, kAct2ViewportRight };
+			for (const std::uint32_t viewport : viewports)
+				streamline_->slFreeResources(sl::kFeatureDLSS, sl::ViewportHandle(viewport));
 		}
-		forceReset_[0] = true;
-		forceReset_[1] = true;
-		lastContract_[0] = 0;
-		lastContract_[1] = 0;
-		lastOutcome_[0] = 0;
-		lastOutcome_[1] = 0;
+		for (std::size_t index = 0; index < 4; ++index) {
+			forceReset_[index] = true;
+			lastContract_[index] = 0;
+			lastOutcome_[index] = 0;
+		}
 	}
 
 	bool AriseDlssProvider::IsAvailable() const
@@ -63,15 +63,17 @@ namespace NeuralRendering
 
 	bool AriseDlssProvider::Record(ID3D12GraphicsCommandList* commandList, const Dispatch& dispatch)
 	{
-		if (dispatch.viewport != kAct1Viewport && dispatch.viewport != kAct2Viewport) {
-			forceReset_[0] = true;
-			forceReset_[1] = true;
+		const int slot = dispatch.viewport == kAct1Viewport ? 0 :
+			dispatch.viewport == kAct2Viewport ? 1 :
+			dispatch.viewport == kAct1ViewportRight ? 2 :
+			dispatch.viewport == kAct2ViewportRight ? 3 : -1;
+		if (slot < 0) {
 			++act1Failed_;
 			return false;
 		}
-		const bool act2 = dispatch.viewport == kAct2Viewport;
-		const std::size_t index = act2 ? 1 : 0;
-		auto& forceReset = forceReset_[act2 ? 1 : 0];
+		const bool act2 = slot == 1 || slot == 3;
+		const std::size_t index = static_cast<std::size_t>(slot);
+		auto& forceReset = forceReset_[index];
 		auto& succeeded = act2 ? act2Succeeded_ : act1Succeeded_;
 		auto& failed = act2 ? act2Failed_ : act1Failed_;
 		std::uint64_t contract = dispatch.viewport;

@@ -171,6 +171,7 @@ namespace Util::Subrect
 				selectedPresetIndex = -1;
 			}
 		}
+		CommitLiveCrop();
 	}
 
 	void Controller::SaveSettings(json& a_json) const
@@ -338,6 +339,8 @@ namespace Util::Subrect
 
 		if (!previewSrv || !previewTexture) {
 			ImGui::TextDisabled("%s", T("ui.subrect.preview_unavailable", "Preview unavailable."));
+			if (!ImGui::IsMouseDown(ImGuiMouseButton_Left))
+				CommitLiveCrop();
 			return;
 		}
 
@@ -397,6 +400,11 @@ namespace Util::Subrect
 				isDraggingCrop = false;
 			}
 		}
+
+		// Live UV drives the green rect. The renderer keeps the last committed
+		// crop until the mouse is up, so a drag does not rebuild DLSS every move.
+		if (!isDraggingCrop && !ImGui::IsMouseDown(ImGuiMouseButton_Left))
+			CommitLiveCrop();
 
 		ImDrawList* drawList = ImGui::GetWindowDrawList();
 		ImVec2 pMin(cursorPos.x + currentUV.x * imageSize.x, cursorPos.y + currentUV.y * imageSize.y);
@@ -505,6 +513,13 @@ namespace Util::Subrect
 		// SeedDefaultPresets with only .name + .uv specified).
 		currentRightUV = presets[selectedPresetIndex].rightUV.value_or(MirrorUVHorizontal(currentUV));
 		ClampCurrentUV();
+		CommitLiveCrop();
+	}
+
+	void Controller::CommitLiveCrop()
+	{
+		committedUV = currentUV;
+		committedRightUV = currentRightUV;
 	}
 
 	void Controller::SyncRightUV()

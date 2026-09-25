@@ -15,7 +15,7 @@ bool VrBridge::OnDbFinalColor(ID3D12Resource* color, UINT width, UINT height, DX
 		return false;
 	VrPoseAbs::StampReady();
 	const VrPose::Body pose = VrPoseAbs::Ready();
-	if (!VrBeat::CopySbs(color, width, height, format, pose.m, pose.valid))
+	if (!VrBeat::CopySbs(color, width, height, format, pose.m, pose.valid, VrBeat::NextPair()))
 		return false;
 	static std::uint64_t n = 0;
 	++n;

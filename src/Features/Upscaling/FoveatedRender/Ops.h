@@ -49,12 +49,17 @@ namespace FoveatedRenderImpl::Ops
 	void StretchDRSToFullEye(ID3D11ShaderResourceView* renderSBSSRV, ID3D11UnorderedAccessView* kMainUAV,
 		uint32_t dstOffsetX, uint32_t dstWidth, uint32_t dstHeight,
 		uint32_t srcOffsetX, uint32_t srcWidth, uint32_t srcHeight,
-		uint32_t srcEyeWidth, uint32_t srcEyeHeight);
+		uint32_t srcEyeWidth, uint32_t srcEyeHeight,
+		int stretchModeOverride = -1, float blurRadiusOverride = -1.0f, bool debugTint = true);
 
 	// StretchDRS for both eyes (snapshot must already exist in vrRenderSBS).
 	void StretchDRSBothEyes(ID3D11UnorderedAccessView* dstUAV, uint32_t eyeWidthOut, uint32_t eyeHeightOut,
 		uint32_t eyeWidthIn, uint32_t eyeHeightIn, uint32_t renderW, uint32_t renderH,
-		ID3D11ShaderResourceView* srcOverride = nullptr);
+		ID3D11ShaderResourceView* srcOverride = nullptr,
+		int stretchModeOverride = -1, float blurRadiusOverride = -1.0f, bool debugTint = true);
+
+	/** @brief Drop the per-eye subrect textures so the next ensure allocates the new crop. */
+	void ReleaseVRSubrectTextures();
 
 	// Periphery temporal smooth: ensure ping-pong history textures and mvec SRV
 	// cache for the render-res SBS smoothing pass.

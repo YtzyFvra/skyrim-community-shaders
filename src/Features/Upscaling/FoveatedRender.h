@@ -178,6 +178,8 @@ struct FoveatedRender
 		uint flatPipelineAct1Quality = 1;
 		uint flatPipelineAct1Preset = 0;
 		uint flatPipelineAct1Jitter = 0;
+		int32_t jitterPhaseCount = 72;  ///< Halton sequence length. KIT DLSS Enhancer set.
+		float mipBiasOffset = -0.5f;    ///< Added after log2(1/qualityScale) - 1.
 		bool flatPipelineAct1Dsr = false;
 		float flatPipelineNrScale = 0.62f;
 		bool flatPipelineNrNative = false;  ///< N == D; skip NR downsample and ACT2 upsample.
@@ -257,8 +259,9 @@ struct FoveatedRender
 		bool act3ResetEveryFrame = false;
 		bool act3Sharpen = false;                 ///< Fullscreen RCAS after the crop is written back.
 		float act3Sharpness = 1.0f;
-		float act3FeatherWidth = 64.0f;           ///< Smoothstep writeback band at the crop edge.
-		float act3DitherStrength = 1.0f;          ///< Unused; kept for settings compatibility.
+		uint act3BlendMode = static_cast<uint>(SubrectBlendMode::kFeather);  ///< Hard copy, feather, or dither.
+		float act3FeatherWidth = 64.0f;           ///< Writeback band at the crop edge.
+		float act3DitherStrength = 1.0f;          ///< Noise amount for the dithered writeback.
 		bool act3GuidanceEnabled = false;         ///< ACT2 Guidance partition on the ACT3 crop.
 		float act3GuidanceLuma = 1.0f;
 		float act3GuidanceChroma = 0.70f;
@@ -320,7 +323,9 @@ struct FoveatedRender
 	void DrawEnable();
 	void DrawSettings();
 	void DrawNeuralRenderingSettings(bool wrapHeader = true);
-	/** @brief Origin / Single-thread / ARISE radios. Restart-gated; Flat only. */
+	/** @brief Hard copy / feather / dither, matching the DLSS Enhancer subrect blend. */
+	void DrawEdgeBlendControls(const char* idSuffix, uint& mode, float& featherWidth, float& ditherStrength);
+	/** @brief PerfMode radios, jitter phase count, and extra mip-bias offset. */
 	void DrawLogicalPerfModeControls();
 	FlatPipelinePlan BuildFlatPipelinePlan(uint32_t displayWidth, uint32_t displayHeight,
 		uint32_t engineWidth = 0, uint32_t engineHeight = 0) const;

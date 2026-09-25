@@ -1451,19 +1451,13 @@ void State::UpdateSharedData([[maybe_unused]] bool a_inWorld, [[maybe_unused]] b
 		if (upscaling.loaded) {
 			auto upscaleMethod = upscaling.GetUpscaleMethod();
 			if (temporal && upscaleMethod != Upscaling::UpscaleMethod::kTAA) {
-				const auto& perfMode = upscaling.perfMode;
-				if (perfMode.IsHookActive()) {
-					// PerfMode forces the DRS ratio to identity while rendering
-					// sub-native, so bias off the latched eye dims instead.
-					data.MipBias = std::log2f(
-						static_cast<float>(perfMode.GetRenderEyeWidth()) /
-						static_cast<float>(perfMode.GetDisplayEyeWidth()));
-				} else {
-					auto renderSize = Util::ConvertToDynamic(screenSize, true);
-					data.MipBias = std::log2f(renderSize.x / screenSize.x);
-				}
+				// KIT DLSS Enhancer: log2(1/qualityScale) - 1, plus the extra offset.
+				// DRS stays 1 under a size lie, so the preset is the ratio, not the viewport.
+				const float scale = std::max(upscaling.ReconstructionUpscaleRatio(), 1.0e-3f);
+				data.MipBias = std::log2f(1.0f / scale);
 				if (upscaleMethod == Upscaling::UpscaleMethod::kDLSS)
 					data.MipBias -= 1.0f;
+				data.MipBias += upscaling.foveatedRender.settings.mipBiasOffset;
 			} else {
 				data.MipBias = 0;
 			}

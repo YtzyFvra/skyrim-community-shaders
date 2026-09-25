@@ -53,6 +53,8 @@ struct PerfMode
 	bool IsHookActive() const { return hookActive; }
 	/** @brief True while PerfMode presents through its DisplayRes testTexture. */
 	bool IsPresentingTestTexture() const { return IsHookActive() && GetTestTexture(); }
+	// Size lie only. Engine RTs stay at logical R. No enlarged kTEMP/kTOTAL.
+	bool IsLogicalEyeActive() const { return logicalEyeActive; }
 	bool IsPostInterceptActive() const { return postInterceptActive; }
 	bool IsPostChainDone() const { return postChainDone; }
 	void ClearPostChainDone() { postChainDone = false; }
@@ -76,6 +78,8 @@ struct PerfMode
 	// Phase 2: called from BSShaderRenderTargets_Create::thunk (before func())
 	// where BSOpenVR is guaranteed to be available
 	void InstallRenderTargetSizeHook();
+	/** @brief VR single-thread: spoof GetRenderTargetSize to logical R. Does not enlarge RTs. */
+	void InstallVrLogicalEyeHook();
 
 	// Hybrid Post: tonemap interception via IS shader hooks
 	// Call BeginPostIntercept() before func(), EndPostIntercept() after.
@@ -147,6 +151,7 @@ private:
 
 	// Phase 2: resolution hook state
 	bool hookActive = false;
+	bool logicalEyeActive = false;
 
 	// Set at the end of SetupResources after every critical Post resource
 	// (textures, views, fake DS, downscale shaders, sampler) successfully

@@ -53,6 +53,8 @@ namespace NeuralRendering
 
 		static constexpr std::uint32_t kAct1Viewport = 10;
 		static constexpr std::uint32_t kAct2Viewport = 11;
+		static constexpr std::uint32_t kAct1ViewportRight = 12;
+		static constexpr std::uint32_t kAct2ViewportRight = 13;
 
 		/** @brief Binds the provider to the DX12 Streamline instance and physical device. */
 		bool Initialize(Streamline* streamline, ID3D12Device* device);
@@ -68,9 +70,9 @@ namespace NeuralRendering
 	private:
 		Streamline* streamline_ = nullptr;
 		ID3D12Device* device_ = nullptr;
-		bool forceReset_[2]{ true, true };
-		std::uint64_t lastContract_[2]{};
-		int lastOutcome_[2]{};
+		bool forceReset_[4]{ true, true, true, true };
+		std::uint64_t lastContract_[4]{};
+		int lastOutcome_[4]{};
 		std::atomic_uint64_t act1Succeeded_ = 0;
 		std::atomic_uint64_t act1Failed_ = 0;
 		std::atomic_uint64_t act2Succeeded_ = 0;

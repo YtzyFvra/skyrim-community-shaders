@@ -27,6 +27,24 @@ namespace VrAriseTail
 	 * slots and Signal one fence. Tail opens the handles on its D3D12 device.
 	 */
 	void PublishKTemp(ID3D11Texture2D* kTemp);
+	/** @brief Game thread: copy kMENUBG into its own shared texture. Not the publish fence. */
+	void NoteHud(ID3D11Texture2D* hud);
+	void* HudSharedHandle();
+	void* HudFenceHandle();
+	std::uint64_t HudFenceValue();
+	/** @brief A frame published nothing since the last success. DLSS/NR must reset. */
+	bool HistoryResetPending();
+	/** @brief Six-pass consumed the pending history reset. */
+	void ClearHistoryReset();
+
+	/** @brief Last doorbell kick-fence wait, in milliseconds. */
+	double LastKickFenceMs();
+	/** @brief Last shared-fence value the game thread signaled. */
+	std::uint64_t LastPublishFence();
+	/** @brief Last shared-fence value PrepareShared consumed. */
+	std::uint64_t LastConsumedFence();
+	/** @brief Start the tail if VR is up. Safe to call from the tonemap hook. */
+	void EnsureRunning();
 
 	struct Status
 	{

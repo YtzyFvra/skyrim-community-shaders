@@ -27,11 +27,12 @@
 #	include "RE/B/BSOpenVR.h"
 #	include "VrBeat/Metronome.h"
 #	include "VrBridge/DbEnd.h"
-#	include "VrCount/PreAfter.h"
-#	include "VrGWrap/GPresent.h"
+#	include "VrFfxOp/Operator.h"
 #	include "VrPose/Absolute.h"
-#	include "VrSimGate/PresentGate.h"
 #	include "VrSwitch/Master.h"
+#	include "VrBoosterTail.h"
+#	include "VrSubmitDlssg.h"
+#	include "FoveatedRender/Ops.h"
 #endif
 
 using Microsoft::WRL::ComPtr;
@@ -74,6 +75,9 @@ namespace
 			return true;
 		if (!event)
 			return false;
+		// A timed-out wait leaves this auto-reset event signaled. The next
+		// wait would consume that previous beat and treat a later fence as done.
+		ResetEvent(event);
 		if (FAILED(fence->SetEventOnCompletion(value, event)))
 			return false;
 		return WaitForSingleObject(event, ms) == WAIT_OBJECT_0;
@@ -92,11 +96,14 @@ namespace
 		DXGI_FORMAT depthFormat = DXGI_FORMAT_UNKNOWN;
 		DXGI_FORMAT mvecFormat = DXGI_FORMAT_UNKNOWN;
 		bool hasGuides = false;
+		bool colorOnly = false;
 		// Captured at the same instant as the color (in PublishKTemp, on the
 		// game thread, right after this frame's UpdatePoses). Rides along
 		// with the fenceValue so Tail/Doorbell can be arbitrarily late
 		// without pairing this frame's pixels with a later frame's pose.
 		VrPose::Body pose{};
+		sl::Constants constants[2]{};
+		bool constantsValid = false;
 	};
 
 	std::mutex sharedMutex;
@@ -125,8 +132,107 @@ namespace
 	std::atomic<bool> loggedPublish{ false };
 	std::atomic<bool> loggedPublishFail{ false };
 	std::atomic<bool> publishPausedForLoad{ false };
+	std::atomic<bool> haveWorldPublish{ false };
+	ComPtr<ID3D11Texture2D> hudTex11;
+	ComPtr<ID3D11Fence> hudFence11;
+	HANDLE hudSharedHandle = nullptr;
+	HANDLE hudFenceHandle = nullptr;
+	UINT hudW = 0;
+	UINT hudH = 0;
+	DXGI_FORMAT hudFmt = DXGI_FORMAT_UNKNOWN;
+	UINT64 hudFenceValue = 0;
+	std::mutex hudMutex;
+	std::atomic<void*> hudSharedPub{ nullptr };
+	std::atomic<void*> hudFencePub{ nullptr };
+	std::atomic<std::uint64_t> hudFencePubValue{ 0 };
 	std::atomic<LONGLONG> publishResumeQpc{ 0 };
+	std::atomic<bool> historyResetPending{ false };
+	std::atomic<UINT64> lastPublishedFrame{ 0 };
+	std::atomic<double> lastKickFenceMs{ 0.0 };
+	std::atomic<UINT64> lastPublishFence{ 0 };
+	std::atomic<UINT64> lastConsumedFence{ 0 };
+	const char* noNewWhy = nullptr;
+	LARGE_INTEGER noNewStart{};
+
+	void EndNoNewFrame()
+	{
+		if (!noNewWhy)
+			return;
+		LARGE_INTEGER now{};
+		QueryPerformanceCounter(&now);
+		LARGE_INTEGER freq{};
+		QueryPerformanceFrequency(&freq);
+		const double sec = freq.QuadPart ? static_cast<double>(now.QuadPart - noNewStart.QuadPart) / static_cast<double>(freq.QuadPart) : 0.0;
+		logger::info("[VrAriseTail] no new frame end ({}) {:.1f} s", noNewWhy, sec);
+		noNewWhy = nullptr;
+	}
+
+	void NoteNoNewFrame(const char* why)
+	{
+		historyResetPending.store(true, std::memory_order_release);
+		if (noNewWhy == why)
+			return;
+		EndNoNewFrame();
+		noNewWhy = why;
+		QueryPerformanceCounter(&noNewStart);
+		logger::info("[VrAriseTail] no new frame start ({})", why);
+	}
 	std::atomic<bool> loggedGuides{ false };
+
+#ifdef ENABLE_SKYRIM_VR
+	ID3D11Texture2D* ScaleToDisplay(ID3D11Texture2D* src, UINT srcW, UINT srcH, UINT dstW, UINT dstH)
+	{
+		static ComPtr<ID3D11Texture2D> dst;
+		static ComPtr<ID3D11ShaderResourceView> srv;
+		static ComPtr<ID3D11UnorderedAccessView> uav;
+		static ID3D11Texture2D* lastSrc = nullptr;
+		static UINT cachedW = 0;
+		static UINT cachedH = 0;
+		if (!src || !globals::d3d::device || !dstW || !dstH || srcW < 2 || !srcH)
+			return nullptr;
+		if (srcW == dstW && srcH == dstH)
+			return src;
+		if (!dst || cachedW != dstW || cachedH != dstH) {
+			D3D11_TEXTURE2D_DESC desc{};
+			src->GetDesc(&desc);
+			desc.Width = dstW;
+			desc.Height = dstH;
+			desc.MipLevels = 1;
+			desc.ArraySize = 1;
+			desc.SampleDesc.Count = 1;
+			desc.Usage = D3D11_USAGE_DEFAULT;
+			desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+			desc.CPUAccessFlags = 0;
+			desc.MiscFlags = 0;
+			dst.Reset();
+			uav.Reset();
+			if (FAILED(globals::d3d::device->CreateTexture2D(&desc, nullptr, dst.ReleaseAndGetAddressOf())))
+				return nullptr;
+			Util::SetResourceName(dst.Get(), "VrAriseTail::LoadingTd");
+			D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
+			uavDesc.Format = desc.Format;
+			uavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+			if (FAILED(globals::d3d::device->CreateUnorderedAccessView(dst.Get(), &uavDesc, uav.ReleaseAndGetAddressOf())))
+				return nullptr;
+			cachedW = dstW;
+			cachedH = dstH;
+		}
+		if (lastSrc != src) {
+			D3D11_TEXTURE2D_DESC desc{};
+			src->GetDesc(&desc);
+			D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+			srvDesc.Format = desc.Format;
+			srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+			srvDesc.Texture2D.MipLevels = 1;
+			srv.Reset();
+			if (FAILED(globals::d3d::device->CreateShaderResourceView(src, &srvDesc, srv.ReleaseAndGetAddressOf())))
+				return nullptr;
+			lastSrc = src;
+		}
+		FoveatedRenderImpl::Ops::StretchDRSBothEyes(uav.Get(), dstW / 2, dstH, srcW / 2, srcH, srcW, srcH, srv.Get(), 2, 1.0f, false);
+		return dst.Get();
+	}
+#endif
 
 	bool CreateSharedTex(ID3D11Device5* device5, UINT width, UINT height, DXGI_FORMAT format, UINT bindFlags,
 		ComPtr<ID3D11Texture2D>& tex, HANDLE& handle, const char* name)
@@ -286,17 +392,8 @@ namespace
 				return;
 			}
 			VrBeat::HookCompositorPoses();
-			// EXPERIMENT (09-20 01:13): route the engine's own Wait through
-			// GetLastPoses (non-blocking snapshot, documented safe for a
-			// second thread -- doesn't open a period, doesn't compete for
-			// anything) instead of the real blocking WaitGetPoses. The
-			// metronome is now the *sole* caller of the real Wait,
-			// continuously, as fast as the runtime returns it -- so there
-			// is only ever one real blocking caller, eliminating the
-			// two-callers-racing-the-same-mutex contention that crashed
-			// 72fps to 5-8fps tonight when the metronome's own extra Wait
-			// for G's interpolated frame collided with the engine's.
-			func(openVR, false);
+			// L1 virtualizes WaitGetPoses inside OC (throttle + cached poses).
+			func(openVR, useLivePoses);
 			updatePosesSincePublish.fetch_add(1, std::memory_order_relaxed);
 			VrPoseAbs::OnEngineDrawStart();
 			static bool logged = false;
@@ -418,6 +515,7 @@ namespace
 		// tracks whether it happened once or is stuck failing every cycle.
 		const char* lastFailReason = "";
 		std::uint64_t failCount = 0;
+		bool logNextSuccess = false;
 
 		~Dx12Path()
 		{
@@ -440,25 +538,9 @@ namespace
 				sl.SetD3DDevice12(device.Get());
 				sl.CheckFeatures(chosen);
 				sl.PostDevice();
-				if (sl.featureDLSSG && sl.slUpgradeInterface) {
-					ID3D12Device* raw = device.Detach();
-					const sl::Result upgraded = sl.slUpgradeInterface(reinterpret_cast<void**>(&raw));
-					device.Attach(raw);
-					if (upgraded == sl::Result::eOk)
-						logger::info("[VrAriseTail] Tail D3D12 device SL-upgraded");
-					else
-						logger::warn("[VrAriseTail] slUpgradeInterface device failed");
-				} else
-					logger::info("[VrAriseTail] DLSS-G not bound; X4 doorbell off");
-			} else
-				logger::warn("[VrAriseTail] Streamline DX12 not initialized; X4 doorbell off");
-			auto& sl11 = globals::features::upscaling.streamline;
-			if (sl11.initialized && sl11.slReflexSetOptions) {
-				sl::ReflexOptions off{};
-				off.mode = sl::ReflexMode::eOff;
-				if (sl11.slReflexSetOptions(off) == sl::Result::eOk)
-					logger::info("[VrAriseTail] game DX11 Reflex off; G/Reflex on Tail DX12 only");
 			}
+			// FFX cannot run on an SL-upgraded device.
+			logger::info("[VrAriseTail] Tail D3D12 device not SL-upgraded (FSR-FG)");
 			D3D12_COMMAND_QUEUE_DESC queueDesc{};
 			queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
 			if (FAILED(device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&queue))))
@@ -653,10 +735,21 @@ namespace
 				return fail("ImportShared");
 			if (!EnsureColorFor(published.width, published.height, published.format))
 				return fail("EnsureColorFor");
-			if (!WaitFenceCpu(openedSharedFence.Get(), fenceEvent, published.fenceValue, kFenceWaitMs))
+			const UINT64 d3d11Completed = openedSharedFence ? openedSharedFence->GetCompletedValue() : 0;
+			if (!WaitFenceCpu(openedSharedFence.Get(), fenceEvent, published.fenceValue, kFenceWaitMs)) {
+				logger::warn("[VrAriseTail] D3D11 fence late want={} done={} lastConsumed={} behind={} gen={}/{} guides={}",
+					published.fenceValue, d3d11Completed, lastConsumed,
+					published.fenceValue > lastConsumed ? published.fenceValue - lastConsumed : 0,
+					openedGeneration, published.generation, guidesReady ? 1 : 0);
+				logNextSuccess = true;
 				return fail("wait D3D11 publish fence (game-thread hitch)");
-			if (!WaitFenceTimeout(fenceValue, kFenceWaitMs))
+			}
+			if (!WaitFenceTimeout(fenceValue, kFenceWaitMs)) {
+				logger::warn("[VrAriseTail] own fence late want={} done={} lastConsumed={}",
+					fenceValue, fence ? fence->GetCompletedValue() : 0, lastConsumed);
+				logNextSuccess = true;
 				return fail("wait own prior-copy fence (Tail-side hitch)");
+			}
 			if (FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.Get(), nullptr)))
 				return fail("allocator/list Reset");
 			if (colorState != D3D12_RESOURCE_STATE_COPY_DEST) {
@@ -724,6 +817,12 @@ namespace
 			queue->Signal(fence.Get(), fenceValue);
 			prepareFenceValue = fenceValue;
 			lastConsumed = published.fenceValue;
+			lastConsumedFence.store(lastConsumed, std::memory_order_relaxed);
+			if (logNextSuccess) {
+				logNextSuccess = false;
+				logger::info("[VrAriseTail] PrepareShared resumed consumed={} queueFence={} gen={} guides={}",
+					lastConsumed, fenceValue, openedGeneration, guidesReady ? 1 : 0);
+			}
 			return true;
 		}
 	};
@@ -744,8 +843,10 @@ namespace
 			D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COMMON
 		};
 		bool keepHasGuides[2]{};
+		VrPose::Body keepPose[2]{};
 		uint64_t keepFenceValue[2]{};
 		UINT keepW = 0;
+		bool keepColorOnly[2]{};
 		UINT keepH = 0;
 		UINT keepGuideW = 0;
 		UINT keepGuideH = 0;
@@ -766,7 +867,6 @@ namespace
 		DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM;
 		std::atomic<bool> ready{ false };
 		bool failed = false;
-		bool gOnLogged = false;
 		uint32_t kicks = 0;
 		std::atomic<uint64_t> inputGen{ 0 };
 		uint64_t takenGen = 0;
@@ -864,7 +964,6 @@ namespace
 				failed = true;
 				return false;
 			};
-			auto& sl = globals::features::upscaling.streamlineDX12;
 			if (!dx12 || !dx12->device || !dx12->queue || !dx12->adapter)
 				return fail("no Tail D3D12");
 			if (sbsWidth < 2 || sbsHeight == 0)
@@ -887,16 +986,6 @@ namespace
 			height = sbsHeight;
 			format = fmt;
 			ready.store(true, std::memory_order_release);
-			if (sl.featureReflex && sl.slReflexSetOptions) {
-				sl::ReflexOptions reflex{};
-				reflex.mode = sl::ReflexMode::eLowLatency;
-				reflex.useMarkersToOptimize = sl.featurePCL;
-				reflex.frameLimitUs = 0;
-				if (sl.slReflexSetOptions(reflex) == sl::Result::eOk)
-					logger::info("[VrAriseTail] X4 Reflex eLowLatency on Tail DX12 (frameLimitUs=0)");
-				else
-					logger::warn("[VrAriseTail] X4 slReflexSetOptions failed");
-			}
 			logger::info("[VrAriseTail] X4 SBS doorbell {}x{} engineFmt={} RGBA8",
 				sbsWidth, sbsHeight, static_cast<unsigned>(engineFmt));
 			return true;
@@ -904,39 +993,42 @@ namespace
 
 		bool EnsureGPath()
 		{
-			if (VrGWrap::Ready())
-				return true;
-			if (!dx12 || !dx12->device || !dx12->queue || !dx12->adapter)
+			if (!dx12 || !dx12->device || !dx12->queue)
 				return false;
-			auto& sl = globals::features::upscaling.streamlineDX12;
-			if (!sl.initialized || !sl.featureDLSSG || !sl.slUpgradeInterface) {
-				logger::warn("[VrAriseTail] G path: DLSS-G not bound");
+			if (!globals::features::upscaling.fidelityFX.featureFSR3FG) {
+				static bool logged = false;
+				if (!logged) {
+					logger::warn("[VrAriseTail] FSR-FG path: FidelityFX FG not bound");
+					logged = true;
+				}
 				return false;
 			}
-			if (!VrGWrap::Ensure(dx12->device.Get(), dx12->queue.Get(), dx12->adapter.Get(),
-					width, height, format))
-				return false;
-			if (!VrSimGate::Ensure(dx12->device.Get(), dx12->queue.Get(),
-					width, height, width, height, format,
-					DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R16G16_FLOAT))
-				return false;
-			return true;
+			// Ensure() keeps the first publish size. The keep is the image actually copied.
+			const UINT colorW = keepW ? keepW : width;
+			const UINT colorH = keepH ? keepH : height;
+			const UINT guideW = keepGuideW ? keepGuideW : colorW;
+			const UINT guideH = keepGuideH ? keepGuideH : colorH;
+			return VrFfxOp::Ensure(dx12->device.Get(), dx12->queue.Get(),
+				colorW, colorH, guideW, guideH, format,
+				DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R16G16_FLOAT);
 		}
 
-		bool Snapshot(ID3D12Resource* color, UINT w, UINT h, DXGI_FORMAT fmt)
+		bool Snapshot(ID3D12Resource* color, UINT w, UINT h, DXGI_FORMAT fmt, bool colorOnly)
 		{
 			auto fail = [&](const char* why) {
 				lastSnapshotFailReason = why;
 				++snapshotFailCount;
 				return false;
 			};
-			if (!color || !dx12 || !dx12->device || !dx12->guidesReady || !dx12->depth || !dx12->mvec)
+			if (!color || !dx12 || !dx12->device)
 				return fail("no color/device/guides yet");
-			if (w < 2 || h == 0 || dx12->guideWidth < 2 || dx12->guideHeight == 0)
+			if (!colorOnly && (!dx12->guidesReady || !dx12->depth || !dx12->mvec))
+				return fail("no color/device/guides yet");
+			if (w < 2 || h == 0 || (!colorOnly && (dx12->guideWidth < 2 || dx12->guideHeight == 0)))
 				return fail("size too small");
 			constexpr DXGI_FORMAT kDoorbellFmt = DXGI_FORMAT_R8G8B8A8_UNORM;
 			if (!CreateKeep(w, h, kDoorbellFmt) ||
-				!CreateGuideKeep(dx12->guideWidth, dx12->guideHeight, dx12->depthFormat, dx12->mvecFormat))
+				(!colorOnly && !CreateGuideKeep(dx12->guideWidth, dx12->guideHeight, dx12->depthFormat, dx12->mvecFormat)))
 				return fail("CreateKeep/CreateGuideKeep");
 			if (fmt != kDoorbellFmt)
 				return fail("format mismatch");
@@ -977,6 +1069,23 @@ namespace
 			}
 			cmd->CopyResource(hudlessKeep[dest].Get(), color);
 			keepHasGuides[dest] = false;
+			if (colorOnly) {
+				Transition(cmd, hudlessKeep[dest].Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+				keepState[dest] = D3D12_RESOURCE_STATE_COMMON;
+				Transition(cmd, color, dx12->colorState, D3D12_RESOURCE_STATE_COMMON);
+				dx12->colorState = D3D12_RESOURCE_STATE_COMMON;
+				if (FAILED(cmd->Close()))
+					return fail("list Close");
+				ID3D12CommandList* lists[]{ cmd };
+				dx12->queue->ExecuteCommandLists(1, lists);
+				++dx12->fenceValue;
+				dx12->queue->Signal(dx12->fence.Get(), dx12->fenceValue);
+				keepFenceValue[dest] = dx12->fenceValue;
+				publishedKeep = dest;
+				width = w;
+				height = h;
+				return true;
+			}
 			if (keepDepthState[dest] != D3D12_RESOURCE_STATE_COPY_DEST) {
 				Transition(cmd, keepDepth[dest].Get(), keepDepthState[dest],
 					D3D12_RESOURCE_STATE_COPY_DEST);
@@ -1025,6 +1134,8 @@ namespace
 			dx12->queue->Signal(dx12->fence.Get(), dx12->fenceValue);
 			keepFenceValue[dest] = dx12->fenceValue;
 			publishedKeep = dest;
+			width = w;
+			height = h;
 			return true;
 		}
 
@@ -1049,8 +1160,6 @@ namespace
 				VrSwitch::Tick();
 				if (ready.load(std::memory_order_acquire) && VrSwitch::On())
 					EnsureGPath();
-				if (VrSwitch::On())
-					VrGWrap::Pump();
 				if (ready.load(std::memory_order_acquire)) {
 					const uint64_t gen = inputGen.load(std::memory_order_acquire);
 					// gen advances once per successful OfferKick/Snapshot; if it
@@ -1080,8 +1189,7 @@ namespace
 					});
 				}
 			}
-			VrSimGate::Shutdown();
-			VrGWrap::Shutdown();
+			VrFfxOp::Shutdown();
 		}
 
 		void WorkerLoop()
@@ -1097,18 +1205,19 @@ namespace
 			}
 		}
 
-		void OfferKick(ID3D12Resource* color, UINT w, UINT h, DXGI_FORMAT fmt, const VrPose::Body& pose)
+		void OfferKick(ID3D12Resource* color, UINT w, UINT h, DXGI_FORMAT fmt, const VrPose::Body& pose, bool colorOnly = false)
 		{
 			reqW = w;
 			reqH = h;
 			reqFmt = fmt;
-			if (!Snapshot(color, w, h, fmt)) {
+			if (!Snapshot(color, w, h, fmt, colorOnly)) {
 				// Every occurrence: see the matching PrepareShared comment.
 				if (snapshotFailCount <= 8 || (snapshotFailCount % 60) == 0)
 					logger::error("[VrAriseTail] Snapshot failed #{}: {}", snapshotFailCount, lastSnapshotFailReason);
 				return;
 			}
-			VrPoseAbs::LatchDraw(pose);
+			keepColorOnly[publishedKeep] = colorOnly;
+			keepPose[publishedKeep] = pose;
 			inputGen.fetch_add(1, std::memory_order_release);
 			if (!worker.joinable()) {
 				worker = std::thread([this] { WorkerLoop(); });
@@ -1124,6 +1233,9 @@ namespace
 			const UINT slot = publishedKeep;
 			if (!hudlessKeep[slot])
 				return false;
+			// Claim before the fence wait so Snapshot writes the other keep
+			// slot. Waiting first let the next Offer overwrite this slot.
+			kickSlot.store(slot, std::memory_order_release);
 			if (keepFenceValue[slot]) {
 				LARGE_INTEGER freq{}, start{}, end{};
 				QueryPerformanceFrequency(&freq);
@@ -1134,71 +1246,49 @@ namespace
 					(static_cast<double>(end.QuadPart - start.QuadPart) * 1000.0 / static_cast<double>(freq.QuadPart)) :
 					0.0;
 				lastKickWaitMs.store(ms, std::memory_order_relaxed);
+				lastKickFenceMs.store(ms, std::memory_order_relaxed);
 				if (ms > 3.0)
 					logger::warn("[VrAriseTail] Kick fence wait {:.2f} ms (hitch candidate) slot={}", ms, slot);
 				if (!waited)
 					return false;
 			}
 
-			// Same double-buffer flip as the G path below: without this the
-			// bridge path never advances kickSlot, Snapshot()'s `dest` always
-			// resolves to the same slot, and the "double" buffer degenerates
-			// into a single buffer Snapshot can overwrite while this Kick is
-			// still reading it -- no hazard tracking catches that case.
-			kickSlot.store(slot, std::memory_order_release);
-			if (!VrSwitch::On()) {
-				if (!VrBridge::OnDbFinalColor(hudlessKeep[slot].Get(), width, height, format))
-					return false;
-				++kicks;
-				if (kicks <= 8 || (kicks % 120) == 0)
-					logger::info("[VrAriseTail] bridge kick={} slot={}", kicks, slot);
-				return true;
+			VrPoseAbs::LatchDraw(keepPose[slot]);
+			// First Ensure() size is the engine SBS. A later TD keep is larger;
+			// submitting the latched size CopyResource-crops the top-left into the HMD.
+			const UINT colorW = keepW ? keepW : width;
+			const UINT colorH = keepH ? keepH : height;
+			static UINT loggedW = 0;
+			static UINT loggedH = 0;
+			if (colorW != loggedW || colorH != loggedH) {
+				logger::info("[VrAriseTail] kick color {}x{} guide {}x{}",
+					colorW, colorH, keepGuideW, keepGuideH);
+				loggedW = colorW;
+				loggedH = colorH;
 			}
-
-			if (!VrGWrap::SwapChain())
-				return false;
-			auto& sl = globals::features::upscaling.streamlineDX12;
-			sl::Constants constants{};
-			{
-				std::lock_guard lock(sharedMutex);
-				if (!sharedConstantsValid) {
-					static bool logged = false;
-					if (!logged) {
-						logger::error("[VrAriseTail] X4 Kick refused: no game-thread constants");
-						logged = true;
-					}
-					return false;
+			if (VrSwitch::On()) {
+				const bool colorOnly = keepColorOnly[slot];
+				if (VrFfxOp::OnDbFinalColor(
+						hudlessKeep[slot].Get(),
+						colorOnly ? nullptr : keepDepth[slot].Get(),
+						colorOnly ? nullptr : keepMvec[slot].Get(),
+						colorW, colorH,
+						colorOnly ? 0 : keepGuideW,
+						colorOnly ? 0 : keepGuideH,
+						format,
+						colorOnly ? DXGI_FORMAT_UNKNOWN : keepDepthFmt,
+						colorOnly ? DXGI_FORMAT_UNKNOWN : keepMvecFmt)) {
+					++kicks;
+					if (kicks <= 8 || (kicks % 120) == 0)
+						logger::info("[VrAriseTail] FSR-FG kick={} slot={} {}x{}", kicks, slot, colorW, colorH);
+					return true;
 				}
-				constants = sharedConstants[0];
 			}
-			if (!keepHasGuides[slot] || !keepDepth[slot] || !keepMvec[slot])
-				return false;
-			VrSimGate::DbFrame db{};
-			db.color = hudlessKeep[slot].Get();
-			db.depth = keepDepth[slot].Get();
-			db.mvec = keepMvec[slot].Get();
-			db.constants = constants;
-			db.colorW = width;
-			db.colorH = height;
-			db.guideW = keepGuideW;
-			db.guideH = keepGuideH;
-			db.colorFmt = format;
-			db.depthFmt = keepDepthFmt;
-			db.mvecFmt = keepMvecFmt;
-			db.enableG = true;
-			if (!VrSimGate::OnDbFinalColor(db))
+			if (!VrBridge::OnDbFinalColor(hudlessKeep[slot].Get(), colorW, colorH, format))
 				return false;
 			++kicks;
-			if (!gOnLogged) {
-				gOnLogged = true;
-				logger::info("[VrAriseTail] X4 G on P={} A={} kick={} guide {}x{} color {}x{}",
-					VrCount::Pre(), VrCount::After(),
-					kicks, keepGuideW, keepGuideH, width, height);
-			}
 			if (kicks <= 8 || (kicks % 120) == 0)
-				logger::info("[VrAriseTail] X4 G kick={} status={} presented={} P={} A={}",
-					kicks, magic_enum::enum_name(sl.lastDLSSGStatus), sl.lastDLSSGFramesPresented,
-					VrCount::Pre(), VrCount::After());
+				logger::info("[VrAriseTail] bridge kick={} slot={} {}x{}", kicks, slot, colorW, colorH);
 			return true;
 		}
 	};
@@ -1255,7 +1345,7 @@ namespace
 			SharedPublish published{};
 
 			published = SnapshotShared();
-			if (published.fenceValue > dx12.lastConsumed) {
+			if (published.fenceValue > dx12.lastConsumed || published.generation != dx12.openedGeneration) {
 				if (dx12.PrepareShared(published)) {
 					prepared = true;
 					if (!VrBeat::HasGpuMail())
@@ -1279,25 +1369,55 @@ namespace
 							dx12.failCount, dx12.lastFailReason);
 				}
 			}
-			if (VrBeat::HasFirstSubmit() && prepared && dx12.color && dx12.guidesReady)
-				doorbell.OfferKick(dx12.color.Get(), published.width, published.height, published.format, published.pose);
+			if (!beatStarted) {
+				VrBeat::Start();
+				beatStarted = true;
+			}
+			// First TwP arrives from Kick->CopySbs. Gating OfferKick on
+			// HasFirstSubmit never lets that first Submit happen.
+			if (prepared && dx12.color && (dx12.guidesReady || published.colorOnly)) {
+				std::uint32_t outW = published.width;
+				std::uint32_t outH = published.height;
+				DXGI_FORMAT outFormat = published.format;
+				ID3D12Resource* finalColor = published.colorOnly ? nullptr : VrBoosterTail::Reconstruct(
+					dx12.device.Get(), dx12.queue.Get(), dx12.color.Get(), dx12.depth.Get(), dx12.mvec.Get(),
+					published.width, published.height, dx12.guideWidth, dx12.guideHeight,
+					published.format, dx12.depthFormat, dx12.mvecFormat,
+					published.constantsValid ? published.constants : nullptr,
+					outW, outH, outFormat);
+				if (!finalColor) {
+					finalColor = dx12.color.Get();
+					outW = published.width;
+					outH = published.height;
+					outFormat = published.format;
+				}
+				auto& perfMode = globals::features::upscaling.perfMode;
+				const bool logicalEye = perfMode.IsLogicalEyeActive() &&
+					perfMode.GetDisplayEyeWidth() && perfMode.GetDisplayEyeHeight();
+				const UINT tdW = perfMode.GetDisplayEyeWidth() * 2;
+				const UINT tdH = perfMode.GetDisplayEyeHeight();
+				static bool submittedTd = false;
+				// An engine SBS publish after the TD image recreates the HMD chain at 67%.
+				if (logicalEye && submittedTd && (outW != tdW || outH != tdH)) {
+					static bool loggedKeep = false;
+					if (!loggedKeep) {
+						loggedKeep = true;
+						logger::info("[VrAriseTail] keep TD {}x{}; ignoring {}x{}", tdW, tdH, outW, outH);
+					}
+				} else {
+					if (logicalEye && outW == tdW && outH == tdH)
+						submittedTd = true;
+					if (VrSwitch::On())
+						doorbell.OfferKick(finalColor, outW, outH, outFormat, published.pose, published.colorOnly);
+					else if (ID3D11Texture2D* present = VrBoosterTail::PresentTexture())
+						VrSubmitDlssg::SubmitOwnedSbs(present, outW, outH);
+				}
+			}
 
 			if (!dx12.color) {
 				Sleep(1);
 				PublishStatus(local);
 				continue;
-			}
-
-			if (!VrBeat::HasGpuMail()) {
-				VrBeat::Frame beat{};
-				beat.queue12 = dx12.queue.Get();
-				beat.left12 = dx12.color.Get();
-				beat.right12 = dx12.color.Get();
-				VrBeat::Publish(beat);
-			}
-			if (!beatStarted) {
-				VrBeat::Start();
-				beatStarted = true;
 			}
 
 			const auto beatStatus = VrBeat::GetStatus();
@@ -1361,6 +1481,14 @@ namespace
 #endif
 }
 
+void VrAriseTail::EnsureRunning()
+{
+#ifdef ENABLE_SKYRIM_VR
+	if (globals::game::isVR)
+		StartWorker();
+#endif
+}
+
 void VrAriseTail::Install()
 {
 #ifdef ENABLE_SKYRIM_VR
@@ -1418,21 +1546,232 @@ bool VrAriseTail::ShouldSwallowEngineSubmit()
 #endif
 }
 
+std::uint64_t VrAriseTail::LastPublishFence()
+{
+#ifdef ENABLE_SKYRIM_VR
+	return lastPublishFence.load(std::memory_order_relaxed);
+#else
+	return 0;
+#endif
+}
+
+std::uint64_t VrAriseTail::LastConsumedFence()
+{
+#ifdef ENABLE_SKYRIM_VR
+	return lastConsumedFence.load(std::memory_order_relaxed);
+#else
+	return 0;
+#endif
+}
+
+double VrAriseTail::LastKickFenceMs()
+{
+#ifdef ENABLE_SKYRIM_VR
+	return lastKickFenceMs.load(std::memory_order_relaxed);
+#else
+	return 0.0;
+#endif
+}
+
+bool VrAriseTail::HistoryResetPending()
+{
+#ifdef ENABLE_SKYRIM_VR
+	return historyResetPending.load(std::memory_order_acquire);
+#else
+	return false;
+#endif
+}
+
+void VrAriseTail::ClearHistoryReset()
+{
+#ifdef ENABLE_SKYRIM_VR
+	historyResetPending.store(false, std::memory_order_release);
+#endif
+}
+
+void LogAlphaProbe(const char* name, ID3D11Texture2D* tex)
+{
+	if (!tex || !globals::d3d::device || !globals::d3d::context) {
+		logger::info("[VrAriseTail] alpha {} missing", name);
+		return;
+	}
+	D3D11_TEXTURE2D_DESC desc{};
+	tex->GetDesc(&desc);
+	if (desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM || desc.Width < 2 || !desc.Height) {
+		logger::info("[VrAriseTail] alpha {} {}x{} fmt={}",
+			name, desc.Width, desc.Height, static_cast<unsigned>(desc.Format));
+		return;
+	}
+	static ComPtr<ID3D11Texture2D> staging;
+	static UINT stagedW = 0;
+	constexpr UINT kRows = 4;
+	if (!staging || stagedW != desc.Width) {
+		D3D11_TEXTURE2D_DESC staged{};
+		staged.Width = desc.Width;
+		staged.Height = kRows;
+		staged.MipLevels = 1;
+		staged.ArraySize = 1;
+		staged.Format = desc.Format;
+		staged.SampleDesc.Count = 1;
+		staged.Usage = D3D11_USAGE_STAGING;
+		staged.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+		staging.Reset();
+		if (FAILED(globals::d3d::device->CreateTexture2D(&staged, nullptr, staging.ReleaseAndGetAddressOf())))
+			return;
+		stagedW = desc.Width;
+	}
+	const UINT rows[kRows]{ desc.Height / 8, desc.Height / 2, desc.Height * 3 / 4, desc.Height - 1 };
+	for (UINT i = 0; i < kRows; ++i) {
+		D3D11_BOX box{ 0, rows[i], 0, desc.Width, rows[i] + 1, 1 };
+		globals::d3d::context->CopySubresourceRegion(staging.Get(), 0, 0, i, 0, tex, 0, &box);
+	}
+	D3D11_MAPPED_SUBRESOURCE mapped{};
+	if (FAILED(globals::d3d::context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped)))
+		return;
+	std::uint32_t zero = 0;
+	std::uint32_t one = 0;
+	std::uint32_t mid = 0;
+	const UINT step = std::max(1u, desc.Width / 256u);
+	for (UINT row = 0; row < kRows; ++row) {
+		const auto* pixels = reinterpret_cast<const std::uint8_t*>(mapped.pData) + static_cast<size_t>(row) * mapped.RowPitch;
+		for (UINT x = 0; x < desc.Width; x += step) {
+			const std::uint8_t alpha = pixels[x * 4 + 3];
+			if (alpha == 0)
+				++zero;
+			else if (alpha == 255)
+				++one;
+			else
+				++mid;
+		}
+	}
+	globals::d3d::context->Unmap(staging.Get(), 0);
+	logger::info("[VrAriseTail] alpha {} {}x{} zero={} one={} mid={}",
+		name, desc.Width, desc.Height, zero, one, mid);
+}
+
+ID3D11Texture2D* EngineRt(RE::RENDER_TARGETS::RENDER_TARGET slot)
+{
+	auto* renderer = globals::game::renderer;
+	if (!renderer)
+		return nullptr;
+	auto* texture = renderer->GetRuntimeData().renderTargets[slot].texture;
+	return static_cast<ID3D11Texture2D*>(texture);
+}
+
+void VrAriseTail::NoteHud(ID3D11Texture2D* hud)
+{
+#ifdef ENABLE_SKYRIM_VR
+	if (!hud || !globals::d3d::device || !globals::d3d::context)
+		return;
+	D3D11_TEXTURE2D_DESC desc{};
+	hud->GetDesc(&desc);
+	if (desc.Width < 2 || !desc.Height)
+		return;
+	ComPtr<ID3D11Device5> device5;
+	ComPtr<ID3D11DeviceContext4> context4;
+	if (FAILED(globals::d3d::device->QueryInterface(IID_PPV_ARGS(&device5))) ||
+		FAILED(globals::d3d::context->QueryInterface(IID_PPV_ARGS(&context4))))
+		return;
+	std::lock_guard lock(hudMutex);
+	if (!hudTex11 || hudW != desc.Width || hudH != desc.Height || hudFmt != desc.Format) {
+		hudSharedPub.store(nullptr, std::memory_order_release);
+		hudFencePub.store(nullptr, std::memory_order_release);
+		if (hudSharedHandle) {
+			CloseHandle(hudSharedHandle);
+			hudSharedHandle = nullptr;
+		}
+		if (hudFenceHandle) {
+			CloseHandle(hudFenceHandle);
+			hudFenceHandle = nullptr;
+		}
+		hudTex11.Reset();
+		hudFence11.Reset();
+		if (!CreateSharedTex(device5.Get(), desc.Width, desc.Height, desc.Format, 0,
+				hudTex11, hudSharedHandle, "VrAriseTail::Hud"))
+			return;
+		if (FAILED(device5->CreateFence(0, D3D11_FENCE_FLAG_SHARED, IID_PPV_ARGS(&hudFence11))) ||
+			FAILED(hudFence11->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr, &hudFenceHandle)))
+			return;
+		hudW = desc.Width;
+		hudH = desc.Height;
+		hudFmt = desc.Format;
+		hudFenceValue = 0;
+		hudFencePub.store(hudFenceHandle, std::memory_order_release);
+		hudSharedPub.store(hudSharedHandle, std::memory_order_release);
+		logger::info("[VrAriseTail] HUD shared {}x{} fmt={}", hudW, hudH, static_cast<unsigned>(hudFmt));
+	}
+	context4->CopyResource(hudTex11.Get(), hud);
+	static LARGE_INTEGER alphaFreq{}, alphaNext{};
+	if (!alphaFreq.QuadPart)
+		QueryPerformanceFrequency(&alphaFreq);
+	LARGE_INTEGER alphaNow{};
+	QueryPerformanceCounter(&alphaNow);
+	if (alphaNext.QuadPart == 0 || alphaNow.QuadPart >= alphaNext.QuadPart) {
+		alphaNext.QuadPart = alphaNow.QuadPart + alphaFreq.QuadPart * 2;
+		LogAlphaProbe("kMENUBG", hud);
+	}
+	++hudFenceValue;
+	if (SUCCEEDED(context4->Signal(hudFence11.Get(), hudFenceValue)))
+		hudFencePubValue.store(hudFenceValue, std::memory_order_release);
+#else
+	(void)hud;
+#endif
+}
+
+void* VrAriseTail::HudSharedHandle()
+{
+#ifdef ENABLE_SKYRIM_VR
+	return hudSharedPub.load(std::memory_order_acquire);
+#else
+	return nullptr;
+#endif
+}
+
+void* VrAriseTail::HudFenceHandle()
+{
+#ifdef ENABLE_SKYRIM_VR
+	return hudFencePub.load(std::memory_order_acquire);
+#else
+	return nullptr;
+#endif
+}
+
+std::uint64_t VrAriseTail::HudFenceValue()
+{
+#ifdef ENABLE_SKYRIM_VR
+	return hudFencePubValue.load(std::memory_order_acquire);
+#else
+	return 0;
+#endif
+}
+
 void VrAriseTail::PublishKTemp(ID3D11Texture2D* kTemp)
 {
 #ifdef ENABLE_SKYRIM_VR
 	if (!kTemp || !BootLatchedArise() || abandoned.load(std::memory_order_acquire))
 		return;
+	bool colorOnly = false;
+	ID3D11Texture2D* colorSrc = kTemp;
 	if (globals::state && globals::state->isLoadingMenuOpen) {
-		if (!publishPausedForLoad.exchange(true))
+		if (!publishPausedForLoad.exchange(true)) {
 			logger::info("[VrAriseTail] X4 publish paused (loading/no world)");
+			LogAlphaProbe("load kTEMP", kTemp);
+			LogAlphaProbe("load kTOTAL", EngineRt(RE::RENDER_TARGETS::kTOTAL));
+			LogAlphaProbe("load kMENUBG", EngineRt(RE::RENDER_TARGETS::kMENUBG));
+			LogAlphaProbe("load kFRAMEBUFFER", EngineRt(RE::RENDER_TARGETS::kFRAMEBUFFER));
+		}
 		publishResumeQpc.store(0, std::memory_order_release);
+		// kTEMP is cleared for the whole LoadingMenu. Scaling it submits black
+		// at TD size, and the shared-fence restart then stops later kicks.
+		NoteNoNewFrame("loading");
 		return;
 	}
 	D3D11_TEXTURE2D_DESC desc{};
-	kTemp->GetDesc(&desc);
-	if (!desc.Width || !desc.Height)
+	colorSrc->GetDesc(&desc);
+	if (!desc.Width || !desc.Height) {
+		NoteNoNewFrame("empty size");
 		return;
+	}
 
 	ComPtr<ID3D11Device5> device5;
 	ComPtr<ID3D11DeviceContext4> context4;
@@ -1477,12 +1816,12 @@ void VrAriseTail::PublishKTemp(ID3D11Texture2D* kTemp)
 			}
 		}
 	}
-	if (!guideW || !guideH || !mvecSrc || !depthSrv) {
-		if (!loggedPublishFail.exchange(true))
-			logger::error("[VrAriseTail] X4 publish refused: missing real depth/mvec");
+	if (!colorOnly && (!guideW || !guideH || !mvecSrc || !depthSrv)) {
+		// Before the pause latch clears, so a guide miss cannot look like a resume.
+		NoteNoNewFrame("guides");
 		return;
 	}
-	const bool resumeReset = publishPausedForLoad.exchange(false);
+	const bool resumeReset = colorOnly ? false : publishPausedForLoad.exchange(false);
 	if (resumeReset || publishResumeQpc.load(std::memory_order_acquire) == 0) {
 		LARGE_INTEGER now{};
 		QueryPerformanceCounter(&now);
@@ -1490,11 +1829,23 @@ void VrAriseTail::PublishKTemp(ID3D11Texture2D* kTemp)
 	}
 	if (resumeReset)
 		logger::info("[VrAriseTail] X4 publish resumed");
+	const UINT64 frame = globals::state ? globals::state->frameCount : 0;
+	if (frame && publishedThisFrame.exchange(frame) == frame)
+		return;
+	const UINT64 prevFrame = lastPublishedFrame.load(std::memory_order_acquire);
+	// Serial, not UpdatePoses. A stopped-then-resumed publish does not show up as count != 1.
+	// Color-only loading leaves the pending flag set so the first world frame resets once.
+	const bool serialGap = !colorOnly && (historyResetPending.exchange(false, std::memory_order_acq_rel) ||
+		(prevFrame && frame && frame != prevFrame + 1));
+	const bool historyReset = !colorOnly && (resumeReset || serialGap);
+	if (historyReset)
+		VrFfxOp::NoteDiscontinuity();
 	sl::Constants constants[2]{};
-	for (uint32_t eye = 0; eye < 2; ++eye) {
-		if (!globals::features::upscaling.streamlineDX12.FillConstants(constants[eye], eye, resumeReset, false)) {
+	for (uint32_t eye = 0; eye < 2 && !colorOnly; ++eye) {
+		if (!globals::features::upscaling.streamlineDX12.FillConstants(constants[eye], eye, historyReset, false)) {
 			if (!loggedPublishFail.exchange(true))
 				logger::error("[VrAriseTail] X4 publish refused: FillConstants eye={}", eye);
+			NoteNoNewFrame("constants");
 			return;
 		}
 		constants[eye].mvecScale = { 1.0f, 1.0f };
@@ -1513,35 +1864,33 @@ void VrAriseTail::PublishKTemp(ID3D11Texture2D* kTemp)
 			guideW, guideH);
 	}
 
-	const UINT64 frame = globals::state ? globals::state->frameCount : 0;
-	if (frame && publishedThisFrame.exchange(frame) == frame)
-		return;
-
 	std::lock_guard lock(sharedMutex);
-	if (!EnsureSharedSlots(device5.Get(), desc.Width, desc.Height, desc.Format, guideW, guideH, mvecFmt)) {
+	if (!EnsureSharedSlots(device5.Get(), desc.Width, desc.Height, desc.Format,
+			colorOnly ? 0u : guideW, colorOnly ? 0u : guideH, colorOnly ? DXGI_FORMAT_UNKNOWN : mvecFmt)) {
 		if (!loggedPublishFail.exchange(true))
 			logger::warn("[VrAriseTail] X2 shared slot create failed {}x{} fmt={}",
 				desc.Width, desc.Height, static_cast<unsigned>(desc.Format));
 		return;
 	}
 	const UINT slot = static_cast<UINT>(sharedFenceValue % kSharedSlots);
-	if (!sharedHasGuides || !sharedDepthRtv[slot] || !sharedMvec11[slot]) {
+	if (!colorOnly && (!sharedHasGuides || !sharedDepthRtv[slot] || !sharedMvec11[slot])) {
 		if (!loggedPublishFail.exchange(true))
 			logger::error("[VrAriseTail] X4 publish refused: shared guides not created");
 		return;
 	}
-	context4->CopyResource(sharedTex11[slot].Get(), kTemp);
-	context4->CopyResource(sharedMvec11[slot].Get(), mvecSrc);
+	context4->CopyResource(sharedTex11[slot].Get(), colorSrc);
+	if (!colorOnly)
+		context4->CopyResource(sharedMvec11[slot].Get(), mvecSrc);
 	auto& upscaling = globals::features::upscaling;
 	auto* vs = upscaling.GetUpscaleVS();
 	auto* ps = upscaling.copyDepthToSharedBufferPS.Get(
 		L"Data\\Shaders\\Upscaling\\CopyDepthToSharedBufferPS.hlsl", { { "PSHADER", "" } }, "ps_5_0");
-	if (!vs || !ps) {
+	if (!colorOnly && (!vs || !ps)) {
 		if (!loggedPublishFail.exchange(true))
 			logger::error("[VrAriseTail] X4 publish refused: depth blit shaders missing");
 		return;
 	}
-	{
+	if (!colorOnly) {
 		Util::FullscreenPassScope stateScope(globals::d3d::context);
 		D3D11_VIEWPORT viewport{};
 		viewport.Width = static_cast<float>(guideW);
@@ -1570,13 +1919,19 @@ void VrAriseTail::PublishKTemp(ID3D11Texture2D* kTemp)
 			logger::warn("[VrAriseTail] X2 fence Signal failed");
 		return;
 	}
+	if (!colorOnly)
+		haveWorldPublish.store(true, std::memory_order_release);
+	lastPublishedFrame.store(frame, std::memory_order_release);
+	lastPublishFence.store(sharedFenceValue, std::memory_order_relaxed);
+	EndNoNewFrame();
 	sharedPublished.fenceValue = sharedFenceValue;
 	sharedPublished.slot = slot;
 	sharedPublished.generation = sharedGeneration;
 	sharedPublished.width = desc.Width;
 	sharedPublished.height = desc.Height;
 	sharedPublished.format = desc.Format;
-	sharedPublished.hasGuides = true;
+	sharedPublished.hasGuides = !colorOnly;
+	sharedPublished.colorOnly = colorOnly;
 	sharedPublished.guideWidth = guideW;
 	sharedPublished.guideHeight = guideH;
 	sharedPublished.depthFormat = DXGI_FORMAT_R32_FLOAT;
@@ -1599,6 +1954,9 @@ void VrAriseTail::PublishKTemp(ID3D11Texture2D* kTemp)
 	sharedConstants[0] = constants[0];
 	sharedConstants[1] = constants[1];
 	sharedConstantsValid = true;
+	sharedPublished.constants[0] = constants[0];
+	sharedPublished.constants[1] = constants[1];
+	sharedPublished.constantsValid = !colorOnly;
 	if (!loggedPublish.exchange(true))
 		logger::info("[VrAriseTail] X4 published kTEMP {}x{} + guides {}x{} mvecFmt={} slot={}",
 			desc.Width, desc.Height, guideW, guideH, static_cast<unsigned>(mvecFmt), slot);

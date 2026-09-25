@@ -120,6 +120,70 @@ void PerfMode::InstallRenderTargetSizeHook()
 	hookActive = true;
 }
 
+void PerfMode::InstallVrLogicalEyeHook()
+{
+	if (!globals::game::isVR || hookActive || logicalEyeActive)
+		return;
+
+	auto* openvr = RE::BSOpenVR::GetSingleton();
+	if (!openvr || !openvr->vrSystem) {
+		logger::error("[PerfMode] VR logical eye: BSOpenVR unavailable");
+		return;
+	}
+	uint32_t hmdW = 0, hmdH = 0;
+	openvr->vrSystem->GetRecommendedRenderTargetSize(&hmdW, &hmdH);
+	if (!hmdW || !hmdH) {
+		logger::error("[PerfMode] VR logical eye: HMD size {}x{}", hmdW, hmdH);
+		return;
+	}
+
+	auto& foveated = globals::features::upscaling.foveatedRender;
+	foveated.bootSnapshot.LatchIfNeeded(foveated.settings);
+	foveated.unifiedBootSnapshot.LatchIfNeeded(foveated.settings.unifiedPipeline);
+	using Backend = FoveatedRender::FlatAct1Backend;
+	const auto backend = static_cast<Backend>(std::min(
+		foveated.bootSnapshot.Boot(&FoveatedRender::Settings::flatPipelineAct1Backend), 2u));
+	if (backend == Backend::kBypass) {
+		logger::info("[PerfMode] VR logical eye skipped: ACT1 bypass leaves nothing to upscale into");
+		return;
+	}
+	const auto unified = foveated.ActiveUnifiedPipelineSettings();
+	const bool srss = unified.act1Srss && backend == Backend::kDLSS;
+	const uint32_t quality = std::min(srss ? unified.act1SrssQuality :
+		foveated.bootSnapshot.Boot(&FoveatedRender::Settings::flatPipelineAct1Quality), 4u);
+	const float guidanceScale = srss ? std::max(unified.guidanceScale, 1.0f) : 1.0f;
+	const float ratio = Upscaling::GetQualityModeRatio(quality);
+	if (!std::isfinite(ratio) || ratio <= 0.0f) {
+		logger::error("[PerfMode] VR logical eye: bad quality ratio {} mode {}", ratio, quality);
+		return;
+	}
+
+	auto even = [](float value) {
+		const auto n = static_cast<uint32_t>(std::lround(value)) & ~1u;
+		return std::max<uint32_t>(2u, n);
+	};
+	uint32_t guidanceW = even(static_cast<float>(hmdW) * guidanceScale);
+	uint32_t guidanceH = even(static_cast<float>(hmdH) * guidanceScale);
+	uint32_t renderW = even(static_cast<float>(guidanceW) / ratio);
+	uint32_t renderH = even(static_cast<float>(guidanceH) / ratio);
+	auto& upscaling = globals::features::upscaling;
+	if (backend == Backend::kDLSS && upscaling.streamline.slDLSSGetOptimalSettings)
+		upscaling.streamline.ClampToDLSSRenderRange(quality, guidanceW, guidanceH, renderW, renderH);
+	renderW = std::max<uint32_t>(2u, renderW & ~1u);
+	renderH = std::max<uint32_t>(2u, renderH & ~1u);
+
+	displayEyeWidth = hmdW;
+	displayEyeHeight = hmdH;
+	renderEyeWidth = renderW;
+	renderEyeHeight = renderH;
+	latchedQualityMode = quality;
+	explicitScaleLatched = false;
+	logicalEyeActive = true;
+	stl::write_vfunc<0x12, GetRenderTargetSize_Hook>(RE::VTABLE_BSOpenVR[0]);
+	logger::info("[PerfMode] VR logical eye TD={}x{} G={}x{} R={}x{} mode={} srss={} G/D={:.3f}",
+		hmdW, hmdH, guidanceW, guidanceH, renderW, renderH, quality, srss ? 1 : 0, guidanceScale);
+}
+
 void PerfMode::GetRenderTargetSize_Hook::thunk(RE::BSOpenVR* a_this, uint32_t* a_width, uint32_t* a_height)
 {
 	// Call original to get real HMD resolution

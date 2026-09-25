@@ -176,6 +176,9 @@ public:
 	// Cached DLL version info for Streamline plugin directory
 	static std::vector<std::pair<std::string, std::string>> dllVersions;
 
+	/** @brief VR shorts DLSS-G and Reflex/PCL at init. DLSS-SR stays. */
+	static bool VrShortsFramegenAndReflex();
+
 	/** @brief Loads the Streamline interposer DLL and initializes the SDK with feature preferences. */
 	void LoadInterposer();
 

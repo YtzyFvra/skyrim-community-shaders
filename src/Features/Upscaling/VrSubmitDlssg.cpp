@@ -7,6 +7,7 @@
 #include "NeuralRendering/ArisePipeline.h"
 #include "Utils/LazyShader.h"
 #include "VrAriseTail.h"
+#include "VrBoosterTail.h"
 
 #include <Windows.h>
 #include <atomic>
@@ -33,7 +34,8 @@ namespace
 		if (!handle)
 			return false;
 #ifdef ENABLE_SKYRIM_VR
-		return handle == Rt(RE::RENDER_TARGETS::kHUDMENU) ||
+		return handle == Rt(RE::RENDER_TARGETS::kMENUBG) ||
+			handle == Rt(RE::RENDER_TARGETS::kHUDMENU) ||
 			handle == Rt(RE::RENDER_TARGETS::kPROJECTEDMENU) ||
 			handle == Rt(RE::RENDER_TARGETS::kFADERUI) ||
 			handle == Rt(RE::RENDER_TARGETS::kWORLDUI0) ||
@@ -55,7 +57,6 @@ namespace
 	eastl::unique_ptr<Texture2D> testSbsB;
 	eastl::unique_ptr<ConstantBuffer> bandCB;
 	bool loggedMode2 = false;
-	bool loggedMode3 = false;
 	bool loggedMode4 = false;
 	bool loggedPaintFail = false;
 	winrt::com_ptr<ID3D11Query> gpuFence;
@@ -134,34 +135,6 @@ namespace
 		context->Flush();
 		while (context->GetData(gpuFence.get(), nullptr, 0, 0) == S_FALSE)
 			Sleep(0);
-	}
-
-	bool SubmitCompositorEyes(ID3D11Texture2D* sbs)
-	{
-		auto* compositor = RE::BSOpenVR::GetIVRCompositor();
-		if (!compositor || !sbs) {
-			if (!loggedMode3) {
-				logger::warn("[VrSubmitDlssg] mode 3 GetIVRCompositor missing");
-				loggedMode3 = true;
-			}
-			return false;
-		}
-		// Official OpenVR Texture_t — not the BSOpenVR vfunc 03 slot (that one is the
-		// ID3D11Texture2D* itself). Half-eye bounds; v unflipped (half-width only).
-		vr::Texture_t tex{};
-		tex.handle = sbs;
-		tex.eType = vr::TextureType_DirectX;
-		tex.eColorSpace = vr::ColorSpace_Auto;
-		const vr::VRTextureBounds_t left{ 0.f, 0.f, 0.5f, 1.f };
-		const vr::VRTextureBounds_t right{ 0.5f, 0.f, 1.f, 1.f };
-		const auto errL = compositor->Submit(vr::Eye_Left, &tex, &left, vr::Submit_Default);
-		const auto errR = compositor->Submit(vr::Eye_Right, &tex, &right, vr::Submit_Default);
-		if (!loggedMode3) {
-			logger::info("[VrSubmitDlssg] mode 3 IVRCompositor Submit L={} R={}",
-				static_cast<int>(errL), static_cast<int>(errR));
-			loggedMode3 = true;
-		}
-		return errL == vr::VRCompositorError_None && errR == vr::VRCompositorError_None;
 	}
 
 	const char* RtName(ID3D11Resource* handle)
@@ -303,8 +276,11 @@ void VrSubmitDlssg::RunSubmitTest(ID3D11Texture2D* kTemp, std::uint32_t mode)
 		return;
 	}
 	if (mode == 3) {
-		SubmitOwnedSbs(kTemp, desc.Width, desc.Height);
-		SubmitCompositorEyes(kTemp);
+		static bool loggedMode3 = false;
+		if (!loggedMode3) {
+			logger::info("[VrSubmitDlssg] mode 3 retired; Submit_Default is not used");
+			loggedMode3 = true;
+		}
 		return;
 	}
 	if (mode == 4) {
@@ -334,35 +310,31 @@ bool VrSubmitDlssg::TrySubmit(RE::BSOpenVR*, const vr::Texture_t* texture,
 	if (texture && textureAddr >= 0x10000 && textureAddr <= 0x00007FFFFFFFFFFFull)
 		handle = reinterpret_cast<ID3D11Resource*>(const_cast<vr::Texture_t*>(texture));
 	const bool isOverlay = handle && IsOverlayRt(handle);
-	if (handle && !isOverlay && VrAriseTail::IsActive())
+	if (handle && !isOverlay && VrAriseTail::IsActive() && !VrBoosterTail::OwnsSubmit()) {
+		// VR HUD is kMENUBG (KIT enlarges that slot). kHUDMENU is the flat enum.
+		if (ID3D11Resource* menu = Rt(RE::RENDER_TARGETS::kMENUBG))
+			VrAriseTail::NoteHud(static_cast<ID3D11Texture2D*>(menu));
 		VrAriseTail::PublishKTemp(static_cast<ID3D11Texture2D*>(handle));
+	}
 
-	// Diagnostic: ShouldSwallowEngineSubmit() below fires unconditionally once
-	// Tail's takeover is live, so it always wins this race and the "let
-	// overlay/menu submits through" branch further down is unreachable dead
-	// code -- every menu/HUD Submit the engine makes gets silently discarded
-	// with nothing in its place. User-reported severe judder is 1:1 with
-	// opening the ESC menu or console; count+name these to confirm before
-	// touching the swallow order (ARISE forbids the engine from Submitting to
-	// OC directly, so "just let overlay through" is not an option here).
+	// Contract B: swallow vs not-takeover only. Overlay RTs are not a
+	// passthrough. Out of scope this round: HUD/menu is swallowed and not folded into SBS.
 	if (isOverlay) {
+		if (handle == Rt(RE::RENDER_TARGETS::kMENUBG))
+			VrAriseTail::NoteHud(static_cast<ID3D11Texture2D*>(handle));
 		static std::atomic<std::uint32_t> overlaySwallowed{ 0 };
 		const std::uint32_t n = ++overlaySwallowed;
 		if (n <= 16 || (n % 120) == 0)
-			logger::warn("[VrSubmitDlssg] overlay Submit #{} {} silently swallowed (dead pass-through branch)",
+			logger::warn("[VrSubmitDlssg] overlay Submit #{} {} swallowed (HUD stamped after FG)",
 				n, RtName(handle));
 	}
 
+	if (!isOverlay && VrBoosterTail::OwnsSubmit())
+		return true;
 	if (VrAriseTail::ShouldSwallowEngineSubmit())
 		return true;
 	if (!ownedSubmitted)
 		return false;
-
-	const bool overlay = IsOverlayRt(handle);
-	if (overlay) {
-		LogEngineSubmit(handle, true, false);
-		return false;
-	}
 
 	LogEngineSubmit(handle, false, true);
 	if (!loggedSwallow) {

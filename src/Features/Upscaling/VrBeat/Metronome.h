@@ -8,8 +8,8 @@
 #	include <d3d12.h>
 
 /**
- * Our Wait+Submit metronome. Reads Tex+matrix from its own mailbox.
- * Does not own G, Kick, or pairing.
+ * Producer thread: copies SBS into a mailbox and enqueues via OpenVR Submit.
+ * OC L3 owns Wait/Begin/End. Does not own G, Kick, or pairing.
  */
 namespace VrBeat
 {
@@ -20,6 +20,7 @@ namespace VrBeat
 		ID3D12Resource* right12 = nullptr;
 		ID3D12CommandQueue* queue12 = nullptr;
 		bool sbs = false;
+		std::uint64_t pair = 0;
 	};
 
 	struct Status
@@ -41,45 +42,33 @@ namespace VrBeat
 	/** @brief Stop the beat and drop Wait ownership. */
 	void Stop();
 
-	/** @brief Overwrite the mailbox picture. Pose is submitPose, not this. */
-	void Publish(const Frame& frame);
-
 	/** @brief Bind the D3D12 queue used to copy into the metronome buffer. */
 	void BindGpu(ID3D12Device* device, ID3D12CommandQueue* queue);
 
-	/**
-	 * @brief Overwrite the one buffer. Pose unchanged.
-	 * Always the same resource; no ping-pong.
-	 */
-	bool CopySbs(ID3D12Resource* src, UINT width, UINT height, DXGI_FORMAT format);
+	/** @brief New Kick id so an interpolated offer only pairs with its own real. */
+	std::uint64_t NextPair();
 
 	/**
 	 * @brief Overwrite the one buffer and the owned pose together.
 	 */
 	bool CopySbs(ID3D12Resource* src, UINT width, UINT height, DXGI_FORMAT format,
-		const vr::HmdMatrix34_t& pose, bool poseValid);
+		const vr::HmdMatrix34_t& pose, bool poseValid, std::uint64_t pair);
 
 	/** @brief True after at least one CopySbs. */
 	bool HasGpuMail();
 
+	/** @brief Last copy-fence wait on the doorbell queue, in milliseconds. */
+	double LastCopyFenceMs();
+
 	/**
-	 * @brief G's interpolated frame, delivered on its own dedicated
-	 * compositor period instead of sharing the reactive mailbox the real
-	 * frame uses. Without this, the interpolated frame's color is always
-	 * overwritten by the real frame that follows it moments later on the
-	 * same Kick before the (purely reactive, once-per-engine-Wait) beat
-	 * loop ever gets a chance to Submit it -- G pays its own per-Kick GPU
-	 * cost but the interpolated frame never reaches the compositor, so the
-	 * headset never sees genuine 2x (09-19 22:52 measurement: VDXR fps
-	 * actually *dropped* with G on, pure overhead with no realized frame).
-	 * Copies into a separate buffer immediately (safe to call from
-	 * whichever thread G's native Present hook fires on); the beat thread
-	 * picks it up on its next wake and gives it its own WaitGetPoses+Submit,
-	 * deferred behind the engine's real-frame period if both are pending in
-	 * the same beat-loop iteration (engine's Wait takes priority).
+	 * @brief Copy the interpolated SBS for this Kick pair. Beat enqueues it
+	 * before the real only when the pair ids match.
 	 */
 	bool OfferGInterpolated(ID3D12Resource* src, UINT width, UINT height, DXGI_FORMAT format,
-		const vr::HmdMatrix34_t& pose);
+		const vr::HmdMatrix34_t& pose, std::uint64_t pair);
+
+	/** @brief Drop a pending interpolated offer (real CopySbs failed). */
+	void CancelInterp();
 
 	/** @brief True after the first owned Submit (OC session bind). */
 	bool HasFirstSubmit();
@@ -97,21 +86,6 @@ namespace VrBeat
 
 	/** @brief HMD pose OpenVR handed the engine on its own last Wait/GetLastPoses. */
 	bool CopyEngineDrawPose(vr::HmdMatrix34_t& out);
-
-	/**
-	 * @brief Engine UpdatePoses(true) is about to WaitGetPoses.
-	 * Serializes with the beat thread so both never Wait at once. The beat
-	 * thread — never this one — Submits to close the period the engine's
-	 * Wait just opened; Submit must never run on the engine thread.
-	 */
-	class EngineWaitClose
-	{
-	public:
-		EngineWaitClose();
-		~EngineWaitClose();
-		EngineWaitClose(const EngineWaitClose&) = delete;
-		EngineWaitClose& operator=(const EngineWaitClose&) = delete;
-	};
 
 	/** @brief Block until first Submit or timeout. */
 	bool WaitForFirstSubmitMs(unsigned ms);

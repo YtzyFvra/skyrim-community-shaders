@@ -17,6 +17,8 @@ cbuffer BlendCB : register(b0)
 	float DitherStrength;  // 0 = pure smooth gradient, 1 = natural noise, 2 = aggressive dither
 	uint MaskMode;         // Mask shape: 0 = Rectangle, 1 = Oval
 	float FalloffCurve;    // 0.5 = earlier falloff, 1 = balanced, 2 = later falloff
+	uint SrcWidth;         // 0 or SubWidth: sample 1:1. Otherwise bilinear into the dest box.
+	uint SrcHeight;
 };
 
 Texture2D<float4> SrcTex : register(t0);    // DLSS subrect output
@@ -58,10 +60,29 @@ float ShapeRamp(float normalizedDistance, float curve)
 	if (tid.x >= SubWidth || tid.y >= SubHeight)
 		return;
 
-	uint2 srcPos = uint2(tid.x + SrcOffsetX, tid.y);
 	uint2 dstPos = uint2(tid.x + DstOffsetX, tid.y + DstOffsetY);
-
-	float4 dlss = SrcTex.Load(int3(srcPos, 0));
+	float4 dlss;
+	if (SrcWidth == 0 || SrcHeight == 0 || (SrcWidth == SubWidth && SrcHeight == SubHeight)) {
+		dlss = SrcTex.Load(int3(int(tid.x + SrcOffsetX), int(tid.y), 0));
+	} else {
+		float2 pos = (float2(tid.xy) + 0.5) * float2(SrcWidth, SrcHeight) / float2(SubWidth, SubHeight) - 0.5;
+		int2 base = int2(floor(pos));
+		float2 fracPos = pos - float2(base);
+		float4 sum = 0;
+		[unroll] for (int y = 0; y < 2; ++y) {
+			[unroll] for (int x = 0; x < 2; ++x) {
+				int2 sample = clamp(base + int2(x, y), int2(0, 0), int2(SrcWidth, SrcHeight) - 1);
+				float w = (x == 0 ? 1.0 - fracPos.x : fracPos.x) * (y == 0 ? 1.0 - fracPos.y : fracPos.y);
+				sum += SrcTex.Load(int3(sample.x + int(SrcOffsetX), sample.y, 0)) * w;
+			}
+		}
+		dlss = sum;
+	}
+	if (BlendMode == 3) {
+		DstTex[dstPos] = dlss;
+		return;
+	}
+	uint2 srcPos = uint2(tid.x + SrcOffsetX, tid.y);
 
 	// Distance from the selected mask edge in subrect-local pixel space.
 	//

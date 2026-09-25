@@ -5,6 +5,7 @@
 #include "Utils/Game.h"
 
 #include <cstdlib>
+#include <cstring>
 #include <d3d11.h>
 
 namespace NeuralRendering
@@ -173,7 +174,8 @@ namespace NeuralRendering
 			ffxFsr3ContextDestroy(&context_);
 		valid_ = false;
 		failureLatched_ = false;
-		context_ = {};
+		// FfxFsr3Context is 2MB. Value-init builds that temporary on the stack and overflows the game thread.
+		std::memset(&context_, 0, sizeof(context_));
 		if (scratch_)
 			std::free(scratch_);
 		scratch_ = nullptr;

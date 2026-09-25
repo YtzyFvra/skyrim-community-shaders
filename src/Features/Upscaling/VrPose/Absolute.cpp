@@ -34,8 +34,12 @@ void VrPoseAbs::LatchDraw(const VrPose::Body& pose)
 void VrPoseAbs::StampReady()
 {
 	std::lock_guard lock(mutex);
-	ready = haveCarry ? carry : pending;
-	haveCarry = false;
+	if (haveCarry) {
+		ready = carry;
+		haveCarry = false;
+	} else {
+		ready.valid = false;
+	}
 	static std::uint64_t n = 0;
 	++n;
 	if (n <= 8 || (n % 120) == 0)

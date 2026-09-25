@@ -45,6 +45,8 @@
 	X(flatPipelineAct1Quality)                    \
 	X(flatPipelineAct1Preset)                     \
 	X(flatPipelineAct1Jitter)                     \
+	X(jitterPhaseCount)                           \
+	X(mipBiasOffset)                              \
 	X(flatPipelineAct1Dsr)                        \
 	X(flatPipelineNrScale)                        \
 	X(flatPipelineNrNative)                       \
@@ -124,6 +126,7 @@
 	X(act3ResetEveryFrame)                        \
 	X(act3Sharpen)                                \
 	X(act3Sharpness)                              \
+	X(act3BlendMode)                              \
 	X(act3FeatherWidth)                           \
 	X(act3DitherStrength)                         \
 	X(act3GuidanceEnabled)                        \
@@ -769,6 +772,9 @@ void FoveatedRender::ClampSettings()
 	settings.flatPipelineAct1Quality = std::min(settings.flatPipelineAct1Quality, 4u);
 	settings.flatPipelineAct1Preset = std::min(settings.flatPipelineAct1Preset, 4u);
 	settings.flatPipelineAct1Jitter = std::min(settings.flatPipelineAct1Jitter, 1u);
+	if (settings.jitterPhaseCount < 1)
+		settings.jitterPhaseCount = 72;
+	settings.mipBiasOffset = std::clamp(settings.mipBiasOffset, -3.0f, 3.0f);
 	auto& unified = settings.unifiedPipeline;
 	unified.act1SrssQuality = std::clamp(unified.act1SrssQuality, 3u, 4u);
 	if (unified.act1SrssQuality == 3)
@@ -844,6 +850,7 @@ void FoveatedRender::ClampSettings()
 	settings.act3SkinStructure = std::clamp(settings.act3SkinStructure, 0.0f, 2.0f);
 	settings.act3Style = std::min(settings.act3Style, 3u);
 	settings.act3Sharpness = std::clamp(settings.act3Sharpness, 0.0f, 1.0f);
+	settings.act3BlendMode = std::min(settings.act3BlendMode, 2u);
 	settings.act3FeatherWidth = std::clamp(settings.act3FeatherWidth, 2.0f, 128.0f);
 	settings.act3DitherStrength = std::clamp(settings.act3DitherStrength, 0.0f, 2.0f);
 	settings.act3GuidanceLuma = std::clamp(settings.act3GuidanceLuma, 0.0f, 1.5f);
@@ -1222,11 +1229,112 @@ const char* FoveatedRender::SubrectMaskModeName(SubrectMaskMode mode)
 	           T(TKEY("foveated_mask_rectangle"), "Rectangle");
 }
 
+void FoveatedRender::DrawEdgeBlendControls(const char* idSuffix, uint& mode, float& featherWidth, float& ditherStrength)
+{
+	mode = std::min(mode, 2u);
+	ImGui::PushID(idSuffix);
+	ImGui::SliderInt(T(TKEY("foveated_edge_blend_label"), "Edge Blend"), reinterpret_cast<int*>(&mode), 0, 2,
+		SubrectBlendModeName(static_cast<SubrectBlendMode>(mode)));
+	switch (static_cast<SubrectBlendMode>(mode)) {
+	case SubrectBlendMode::kHardCopy:
+		ImGui::TextWrapped("%s", T(TKEY("foveated_blend_hard_copy_desc"), "Sharp seam at the subrect boundary. Lowest cost."));
+		break;
+	case SubrectBlendMode::kFeather:
+		ImGui::TextWrapped("%s", T(TKEY("foveated_blend_feather_desc"), "Smoothstep fade over N pixels at the boundary. Hides the seam."));
+		ImGui::SliderFloat(T(TKEY("foveated_feather_width"), "Feather Width"), &featherWidth, 2.0f, 128.0f, "%.0f px");
+		break;
+	case SubrectBlendMode::kDither:
+		ImGui::TextWrapped("%s", T(TKEY("foveated_blend_dither_desc"), "Noise-dithered fade. More natural than a smooth feather on a large box."));
+		ImGui::SliderFloat(T(TKEY("foveated_band_width"), "Band Width"), &featherWidth, 2.0f, 128.0f, "%.0f px");
+		ImGui::SliderFloat(T(TKEY("foveated_noise_amount"), "Noise Amount"), &ditherStrength, 0.0f, 2.0f, "%.2f");
+		break;
+	default:
+		break;
+	}
+	ImGui::PopID();
+}
+
+namespace
+{
+	void DrawJitterLodControls(FoveatedRender::Settings& settings, const Upscaling& upscaling)
+	{
+		ImGui::Separator();
+		ImGui::TextUnformatted(T(TKEY("jitter_control"), "Jitter Control"));
+		static const int32_t jitterValues[] = { 4, 8, 18, 24, 32, 72, 144 };
+		static const char* jitterLabels[] = { "4", "8", "18", "24", "32", "72", "144" };
+		int currentIdx = -1;
+		for (int i = 0; i < 7; ++i) {
+			if (settings.jitterPhaseCount == jitterValues[i]) {
+				currentIdx = i;
+				break;
+			}
+		}
+		char preview[16];
+		if (currentIdx >= 0)
+			std::snprintf(preview, sizeof(preview), "%s", jitterLabels[currentIdx]);
+		else
+			std::snprintf(preview, sizeof(preview), "%d", settings.jitterPhaseCount);
+		if (ImGui::BeginCombo("##jitterPhase", preview)) {
+			for (int i = 0; i < 7; ++i) {
+				const bool selected = currentIdx == i;
+				if (ImGui::Selectable(jitterLabels[i], selected))
+					settings.jitterPhaseCount = jitterValues[i];
+				if (selected)
+					ImGui::SetItemDefaultFocus();
+			}
+			ImGui::EndCombo();
+		}
+		const int32_t activePhase = upscaling.lastJitterPhaseCount > 0 ? upscaling.lastJitterPhaseCount : settings.jitterPhaseCount;
+		ImGui::Text(T(TKEY("jitter_phase_active"), "Active phase count: %d"), activePhase);
+		ImGui::TextWrapped("%s", T(TKEY("jitter_phase_detail"),
+			"Fewer phases may converge faster; more phases may capture finer sub-pixel detail."));
+		ImGui::TextWrapped("%s", T(TKEY("jitter_phase_flicker"), "More phases = more background flickering."));
+
+		ImGui::TextUnformatted(T(TKEY("extra_bias"), "Extra Bias"));
+		const char* mipLabel;
+		if (settings.mipBiasOffset >= 0.5f)
+			mipLabel = T(TKEY("mip_soft"), "Soft");
+		else if (settings.mipBiasOffset >= -0.5f)
+			mipLabel = T(TKEY("mip_balanced"), "Balanced");
+		else if (settings.mipBiasOffset >= -1.5f)
+			mipLabel = T(TKEY("mip_sharper"), "Sharper");
+		else
+			mipLabel = T(TKEY("mip_very_sharp"), "Very Sharp");
+		char mipBuf[48];
+		std::snprintf(mipBuf, sizeof(mipBuf), "%.1f  (%s)", settings.mipBiasOffset, mipLabel);
+		ImGui::SliderFloat("##mipBiasOffset", &settings.mipBiasOffset, -3.0f, 1.0f, mipBuf);
+		if (ImGui::IsItemHovered())
+			ImGui::SetTooltip("%s", T(TKEY("mip_bias_tooltip"),
+				"Extra offset added to the computed mip bias. Negative = sharper textures, positive = softer."));
+		const float scale = std::max(upscaling.ReconstructionUpscaleRatio(), 1.0e-3f);
+		float bias = std::log2(1.0f / scale);
+		if (upscaling.GetUpscaleMethod() == Upscaling::UpscaleMethod::kDLSS)
+			bias -= 1.0f;
+		bias += settings.mipBiasOffset;
+		ImGui::TextDisabled(T(TKEY("mip_bias_result"), "Mip bias %.2f (quality scale %.2f, SRSS excluded)"), bias, scale);
+		ImGui::TextWrapped("%s", T(TKEY("mip_bias_flicker"), "High values increase background flickering."));
+	}
+}
+
 void FoveatedRender::DrawLogicalPerfModeControls()
 {
 	if (globals::game::isVR) {
-		ImGui::TextDisabled("%s", T(TKEY("pipeline_arise_vr_blocked"),
-			"ARISE owns DXGI Present. VR submits through OpenVR. 8-pass runs after Post, then we Submit."));
+		auto& upscaling = globals::features::upscaling;
+		if (ImGui::Checkbox(T(TKEY("pipeline_single_thread"), "Single-thread PerfMode"), &settings.singleThreadPerfMode) &&
+			settings.singleThreadPerfMode)
+			settings.ariseModel3 = false;
+		Util::UI::RestartGatedAnnotate(bootSnapshot, settings, &Settings::singleThreadPerfMode,
+			T(TKEY("pipeline_vr_logical_restart"),
+				"Engine RTs allocate at logical R from the ACT1 preset, HMD size, and SRSS. Submit stays at the HMD size. Restart required."));
+		if (upscaling.perfMode.IsLogicalEyeActive())
+			ImGui::TextDisabled(T(TKEY("pipeline_vr_logical_active"),
+				"Active: engine R %ux%u per eye, submit TD %ux%u"),
+				upscaling.perfMode.GetRenderEyeWidth(), upscaling.perfMode.GetRenderEyeHeight(),
+				upscaling.perfMode.GetDisplayEyeWidth(), upscaling.perfMode.GetDisplayEyeHeight());
+		else
+			ImGui::TextDisabled("%s", T(TKEY("pipeline_vr_logical_off"),
+				"Off this session. The engine keeps the HMD resolution until restart."));
+		DrawJitterLodControls(settings, upscaling);
 		return;
 	}
 	ClampSettings();
@@ -1259,6 +1367,7 @@ void FoveatedRender::DrawLogicalPerfModeControls()
 			T(TKEY("pipeline_active_single_thread"), "Active this session: Single-thread synchronous Tail"));
 	else
 		ImGui::TextDisabled("%s", T(TKEY("pipeline_active_origin"), "Active this session: Origin (engine RTs at D)"));
+	DrawJitterLodControls(settings, upscaling);
 }
 
 namespace
@@ -1854,11 +1963,7 @@ void FoveatedRender::DrawNeuralRenderingSettings(bool wrapHeader)
 					ImGui::Text("%s", T(TKEY("act3_scale_tooltip"),
 						"Fixed center crop. 0.50 = half the full D width and height. 0 skips ACT3."));
 				}
-				ImGui::SliderFloat(T(TKEY("act3_feather"), "Writeback Feather"), &settings.act3FeatherWidth, 2.0f, 128.0f, "%.0f px");
-				if (auto _tt = Util::HoverTooltipWrapper()) {
-					ImGui::Text("%s", T(TKEY("act3_feather_tooltip"),
-						"Smoothstep band at the crop edge. Outer edge is first-pass D, inner edge is ACT3."));
-				}
+				DrawEdgeBlendControls("act3", settings.act3BlendMode, settings.act3FeatherWidth, settings.act3DitherStrength);
 				ImGui::Checkbox(T(TKEY("act3_guidance"), "ACT3 Guidance"), &settings.act3GuidanceEnabled);
 				if (auto _tt = Util::HoverTooltipWrapper()) {
 					ImGui::Text("%s", T(TKEY("act3_guidance_tooltip"),
@@ -2310,21 +2415,7 @@ void FoveatedRender::DrawSettings()
 			}
 		}
 
-		ImGui::SliderInt(T(TKEY("foveated_edge_blend_label"), "Edge Blend"), reinterpret_cast<int*>(&settings.subrectBlendMode), 0, 2, SubrectBlendModeName((SubrectBlendMode)std::min(settings.subrectBlendMode, 2u)));
-		switch (GetSubrectBlendMode()) {
-		case SubrectBlendMode::kHardCopy:
-			ImGui::TextWrapped("%s", T(TKEY("foveated_blend_hard_copy_desc"), "Sharp seam at the subrect boundary. Lowest cost."));
-			break;
-		case SubrectBlendMode::kFeather:
-			ImGui::TextWrapped("%s", T(TKEY("foveated_blend_feather_desc"), "Smoothstep fade over N pixels at the boundary. Hides the seam. Falloff Curve reshapes the ramp."));
-			ImGui::SliderFloat(T(TKEY("foveated_feather_width"), "Feather Width"), &settings.subrectFeatherWidth, 2.0f, 128.0f, "%.0f px");
-			break;
-		case SubrectBlendMode::kDither:
-			ImGui::TextWrapped("%s", T(TKEY("foveated_blend_dither_desc"), "Noise-dithered fade — more natural-looking than feather at large subrects."));
-			ImGui::SliderFloat(T(TKEY("foveated_band_width"), "Band Width"), &settings.subrectFeatherWidth, 2.0f, 128.0f, "%.0f px");
-			ImGui::SliderFloat(T(TKEY("foveated_noise_amount"), "Noise Amount"), &settings.subrectDitherStrength, 0.0f, 2.0f, "%.2f");
-			break;
-		}
+		DrawEdgeBlendControls("foveated", settings.subrectBlendMode, settings.subrectFeatherWidth, settings.subrectDitherStrength);
 
 		if (GetSubrectBlendMode() != SubrectBlendMode::kHardCopy) {
 			ImGui::SliderFloat(T(TKEY("foveated_falloff_curve"), "Falloff Curve"), &settings.subrectFalloffCurve, 0.5f, 2.0f, "%.2f");

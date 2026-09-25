@@ -33,6 +33,10 @@ namespace NeuralRendering
 		queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
 		result = device12_->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&queue12_));
 		if (FAILED(result)) return RecordFailure(result);
+		result = device12_->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&queue12Eye_));
+		if (FAILED(result)) return RecordFailure(result);
+		queue12_->SetName(L"NeuralRendering::Queue0");
+		queue12Eye_->SetName(L"NeuralRendering::Queue1");
 		result = queue12_->GetTimestampFrequency(&timestampFrequency_);
 		if (FAILED(result) || !timestampFrequency_) return RecordFailure(FAILED(result) ? result : E_FAIL);
 		D3D12_QUERY_HEAP_DESC queryDesc{};
@@ -85,12 +89,20 @@ namespace NeuralRendering
 		result = device11_->OpenSharedFence(sharedFence, IID_PPV_ARGS(&nrDoneFence11_));
 		CloseHandle(sharedFence);
 		if (FAILED(result)) return RecordFailure(result);
+		result = device12_->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&nrDoneFence12Eye_));
+		if (FAILED(result)) return RecordFailure(result);
+		sharedFence = nullptr;
+		result = device12_->CreateSharedHandle(nrDoneFence12Eye_.Get(), nullptr, GENERIC_ALL, nullptr, &sharedFence);
+		if (FAILED(result)) return RecordFailure(result);
+		result = device11_->OpenSharedFence(sharedFence, IID_PPV_ARGS(&nrDoneFence11Eye_));
+		CloseHandle(sharedFence);
+		if (FAILED(result)) return RecordFailure(result);
 
 		fenceEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
 		if (!fenceEvent_) return RecordFailure(HRESULT_FROM_WIN32(GetLastError()));
 		initialized_ = true;
 		lastError_ = S_OK;
-		logger::info("[DLSSNR] D3D12 interop initialized commandContexts={} cpuFenceWait=backpressure-only",
+		logger::info("[DLSSNR] D3D12 interop initialized commandContexts={} queues=2 cpuFenceWait=backpressure-only",
 			kCommandContextCount);
 		return true;
 	}
@@ -117,17 +129,20 @@ namespace NeuralRendering
 		totalTimingActive_ = false;
 		initialized_ = false;
 		engineReadyFenceValue_ = 0;
-		nrDoneFenceValue_ = 0;
-		finalizedNrDoneFenceValue_ = 0;
+		nrDoneFenceValue_[0] = nrDoneFenceValue_[1] = 0;
+		finalizedNrDoneFenceValue_[0] = finalizedNrDoneFenceValue_[1] = 0;
 		engineReadyFence11_.Reset();
 		nrDoneFence11_.Reset();
+		nrDoneFence11Eye_.Reset();
 		engineReadyFence12_.Reset();
 		nrDoneFence12_.Reset();
+		nrDoneFence12Eye_.Reset();
 		commandContexts_ = {};
 		timestampReadback_.Reset();
 		timestampHeap_.Reset();
 		totalTimestampReadback_.Reset();
 		totalTimestampHeap_.Reset();
+		queue12Eye_.Reset();
 		queue12_.Reset();
 		device12_.Reset();
 		context11_.Reset();
@@ -187,8 +202,10 @@ namespace NeuralRendering
 	{
 		if (!initialized_)
 			return RecordFailure(E_UNEXPECTED);
+		const std::uint32_t queueIndex = submission.queueIndex == 0 ? 0u : 1u;
+		submission.queueIndex = queueIndex;
 		submission.engineReady = engineReadyFenceValue_ + 1;
-		submission.nrDone = nrDoneFenceValue_ + 1;
+		submission.nrDone = nrDoneFenceValue_[queueIndex] + 1;
 		lastOperation_ = "D3D11SignalEngineReady";
 		const HRESULT result = context11_->Signal(engineReadyFence11_.Get(), submission.engineReady);
 		if (FAILED(result)) {
@@ -196,7 +213,7 @@ namespace NeuralRendering
 			return RecordFailure(result);
 		}
 		engineReadyFenceValue_ = submission.engineReady;
-		nrDoneFenceValue_ = submission.nrDone;
+		nrDoneFenceValue_[queueIndex] = submission.nrDone;
 		lastError_ = S_OK;
 		return true;
 	}
@@ -206,12 +223,15 @@ namespace NeuralRendering
 		if (!initialized_ || recording_ || !commandList || !submission.engineReady || !submission.nrDone)
 			return RecordFailure(E_UNEXPECTED);
 
-		const std::uint64_t completedValue = nrDoneFence12_->GetCompletedValue();
+		const std::uint32_t queueIndex = submission.queueIndex == 0 ? 0u : 1u;
+		auto* const queue = queueIndex == 0 ? queue12_.Get() : queue12Eye_.Get();
 		std::size_t contextIndex = kCommandContextCount;
 		for (std::size_t offset = 0; offset < kCommandContextCount; ++offset) {
 			const std::size_t candidate = (commandContextCursor_ + offset) % kCommandContextCount;
-			const auto pendingValue = commandContexts_[candidate].fenceValue;
-			if (pendingValue == 0 || completedValue >= pendingValue) {
+			const auto& candidateContext = commandContexts_[candidate];
+			const auto pendingValue = candidateContext.fenceValue;
+			auto* const candidateFence = candidateContext.fenceQueue == 0 ? nrDoneFence12_.Get() : nrDoneFence12Eye_.Get();
+			if (pendingValue == 0 || (candidateFence && candidateFence->GetCompletedValue() >= pendingValue)) {
 				contextIndex = candidate;
 				break;
 			}
@@ -223,7 +243,7 @@ namespace NeuralRendering
 				backpressureLogged_ = true;
 			}
 			const ULONGLONG waitStart = GetTickCount64();
-			if (!WaitForFence(commandContexts_[contextIndex].fenceValue))
+			if (!WaitForFence(commandContexts_[contextIndex].fenceValue, commandContexts_[contextIndex].fenceQueue))
 				return false;
 			lastCpuBackpressureMs_ = static_cast<double>(GetTickCount64() - waitStart);
 			++cpuBackpressureCount_;
@@ -233,7 +253,7 @@ namespace NeuralRendering
 		ResolveCompletedTiming(contextIndex);
 		commandContext.fenceValue = 0;
 		lastOperation_ = "D3D12WaitEngineReady";
-		HRESULT result = queue12_->Wait(engineReadyFence12_.Get(), submission.engineReady);
+		HRESULT result = queue->Wait(engineReadyFence12_.Get(), submission.engineReady);
 		if (FAILED(result)) return RecordFailure(result);
 		result = commandContext.allocator->Reset();
 		if (FAILED(result)) return RecordFailure(result);
@@ -265,6 +285,9 @@ namespace NeuralRendering
 
 	bool D3D12Interop::BeginTotalTiming(ID3D12GraphicsCommandList* commandList)
 	{
+		// Queue 1 runs beside queue 0. One timestamp heap cannot be executed by both.
+		if (recordingSubmission_.queueIndex != 0)
+			return false;
 		if (!recording_ || recordingContext_ >= kCommandContextCount || !commandList || !totalTimestampHeap_ ||
 			totalTimingActive_ || recordingTotalTimingPairCount_ >= kTimingPairsPerContext)
 			return false;
@@ -290,6 +313,8 @@ namespace NeuralRendering
 
 	bool D3D12Interop::BeginEvaluationTiming(ID3D12GraphicsCommandList* commandList)
 	{
+		if (recordingSubmission_.queueIndex != 0)
+			return false;
 		if (!recording_ || recordingContext_ >= kCommandContextCount || !commandList || !timestampHeap_ ||
 			evaluationTimingActive_ || recordingTimingPairCount_ >= kTimingPairsPerContext)
 			return false;
@@ -316,9 +341,12 @@ namespace NeuralRendering
 
 	bool D3D12Interop::EndPrepared(const PreparedSubmission& submission)
 	{
+		const std::uint32_t queueIndex = submission.queueIndex == 0 ? 0u : 1u;
+		auto* const queue = queueIndex == 0 ? queue12_.Get() : queue12Eye_.Get();
+		auto* const fence = queueIndex == 0 ? nrDoneFence12_.Get() : nrDoneFence12Eye_.Get();
 		if (!initialized_ || !recording_ || recordingContext_ >= kCommandContextCount ||
 			submission.nrDone != recordingSubmission_.nrDone ||
-			submission.nrDone != finalizedNrDoneFenceValue_ + 1)
+			submission.nrDone != finalizedNrDoneFenceValue_[queueIndex] + 1)
 			return RecordFailure(E_UNEXPECTED);
 		recording_ = false;
 		evaluationTimingActive_ = false;
@@ -329,17 +357,18 @@ namespace NeuralRendering
 		lastOperation_ = "D3D12ClosePrepared";
 		HRESULT result = commandContext.commandList->Close();
 		if (FAILED(result)) {
-			const HRESULT signalResult = queue12_->Signal(nrDoneFence12_.Get(), submission.nrDone);
+			const HRESULT signalResult = queue->Signal(fence, submission.nrDone);
 			if (SUCCEEDED(signalResult))
-				finalizedNrDoneFenceValue_ = submission.nrDone;
+				finalizedNrDoneFenceValue_[queueIndex] = submission.nrDone;
 			return RecordFailure(result);
 		}
 		ID3D12CommandList* lists[] = { commandContext.commandList.Get() };
-		queue12_->ExecuteCommandLists(1, lists);
+		queue->ExecuteCommandLists(1, lists);
 		lastOperation_ = "D3D12SignalNrDone";
-		result = queue12_->Signal(nrDoneFence12_.Get(), submission.nrDone);
+		result = queue->Signal(fence, submission.nrDone);
 		if (FAILED(result)) return RecordFailure(result);
-		finalizedNrDoneFenceValue_ = submission.nrDone;
+		finalizedNrDoneFenceValue_[queueIndex] = submission.nrDone;
+		commandContext.fenceQueue = queueIndex;
 		commandContext.fenceValue = submission.nrDone;
 		commandContext.timingPairCount = recordingTimingPairCount_;
 		commandContext.timingPending = recordingTimingPairCount_ != 0;
@@ -352,7 +381,10 @@ namespace NeuralRendering
 
 	bool D3D12Interop::SignalPreparedFailure(const PreparedSubmission& submission)
 	{
-		if (!initialized_ || !submission.nrDone || submission.nrDone != finalizedNrDoneFenceValue_ + 1)
+		const std::uint32_t queueIndex = submission.queueIndex == 0 ? 0u : 1u;
+		auto* const queue = queueIndex == 0 ? queue12_.Get() : queue12Eye_.Get();
+		auto* const fence = queueIndex == 0 ? nrDoneFence12_.Get() : nrDoneFence12Eye_.Get();
+		if (!initialized_ || !submission.nrDone || submission.nrDone != finalizedNrDoneFenceValue_[queueIndex] + 1)
 			return RecordFailure(E_UNEXPECTED);
 		if (recording_) {
 			recording_ = false;
@@ -362,10 +394,10 @@ namespace NeuralRendering
 			totalTimingActive_ = false;
 		}
 		lastOperation_ = "D3D12SignalFailedNrDone";
-		const HRESULT result = queue12_->Signal(nrDoneFence12_.Get(), submission.nrDone);
+		const HRESULT result = queue->Signal(fence, submission.nrDone);
 		if (FAILED(result))
 			return RecordFailure(result);
-		finalizedNrDoneFenceValue_ = submission.nrDone;
+		finalizedNrDoneFenceValue_[queueIndex] = submission.nrDone;
 		lastError_ = S_OK;
 		return true;
 	}
@@ -375,13 +407,15 @@ namespace NeuralRendering
 		if (!initialized_ || !submission.nrDone)
 			return RecordFailure(E_UNEXPECTED);
 		lastOperation_ = "D3D11WaitNrDone";
-		const HRESULT result = context11_->Wait(nrDoneFence11_.Get(), submission.nrDone);
+		auto* const fence11 = submission.queueIndex == 0 ? nrDoneFence11_.Get() : nrDoneFence11Eye_.Get();
+		const HRESULT result = context11_->Wait(fence11, submission.nrDone);
 		return SUCCEEDED(result) ? (lastError_ = S_OK, true) : RecordFailure(result);
 	}
 
 	bool D3D12Interop::IsComplete(const PreparedSubmission& submission) const
 	{
-		return initialized_ && submission.nrDone && nrDoneFence12_->GetCompletedValue() >= submission.nrDone;
+		auto* const fence12 = submission.queueIndex == 0 ? nrDoneFence12_.Get() : nrDoneFence12Eye_.Get();
+		return initialized_ && submission.nrDone && fence12 && fence12->GetCompletedValue() >= submission.nrDone;
 	}
 
 	bool D3D12Interop::EndD3D12()
@@ -442,11 +476,12 @@ namespace NeuralRendering
 		return true;
 	}
 
-	bool D3D12Interop::WaitForFence(std::uint64_t value)
+	bool D3D12Interop::WaitForFence(std::uint64_t value, std::uint32_t queueIndex)
 	{
-		if (!value || nrDoneFence12_->GetCompletedValue() >= value)
+		auto* const fence = queueIndex == 0 ? nrDoneFence12_.Get() : nrDoneFence12Eye_.Get();
+		if (!value || !fence || fence->GetCompletedValue() >= value)
 			return true;
-		const HRESULT result = nrDoneFence12_->SetEventOnCompletion(value, fenceEvent_);
+		const HRESULT result = fence->SetEventOnCompletion(value, fenceEvent_);
 		if (FAILED(result)) return RecordFailure(result);
 		const DWORD waitResult = WaitForSingleObject(fenceEvent_, 250);
 		if (waitResult != WAIT_OBJECT_0)
@@ -460,9 +495,10 @@ namespace NeuralRendering
 	{
 		if (!initialized_)
 			return true;
-		std::uint64_t lastSubmittedValue = 0;
-		for (const auto& commandContext : commandContexts_)
-			lastSubmittedValue = std::max(lastSubmittedValue, commandContext.fenceValue);
-		return WaitForFence(lastSubmittedValue);
+		for (const auto& commandContext : commandContexts_) {
+			if (!WaitForFence(commandContext.fenceValue, commandContext.fenceQueue))
+				return false;
+		}
+		return true;
 	}
 }

@@ -768,12 +768,11 @@ void Upscaling::DrawFrameGenerationSettings()
 					"device. Engine Submit is swallowed (no HUD this version). Do not enable\n"
 					"without a restart — the runtime session binds on the first Submit."));
 			if (VrAriseTail::IsActive()) {
-				ImGui::Checkbox(T(TKEY("vr_g"), "VR DLSS-G"), &settings.vrG);
+				ImGui::Checkbox(T(TKEY("vr_g"), "VR FSR-FG"), &settings.vrG);
 				if (auto _tt = Util::HoverTooltipWrapper()) {
 					ImGui::Text("%s", T(TKEY("vr_g_tooltip"),
-						"Hot master. On: eOn and the G chain (gate, wrapper, P/A, input/output pose).\n"
-						"Off: eOff + slFreeResources, then the bridge. Absolute pose and the\n"
-						"metronome stay on either path."));
+						"Hot master. On: FSR-FG operator + metronome interp/real.\n"
+						"Off: bridge. Absolute pose and metronome stay on either path."));
 				}
 			}
 		}
@@ -874,6 +873,8 @@ void Upscaling::DrawFrameGenerationSettings()
 
 void Upscaling::DrawReflexSettings()
 {
+	if (Streamline::VrShortsFramegenAndReflex())
+		return;
 	const bool reflexSupported = streamline.reflexSupportedOnCurrentAdapter || streamlineDX12.reflexSupportedOnCurrentAdapter;
 	if (!(reflexSupported && ImGui::TreeNodeEx(T(TKEY("nvidia_reflex"), "NVIDIA Reflex"), ImGuiTreeNodeFlags_DefaultOpen)))
 		return;
@@ -1554,6 +1555,45 @@ float Upscaling::GetQualityModeRatio(uint qualityMode)
 	return std::isfinite(ratio) && ratio > 0.0f ? ratio : 3.0f;
 }
 
+float Upscaling::ReconstructionUpscaleRatio() const
+{
+	// Explicit render scale is the allocation. The quality preset is only the nearest label.
+	if (perfMode.IsHookActive() && perfMode.IsExplicitScaleLatched() &&
+		perfMode.GetRenderEyeWidth() && perfMode.GetDisplayEyeWidth()) {
+		return static_cast<float>(perfMode.GetDisplayEyeWidth()) /
+			static_cast<float>(perfMode.GetRenderEyeWidth());
+	}
+	// Enlarge-RT PerfMode is sized from the upscaling preset, not the booster contract.
+	if (perfMode.IsHookActive())
+		return GetQualityModeRatio(perfMode.GetLatchedQualityMode());
+
+	const bool sizeLie = perfMode.IsLogicalEyeActive() || dx12SwapChain.useArise;
+	const bool drs = resolutionScale.x > 0.0f && resolutionScale.x < 0.99f;
+	// Native viewport (VR post-inject without the size lie) is a 1.0 contract.
+	if (!sizeLie && !drs)
+		return 1.0f;
+
+	// SRSS guidance changes R the way KIT RC does, and KIT's bias ignores it.
+	if (sizeLie || IsDlssPostInjectActive()) {
+		const bool logical = foveatedRender.BootUsesLogicalPerfMode();
+		const auto unified = foveatedRender.ActiveUnifiedPipelineSettings();
+		const uint backend = logical ?
+			foveatedRender.bootSnapshot.Boot(&FoveatedRender::Settings::flatPipelineAct1Backend) :
+			foveatedRender.settings.flatPipelineAct1Backend;
+		const uint act1Quality = logical ?
+			foveatedRender.bootSnapshot.Boot(&FoveatedRender::Settings::flatPipelineAct1Quality) :
+			foveatedRender.settings.flatPipelineAct1Quality;
+		const bool dlss = logical ||
+			std::min(backend, 2u) == static_cast<uint>(FoveatedRender::FlatAct1Backend::kDLSS);
+		if (!logical && foveatedRender.settings.flatPipelineAct1Dsr &&
+			backend != static_cast<uint>(FoveatedRender::FlatAct1Backend::kBypass))
+			return GetQualityModeRatio(4u) / 2.0f;
+		const uint quality = (unified.act1Srss && dlss) ? unified.act1SrssQuality : act1Quality;
+		return GetQualityModeRatio(quality);
+	}
+	return GetQualityModeRatio(settings.qualityMode);
+}
+
 Upscaling::UpscaleMethod Upscaling::GetUpscaleMethod() const
 {
 	// OpenComposite owning upscaling wins over everything (incl. PerfMode); VR-only.
@@ -1592,10 +1632,21 @@ bool Upscaling::PerfModePrerequisitesMet() const
 
 bool Upscaling::ShouldEngagePerfMode() const
 {
-	// No-FG DB writeback keeps engine E at native. TD UI via PerfMode is a later cut.
+	// The owned-submit path uses logical eye instead of the enlarge-RT PerfMode.
 	if (IsVrDlssPostInjectActive() || ShouldSkipUpscalingDlss())
 		return false;
 	return settings.renderAtUpscaleRes && PerfModePrerequisitesMet();
+}
+
+bool Upscaling::ShouldEngageVrLogicalEye() const
+{
+	if (!globals::game::isVR || !IsVrDlssPostInjectActive())
+		return false;
+	auto& foveated = foveatedRender;
+	foveated.bootSnapshot.LatchIfNeeded(foveated.settings);
+	if (foveated.bootSnapshot.Boot(&FoveatedRender::Settings::ariseModel3))
+		return false;
+	return foveated.bootSnapshot.Boot(&FoveatedRender::Settings::singleThreadPerfMode);
 }
 
 void Upscaling::CreateUpscalingTextureResources(UpscaleMethod a_upscalemethod)
@@ -2148,11 +2199,9 @@ void Upscaling::ClearHMDMask(ID3D11UnorderedAccessView* colorUAV, ID3D11ShaderRe
 	}
 }
 
-int32_t GetJitterPhaseCount(int32_t renderWidth, int32_t displayWidth)
+static int32_t DlssJitterPhaseCount(int32_t configured)
 {
-	const float basePhaseCount = 8.0f;
-	const int32_t jitterPhaseCount = int32_t(basePhaseCount * pow((float(displayWidth) / renderWidth), 2.0f));
-	return jitterPhaseCount;
+	return configured > 0 ? configured : 72;
 }
 
 // Calculate halton number for index and base.
@@ -2212,29 +2261,32 @@ void Upscaling::ConfigureUpscaling(RE::BSGraphics::State* a_viewport)
 		if (model3LogicalRenderPath) {
 			const int renderWidth = static_cast<int>(dx12SwapChain.LogicalWidth());
 			const int renderHeight = static_cast<int>(dx12SwapChain.LogicalHeight());
-			const int displayWidth = static_cast<int>(dx12SwapChain.PhysicalWidth());
 			a_viewport->screenWidth = static_cast<std::uint32_t>(renderWidth);
 			a_viewport->screenHeight = static_cast<std::uint32_t>(renderHeight);
 			a_viewport->frameBufferViewport[0] = static_cast<std::uint32_t>(renderWidth);
 			a_viewport->frameBufferViewport[1] = static_cast<std::uint32_t>(renderHeight);
-			const auto plan = foveatedRender.BuildFlatPipelinePlan(
-				displayWidth, dx12SwapChain.PhysicalHeight(), renderWidth, renderHeight);
 			resolutionScale = { 1.0f, 1.0f };
 			lastDlssRenderWidth = renderWidth;
 			lastDlssRenderHeight = renderHeight;
-			int phaseCount = GetJitterPhaseCount(renderWidth, displayWidth);
-			if (plan.act2Backend == FoveatedRender::FlatAct2Backend::kDLSS)
-				phaseCount = std::max(phaseCount, GetJitterPhaseCount(plan.nrWidth, plan.displayWidth));
+			const int phaseCount = DlssJitterPhaseCount(foveatedRender.settings.jitterPhaseCount);
+			lastJitterPhaseCount = phaseCount;
 			GetJitterOffset(&jitter.x, &jitter.y, state->frameCount, phaseCount);
 			if (state->isLoadingMenuOpen)
 				jitter = { 0.0f, 0.0f };
+			{
+				static bool loggedAriseJitter = false;
+				if (!loggedAriseJitter) {
+					loggedAriseJitter = true;
+					logger::info("[ARISE] jitter phase={} mipOffset={:.2f} logical={}x{} sample=({:.3f},{:.3f})",
+						phaseCount, foveatedRender.settings.mipBiasOffset, renderWidth, renderHeight, jitter.x, jitter.y);
+				}
+			}
 			a_viewport->projectionPosScaleX = -2.0f * jitter.x / renderWidth;
 			a_viewport->projectionPosScaleY = 2.0f * jitter.y / renderHeight;
 		} else {
 		// PerfMode: when the BSOpenVR size hook is live, every engine RT was
 		// already allocated at RenderRes — so the DRS-style scale is identity.
-		// Jitter is still computed at the real DisplayRes phase ratio so the
-		// upscaler has enough sub-pixel diversity for reconstruction.
+		// Phase length is the DLSS Enhancer sequence, not 8*(display/render)^2.
 		//
 		// The upscaleMethod here comes from GetUpscaleMethod(), which under
 		// PerfMode+hookActive is locked to the boot snapshot — so this gate
@@ -2253,9 +2305,9 @@ void Upscaling::ConfigureUpscaling(RE::BSGraphics::State* a_viewport)
 			resolutionScale = float2{ 1.0f, 1.0f };
 
 			auto renderWidth = static_cast<int>(perfMode.GetRenderEyeWidth());
-			auto displayWidth = static_cast<int>(perfMode.GetDisplayEyeWidth());
 
-			auto phaseCount = GetJitterPhaseCount(renderWidth, displayWidth);
+			const int phaseCount = DlssJitterPhaseCount(foveatedRender.settings.jitterPhaseCount);
+			lastJitterPhaseCount = phaseCount;
 			GetJitterOffset(&jitter.x, &jitter.y, state->frameCount, phaseCount);
 			// Loading screens reset the upscaler every frame; unintegrated jitter only wobbles the image.
 			if (globals::state->isLoadingMenuOpen)
@@ -2270,11 +2322,18 @@ void Upscaling::ConfigureUpscaling(RE::BSGraphics::State* a_viewport)
 		} else {
 			const bool flatPipeline = IsFlatDlssPostInjectActive();
 			const bool vrPostInject = IsVrDlssPostInjectActive();
+			const bool vrLogicalEye = perfMode.IsLogicalEyeActive() &&
+				perfMode.GetRenderEyeWidth() && perfMode.GetDisplayEyeWidth();
 			const bool skipUpscalingDlss = ShouldSkipUpscalingDlss();
 			uint32_t vrEyeW = 0, vrEyeH = 0, vrDisplayW = 0, vrDisplayH = 0;
 			if (vrPostInject)
 				NeuralRendering::GetVrOwnedEyeSizes(vrEyeW, vrEyeH, vrDisplayW, vrDisplayH);
-			const auto& vrCropUV = foveatedRender.subrectController.GetUV();
+			const Util::Subrect::UVRegion* dbLeft = nullptr;
+			const Util::Subrect::UVRegion* dbRight = nullptr;
+			const auto& fallbackCrop = foveatedRender.subrectController.GetUV();
+			const auto& vrCropUV = globals::features::dlssBooster.TryGetVrSubrect(dbLeft, dbRight) && dbLeft ?
+				*dbLeft :
+				fallbackCrop;
 			const uint32_t vrPlanEyeW = vrEyeW ? vrEyeW : static_cast<uint32_t>(std::max(1, screenWidth / 2));
 			const uint32_t vrPlanEyeH = vrEyeH ? vrEyeH : static_cast<uint32_t>(screenHeight);
 			const uint32_t vrPlanDisplayW = vrDisplayW ? vrDisplayW : vrPlanEyeW;
@@ -2288,27 +2347,41 @@ void Upscaling::ConfigureUpscaling(RE::BSGraphics::State* a_viewport)
 				foveatedRender.BuildFlatPipelinePlan(screenWidth, screenHeight);
 			const uint32_t qm = globals::features::upscaling.perfMode.IsHookActive() ?
 				bootSnapshot.Boot(&Settings::qualityMode) : settings.qualityMode;
-			// Booster override and VR no-FG writeback keep engine RTs at native E.
-			auto renderWidth = (vrPostInject || skipUpscalingDlss) ? screenWidth :
+			// Logical eye already allocated RTs at R. Keep DRS at 1 and express
+			// jitter in that eye, or the camera shift is half a low-res pixel.
+			const int logicalRenderWidth = static_cast<int>(perfMode.GetRenderEyeWidth());
+			const int logicalRenderHeight = static_cast<int>(perfMode.GetRenderEyeHeight());
+			const int logicalDisplayWidth = static_cast<int>(perfMode.GetDisplayEyeWidth());
+			const int logicalDisplayHeight = static_cast<int>(perfMode.GetDisplayEyeHeight());
+			auto renderWidth = vrLogicalEye ? logicalRenderWidth :
+				((vrPostInject || skipUpscalingDlss) ? screenWidth :
 				(flatPipeline ? static_cast<int>(plan.engineWidth) :
-					static_cast<int>(std::lround(screenWidth / GetQualityModeRatio(qm))));
-			auto renderHeight = (vrPostInject || skipUpscalingDlss) ? screenHeight :
+					static_cast<int>(std::lround(screenWidth / GetQualityModeRatio(qm)))));
+			auto renderHeight = vrLogicalEye ? logicalRenderHeight :
+				((vrPostInject || skipUpscalingDlss) ? screenHeight :
 				(flatPipeline ? static_cast<int>(plan.engineHeight) :
-					static_cast<int>(std::lround(screenHeight / GetQualityModeRatio(qm))));
+					static_cast<int>(std::lround(screenHeight / GetQualityModeRatio(qm)))));
 
-			resolutionScale.x = static_cast<float>(renderWidth) / static_cast<float>(screenWidth);
-			resolutionScale.y = static_cast<float>(renderHeight) / static_cast<float>(screenHeight);
+			resolutionScale.x = vrLogicalEye ? 1.0f : static_cast<float>(renderWidth) / static_cast<float>(screenWidth);
+			resolutionScale.y = vrLogicalEye ? 1.0f : static_cast<float>(renderHeight) / static_cast<float>(screenHeight);
 
-			int phaseCount = GetJitterPhaseCount(renderWidth, screenWidth);
-			if (flatPipeline || vrPostInject) {
-				if (plan.act1Backend != FoveatedRender::FlatAct1Backend::kBypass)
-					phaseCount = std::max(phaseCount, GetJitterPhaseCount(plan.engineWidth, plan.act1OutputWidth));
-				if (plan.act2Backend == FoveatedRender::FlatAct2Backend::kDLSS ||
-					plan.act2Backend == FoveatedRender::FlatAct2Backend::kFSR3)
-					phaseCount = std::max(phaseCount, GetJitterPhaseCount(plan.nrWidth, plan.act2OutputWidth));
-			}
+			const int phaseCount = DlssJitterPhaseCount(foveatedRender.settings.jitterPhaseCount);
+			lastJitterPhaseCount = phaseCount;
 
 			GetJitterOffset(&jitter.x, &jitter.y, state->frameCount, phaseCount);
+			if (vrLogicalEye || flatPipeline) {
+				static bool loggedJitter = false;
+				if (!loggedJitter) {
+					loggedJitter = true;
+					logger::info("[Upscaling] jitter phase={} mipOffset={:.2f} eye={}x{} td={}x{} sample=({:.3f},{:.3f})",
+						phaseCount, foveatedRender.settings.mipBiasOffset,
+						vrLogicalEye ? logicalRenderWidth : renderWidth,
+						vrLogicalEye ? logicalRenderHeight : renderHeight,
+						vrLogicalEye ? logicalDisplayWidth : screenWidth,
+						vrLogicalEye ? logicalDisplayHeight : screenHeight,
+						jitter.x, jitter.y);
+				}
+			}
 			// Loading screens reset the upscaler every frame; unintegrated jitter only wobbles the image.
 			if (globals::state->isLoadingMenuOpen || (skipUpscalingDlss && !vrPostInject && !flatPipeline))
 				jitter = float2{ 0.0f, 0.0f };
@@ -2825,6 +2898,8 @@ bool Upscaling::IsVrDlssPostInjectActive() const
 		return false;
 	if (GetUpscaleMethod() != UpscaleMethod::kDLSS)
 		return false;
+	// A failed stage must fill the hole at the same size. Relaxing this gate
+	// without that layout (color vs depth/mvec) replays the horizontal mismatch.
 	return foveatedRender.settings.neuralRenderingEnabled;
 }
 
@@ -2865,7 +2940,12 @@ json Upscaling::GetDiagnostics()
 	diagnostics["frameGenActive"] = IsFrameGenerationActive();
 	diagnostics["frameGenMultiplier"] = GetFrameGenerationMultiplier();
 	if (globals::game::isVR) {
-		const auto& cropUV = foveatedRender.subrectController.GetUV();
+		const Util::Subrect::UVRegion* dbLeft = nullptr;
+		const Util::Subrect::UVRegion* dbRight = nullptr;
+		const auto& fallbackCrop = foveatedRender.subrectController.GetUV();
+		const auto& cropUV = globals::features::dlssBooster.TryGetVrSubrect(dbLeft, dbRight) && dbLeft ?
+			*dbLeft :
+			fallbackCrop;
 		uint32_t renderW = 0, renderH = 0, displayW = 0, displayH = 0;
 		NeuralRendering::GetVrOwnedEyeSizes(renderW, renderH, displayW, displayH);
 		const uint32_t cropInW = std::max(1u, static_cast<uint32_t>(renderW * cropUV.w));

@@ -388,15 +388,18 @@ Destination[p]=float4((lobe*(b+d+f+h)+e)/(4*lobe+1),1);})";
 				depthDesc.Width != plan.sceneInputWidth || depthDesc.Height != plan.sceneInputHeight ||
 				motionDesc.Width != plan.sceneInputWidth || motionDesc.Height != plan.sceneInputHeight)
 				return false;
-			if (slot.displayWidth == plan.displayWidth && slot.displayHeight == plan.displayHeight &&
+			const bool slotMatches =
+				slot.displayWidth == plan.displayWidth && slot.displayHeight == plan.displayHeight &&
 				slot.sceneInputWidth == plan.sceneInputWidth && slot.sceneInputHeight == plan.sceneInputHeight &&
 				slot.engineWidth == plan.engineWidth && slot.engineHeight == plan.engineHeight &&
 				slot.act1OutputWidth == plan.act1OutputWidth && slot.act1OutputHeight == plan.act1OutputHeight &&
 				slot.nrWidth == plan.nrWidth && slot.nrHeight == plan.nrHeight &&
 				slot.sceneFormat == sceneDesc.Format &&
 				slot.depthFormat == depthDesc.Format &&
-				slot.motionFormat == motionDesc.Format)
+				slot.motionFormat == motionDesc.Format;
+			if (slotMatches)
 				return true;
+			dlss.Reset();
 			DXGI_FORMAT motionOutputFormat = DXGI_FORMAT_UNKNOWN;
 			for (const DXGI_FORMAT candidate : { DXGI_FORMAT_R16G16_FLOAT, DXGI_FORMAT_R32G32_FLOAT }) {
 				if (SupportsTypedUavStore(candidate)) {
@@ -472,7 +475,7 @@ Destination[p]=float4((lobe*(b+d+f+h)+e)/(4*lobe+1),1);})";
 					SrvFormat(inputs.scene->GetDesc().Format), kColorFormat);
 			} else if (plan.act1 == Act1Backend::kDLSS) {
 				act1DlssSucceeded = dlss.Record(list, {
-					.frameId = plan.frameId, .viewport = AriseDlssProvider::kAct1Viewport,
+					.frameId = plan.frameId, .viewport = plan.act1Viewport,
 					.inputWidth = plan.sceneInputWidth, .inputHeight = plan.sceneInputHeight,
 					.outputWidth = plan.act1OutputWidth, .outputHeight = plan.act1OutputHeight,
 					.quality = plan.act1Quality, .preset = plan.act1Preset, .reset = plan.reset,
@@ -526,7 +529,8 @@ Destination[p]=float4((lobe*(b+d+f+h)+e)/(4*lobe+1),1);})";
 				Transition(list, slot.neuralN.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 				nrSucceeded = Renderer::Instance().ExecuteModel3(list, slot.colorN.Get(), slot.depthN.Get(),
 					slot.motionN.Get(), slot.neuralN.Get(), plan.nrWidth, plan.nrHeight,
-					plan.motionVectorScaleX, plan.motionVectorScaleY, plan.tuning, plan.reset || forceReset);
+					plan.motionVectorScaleX, plan.motionVectorScaleY, plan.tuning, plan.reset || forceReset,
+					plan.nrSlot);
 				Transition(list, slot.colorN.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
 				Transition(list, slot.depthN.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
 				Transition(list, slot.motionN.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
@@ -557,7 +561,7 @@ Destination[p]=float4((lobe*(b+d+f+h)+e)/(4*lobe+1),1);})";
 							kColorFormat, kColorFormat))
 						finalColor = slot.act2Dlss.Get();
 					else if (!plan.renderDocReplacement && dlss.Record(list, {
-						.frameId = plan.frameId, .viewport = AriseDlssProvider::kAct2Viewport,
+						.frameId = plan.frameId, .viewport = plan.act2Viewport,
 						.inputWidth = plan.nrWidth, .inputHeight = plan.nrHeight,
 						.outputWidth = plan.displayWidth, .outputHeight = plan.displayHeight,
 						.quality = plan.act2Quality, .preset = plan.act2Preset, .reset = plan.reset,
@@ -1029,6 +1033,17 @@ Destination[p]=float4((lobe*(b+d+f+h)+e)/(4*lobe+1),1);})";
 				slot.act3DepthD && slot.act3MotionD && slot.act3Gain && slot.act3EditLow && slot.act3Fusion &&
 				slot.act3GuideLow)
 				return true;
+			slot.act3Color.Reset();
+			slot.act3Output.Reset();
+			slot.act3Depth.Reset();
+			slot.act3Motion.Reset();
+			slot.act3DepthD.Reset();
+			slot.act3MotionD.Reset();
+			slot.act3Gain.Reset();
+			slot.act3EditLow.Reset();
+			slot.act3Fusion.Reset();
+			slot.act3GuideLow.Reset();
+			slot.act3Width = slot.act3Height = 0;
 			if (!CreateTexture(slot.act3Color, plan.act3.cropWidth, plan.act3.cropHeight, kColorFormat, L"ARISE Graph ACT3 Color") ||
 				!CreateTexture(slot.act3Output, plan.act3.cropWidth, plan.act3.cropHeight, kColorFormat, L"ARISE Graph ACT3 Output") ||
 				!CreateTexture(slot.act3Depth, plan.act3.cropWidth, plan.act3.cropHeight, DXGI_FORMAT_R32_FLOAT, L"ARISE Graph ACT3 Depth") ||
@@ -1128,9 +1143,11 @@ Destination[p]=float4((lobe*(b+d+f+h)+e)/(4*lobe+1),1);})";
 				std::uint32_t pad0, pad1, pad2;
 			} constants{
 				plan.act3.cropX, plan.act3.cropY, plan.act3.cropWidth, plan.act3.cropHeight,
-				0u,
+				plan.act3.blendMode == 2u ? 1u : 0u,
 				plan.act3.featherWidth, static_cast<std::uint32_t>(plan.frameId), 0u,
-				0.0f, 0u, 0u, 0u };
+				plan.act3.ditherStrength, 0u, 0u, 0u };
+			if (plan.act3.blendMode == 0u)
+				return false;
 			const auto views = BindViews(slot, source, kColorFormat, destination, kColorFormat);
 			if (!views.ptr)
 				return false;

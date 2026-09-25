@@ -70,6 +70,7 @@ namespace NeuralRendering
 			bool sharpen = false;
 			float sharpness = 1.0f;
 			bool resetEveryFrame = false;
+			std::uint32_t blendMode = 1;
 			float featherWidth = 64.0f;
 			float ditherStrength = 1.0f;
 			bool guidanceEnabled = false;
@@ -106,6 +107,9 @@ namespace NeuralRendering
 			std::uint32_t act1Preset = 0;
 			std::uint32_t act2Quality = 1;
 			std::uint32_t act2Preset = 0;
+			std::uint32_t act1Viewport = AriseDlssProvider::kAct1Viewport;
+			std::uint32_t act2Viewport = AriseDlssProvider::kAct2Viewport;
+			std::uint32_t nrSlot = 0;
 			AriseDlssProvider::CameraConstants act1Camera{};
 			AriseDlssProvider::CameraConstants act2Camera{};
 			FusionParameters fusion{};

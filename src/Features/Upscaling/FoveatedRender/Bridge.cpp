@@ -1,6 +1,7 @@
 #include "Bridge.h"
 
 #include "../../../Globals.h"
+#include "../../DLSSBooster.h"
 #include "../../Upscaling.h"
 #include "../FoveatedRender.h"
 
@@ -28,10 +29,12 @@ void FoveatedRenderImpl::Bridge::ComputeMvecScale(uint32_t eyeIndex, float& outX
 		return;
 
 	auto& enhancer = globals::features::upscaling.foveatedRender;
-	// Stereo Subrect: GetUV() == left-eye, GetRightEyeUV() == right-eye. Asymmetric
-	// presets (e.g. Nasal Convergence) size the two eyes differently, so the scale must
-	// be computed per-eye rather than always reading the left eye's UV.
-	const auto& uv = (eyeIndex == 1) ? enhancer.subrectController.GetRightEyeUV() : enhancer.subrectController.GetUV();
+	// DB's VR box wins over Upscaling while the override is on. Eyes can differ (nasal).
+	const Util::Subrect::UVRegion* dbLeft = nullptr;
+	const Util::Subrect::UVRegion* dbRight = nullptr;
+	const bool dbCrop = globals::features::dlssBooster.TryGetVrSubrect(dbLeft, dbRight);
+	const auto& uv = dbCrop ? (eyeIndex == 1 ? *dbRight : *dbLeft) :
+		((eyeIndex == 1) ? enhancer.subrectController.GetRightEyeUV() : enhancer.subrectController.GetUV());
 	const bool isFullEye = uv.IsFullEye();
 
 	if (isFullEye)

@@ -7,8 +7,10 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <utility>
 
 #include <d3d11.h>
@@ -112,7 +114,8 @@ namespace NeuralRendering
 			std::uint32_t guideWidth, std::uint32_t guideHeight,
 			std::uint32_t colorWidth, std::uint32_t colorHeight,
 			std::uint32_t outputWidth, std::uint32_t outputHeight,
-			float motionVectorScaleX, float motionVectorScaleY, const Tuning& tuning, bool forceReset)
+			float motionVectorScaleX, float motionVectorScaleY, const Tuning& tuning, bool forceReset,
+			bool deferWait)
 		{
 			if (failureLatched || model3Device || !device || !context || eyeIndex >= eyes.size() || !color || !output || !depth || !depthSRV || !motionVectors)
 				return false;
@@ -122,7 +125,7 @@ namespace NeuralRendering
 				return false;
 			if (runtime.Status() != RuntimeStatus::Initialized && !InitializeRuntime())
 				return false;
-			if (eyeIndex == 0 && ARISE::Pipeline::Instance().IsWorkerNrEnabled()) {
+			if (!deferWait && eyeIndex == 0 && ARISE::Pipeline::Instance().IsWorkerNrEnabled()) {
 				context->CopyResource(output, color);
 				if (asyncFallbackPending.exchange(false, std::memory_order_acq_rel)) {
 					if (!PrepareSynchronousFallback()) {
@@ -154,15 +157,33 @@ namespace NeuralRendering
 				motionVectorScaleX, motionVectorScaleY, tuning, resetPending[eyeIndex] || forceReset
 			};
 			D3D12Interop::PreparedSubmission submission;
+			submission.queueIndex = eyeIndex == 1 ? 1u : 0u;
 			if (!PrepareInput(submission))
 				return LatchFailure("PrepareInput", interop.LastError());
 			if (!ExecutePrepared(eye, eyeIndex, submission, arguments))
 				return LatchFailure("Feature 18", static_cast<HRESULT>(runtime.NgxResult()));
+			resetPending[eyeIndex] = false;
+			if (deferWait) {
+				deferred_[eyeIndex] = submission;
+				deferredArmed_[eyeIndex] = true;
+				return true;
+			}
 			if (!interop.QueueWaitOutput(submission))
 				return LatchFailure("QueueWaitOutput", interop.LastError());
 
 			context->CopyResource(output, eye.output.resource11.Get());
-			resetPending[eyeIndex] = false;
+			return true;
+		}
+
+		bool FinishApply(ID3D11DeviceContext* context, std::uint32_t eyeIndex, ID3D11Resource* output)
+		{
+			if (!context || eyeIndex >= eyes.size() || !output || !deferredArmed_[eyeIndex])
+				return false;
+			const auto submission = deferred_[eyeIndex];
+			deferredArmed_[eyeIndex] = false;
+			if (!interop.QueueWaitOutput(submission))
+				return LatchFailure("QueueWaitOutput", interop.LastError());
+			context->CopyResource(output, eyes[eyeIndex].output.resource11.Get());
 			return true;
 		}
 
@@ -320,11 +341,23 @@ namespace NeuralRendering
 			pipeline.SetWorkerNrEnabled(false);
 			pipeline.WaitForWorkerTasks();
 			if (model3Device) {
-				const bool drained = model3DrainOwner && model3DrainOwner();
+				bool drained = false;
+				if (model3DrainOwner) {
+					const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+					do {
+						drained = model3DrainOwner();
+						if (drained)
+							break;
+						std::this_thread::sleep_for(std::chrono::milliseconds(1));
+					} while (std::chrono::steady_clock::now() < deadline);
+				}
+				if (!drained)
+					logger::warn("[DLSSNR] Model 3 GPU still busy; skipping feature release this toggle");
 				if (drained) {
 					std::scoped_lock lock(submissionMutex);
 					runtime.ResetFeatures();
 					resetPending.fill(true);
+					deferredArmed_.fill(false);
 					failureLatched = false;
 					copyDepthGuideCS.Reset();
 				}
@@ -340,6 +373,7 @@ namespace NeuralRendering
 				eyes = {};
 				ResetAsyncSlots();
 				resetPending.fill(true);
+				deferredArmed_.fill(false);
 				failureLatched = false;
 				model3Device = nullptr;
 				copyDepthGuideCS.Reset();
@@ -358,6 +392,7 @@ namespace NeuralRendering
 				interop.WaitForIdle();
 			runtime.ResetFeatures();
 			resetPending.fill(true);
+			deferredArmed_.fill(false);
 		}
 
 		[[nodiscard]] bool IsFailureLatched() const { return failureLatched; }
@@ -672,6 +707,8 @@ namespace NeuralRendering
 		std::array<EyeResources, Runtime::kFeatureSlotCount> eyes;
 		std::array<AsyncSlot, 3> asyncSlots;
 		std::array<bool, Runtime::kFeatureSlotCount> resetPending{ true, true, true, true };
+		std::array<bool, Runtime::kFeatureSlotCount> deferredArmed_{};
+		std::array<D3D12Interop::PreparedSubmission, Runtime::kFeatureSlotCount> deferred_{};
 		std::uint32_t asyncProducerCursor = 0;
 		std::atomic_bool asyncFallbackPending = false;
 		bool failureLatched = false;
@@ -687,11 +724,16 @@ namespace NeuralRendering
 		ID3D11Resource* color, ID3D11Resource* depth, ID3D11ShaderResourceView* depthSRV,
 		ID3D11Resource* motionVectors,
 		std::uint32_t guideWidth, std::uint32_t guideHeight, std::uint32_t colorWidth, std::uint32_t colorHeight,
-		float motionVectorScaleX, float motionVectorScaleY, const Tuning& tuning, bool forceReset)
+		float motionVectorScaleX, float motionVectorScaleY, const Tuning& tuning, bool forceReset, bool deferWait)
 	{
 		return state_->Apply(device, context, eyeIndex, color, color, depth, depthSRV, motionVectors,
 			guideWidth, guideHeight, colorWidth, colorHeight, colorWidth, colorHeight,
-			motionVectorScaleX, motionVectorScaleY, tuning, forceReset);
+			motionVectorScaleX, motionVectorScaleY, tuning, forceReset, deferWait);
+	}
+
+	bool Renderer::FinishApply(ID3D11DeviceContext* context, std::uint32_t eyeIndex, ID3D11Resource* output)
+	{
+		return state_->FinishApply(context, eyeIndex, output);
 	}
 
 	bool Renderer::ApplyToOutput(ID3D11Device* device, ID3D11DeviceContext* context, std::uint32_t eyeIndex,
@@ -704,7 +746,7 @@ namespace NeuralRendering
 	{
 		return state_->Apply(device, context, eyeIndex, color, output, depth, depthSRV, motionVectors,
 			guideWidth, guideHeight, colorWidth, colorHeight, outputWidth, outputHeight,
-			motionVectorScaleX, motionVectorScaleY, tuning, forceReset);
+			motionVectorScaleX, motionVectorScaleY, tuning, forceReset, false);
 	}
 
 	bool Renderer::ApplyStereo(ID3D11Device* device, ID3D11DeviceContext* context, ID3D11Resource* color,

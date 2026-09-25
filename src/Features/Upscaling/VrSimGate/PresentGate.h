@@ -8,8 +8,7 @@
 #	include <d3d12.h>
 
 /**
- * Simulated-compositor gate. G only sees this ready set.
- * Absolute pose marks before Copy. P counts immediately before Present.
+ * Dead DLSS-G simulated-compositor gate. Ensure always returns false.
  */
 namespace VrSimGate
 {
@@ -30,14 +29,10 @@ namespace VrSimGate
 		bool enableG = false;
 	};
 
-	/** @brief Bind GPU and create the one ready set. */
 	bool Ensure(ID3D12Device* device, ID3D12CommandQueue* queue,
 		UINT colorW, UINT colorH, UINT guideW, UINT guideH,
 		DXGI_FORMAT colorFmt, DXGI_FORMAT depthFmt, DXGI_FORMAT mvecFmt);
 
-	/**
-	 * @brief DB finished final color: copy into ready, tag the token, Present.
-	 */
 	bool OnDbFinalColor(const DbFrame& frame);
 
 	void Shutdown();

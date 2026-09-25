@@ -5,6 +5,7 @@
 
 #	include "../../../Globals.h"
 #	include "../../Upscaling.h"
+#	include "../VrFfxOp/Operator.h"
 
 #	include <atomic>
 #	include <condition_variable>
@@ -16,18 +17,9 @@ namespace
 	std::atomic<bool> applied{ false };
 	std::atomic<bool> haveApplied{ false };
 
-	// Streamline::ShutdownDLSSG() calls slFreeResources, which blocks until the
-	// GPU has finished with DLSS-G's resources before freeing them. Tick() is
-	// called every iteration of Doorbell::WorkerLoopImpl's loop (the same
-	// thread that drains Snapshot()s into Kick()) -- calling it there stalled
-	// that thread for the free's duration while the game thread kept
-	// publishing new snapshots at full engine rate, dropping ~19 generations
-	// per toggle (measured 09-19 23:14, confirmed unrelated to render
-	// resolution -- it landed on the exact millisecond of the off transition
-	// twice in a row, and a preceding 28s bridge-only stretch at the same
-	// resolution dropped nothing). Route the actual SL call to a dedicated
-	// thread so the falling edge only ever costs an atomic + notify on the
-	// Doorbell thread.
+	// DestroyContext waits GPU-idle. Tick() runs on the doorbell worker that
+	// drains Snapshot into Kick, so teardown goes to this thread and the
+	// falling edge only costs an atomic + notify there.
 	std::thread shutdownThread;
 	std::mutex shutdownMutex;
 	std::condition_variable shutdownCv;
@@ -43,7 +35,7 @@ namespace
 				return;
 			shutdownPending = false;
 			lock.unlock();
-			globals::features::upscaling.streamlineDX12.ShutdownDLSSG();
+			VrFfxOp::Shutdown();
 		}
 	}
 

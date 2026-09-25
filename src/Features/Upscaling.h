@@ -206,6 +206,7 @@ public:
 	// Timing and scaling
 	double refreshRate = 0.0f;
 	float2 resolutionScale = { 1.0f, 1.0f };
+	int32_t lastJitterPhaseCount = 0;
 	uint32_t lastDlssRenderWidth = 0;
 	uint32_t lastDlssRenderHeight = 0;
 	LARGE_INTEGER qpf;
@@ -337,6 +338,8 @@ public:
 	// Globals.cpp, and restart-field reporting — keep callers from re-deriving and drifting.
 	bool PerfModePrerequisitesMet() const;
 	bool ShouldEngagePerfMode() const;
+	/** @brief VR single-thread logical eye. Separate from the enlarge-RT PerfMode path. */
+	bool ShouldEngageVrLogicalEye() const;
 
 	/// Render-to-display scale ratio for a quality mode index
 	/// (1=Quality, 2=Balanced, 3=Performance, 4=UltraPerformance).
@@ -347,6 +350,8 @@ public:
 	/// quality lookups through here rather than duplicating the table. Returns
 	/// 3.0 (UltraPerformance) on out-of-range input.
 	static float GetQualityModeRatio(uint qualityMode);
+	/** @brief Display/render ratio of the active DLSS contract. SRSS does not change it. */
+	float ReconstructionUpscaleRatio() const;
 
 	void CheckResources(UpscaleMethod a_upscalemethod);
 	void CreateUpscalingTextureResources(UpscaleMethod a_upscalemethod);

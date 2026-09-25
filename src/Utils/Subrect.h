@@ -155,9 +155,9 @@ namespace Util::Subrect
 		// texture must add `fullWidth / 2` to rightEye.x themselves.
 		StereoPixelRegions GetStereoPixelRegions(uint32_t fullWidth, uint32_t fullHeight) const;
 
-		/** @brief Get the current crop region in UV coordinates. */
-		const UVRegion& GetUV() const { return currentUV; }
-		const UVRegion& GetRightEyeUV() const { return stereoEnabled ? currentRightUV : currentUV; }
+		/** @brief Crop the renderer should use. Drag and slider edits commit on mouse release. */
+		const UVRegion& GetUV() const { return committedUV; }
+		const UVRegion& GetRightEyeUV() const { return stereoEnabled ? committedRightUV : committedUV; }
 
 		/** @brief True while the user is actively drag-resizing the crop region. */
 		bool IsDragging() const { return isDraggingCrop; }
@@ -206,6 +206,8 @@ namespace Util::Subrect
 
 		UVRegion currentUV{};
 		UVRegion currentRightUV{};
+		UVRegion committedUV{};
+		UVRegion committedRightUV{};
 		bool stereoEnabled = false;
 		// True once LoadSettings sees an explicit CropRight* key. Suppresses
 		// the auto-mirror in SetStereoEnabled(true) so a deliberate JSON
@@ -220,6 +222,7 @@ namespace Util::Subrect
 		void ClampCurrentUV();
 		void ApplyPreset(int index);
 		void SyncRightUV();
+		void CommitLiveCrop();
 	};
 
 	// Opaque-RGB blend state callback for Controller::DrawEditor. Pass when the

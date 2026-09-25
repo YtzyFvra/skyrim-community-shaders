@@ -78,6 +78,15 @@ void LoggingCallback(sl::LogType type, const char* msg)
 
 std::vector<std::pair<std::string, std::string>> Streamline::dllVersions = {};
 
+bool Streamline::VrShortsFramegenAndReflex()
+{
+#ifdef ENABLE_SKYRIM_VR
+	return REL::Module::IsVR();
+#else
+	return false;
+#endif
+}
+
 void Streamline::LoadInterposer()
 {
 	triedInitialization = true;
@@ -105,11 +114,19 @@ void Streamline::LoadInterposer()
 
 	sl::Preferences pref;
 
-	// DX11 instance: DLSS upscaling + low-latency (Reflex/PCL).
-	// DX12 instance: DLSS reconstruction + optional DLSS-G and Reflex/PCL.
+	// VR must not slInit G/Reflex/PCL — those plugins would race FSR-FG.
 	sl::Feature featuresDX11[] = { sl::kFeatureDLSS, sl::kFeatureReflex, sl::kFeaturePCL };
 	sl::Feature featuresDX12[] = { sl::kFeatureDLSS, sl::kFeatureDLSS_G, sl::kFeatureReflex, sl::kFeaturePCL };
-	if (renderAPI == sl::RenderAPI::eD3D11) {
+	sl::Feature featuresVrDlssOnly[] = { sl::kFeatureDLSS };
+	if (VrShortsFramegenAndReflex()) {
+		pref.featuresToLoad = featuresVrDlssOnly;
+		pref.numFeaturesToLoad = _countof(featuresVrDlssOnly);
+		static bool loggedVrShort = false;
+		if (!loggedVrShort) {
+			loggedVrShort = true;
+			logger::info("[Streamline] VR shorts DLSS-G/Reflex/PCL; featuresToLoad=DLSS only");
+		}
+	} else if (renderAPI == sl::RenderAPI::eD3D11) {
 		pref.featuresToLoad = featuresDX11;
 		pref.numFeaturesToLoad = _countof(featuresDX11);
 	} else {
@@ -231,12 +248,18 @@ void Streamline::CheckFeatures(IDXGIAdapter* a_adapter)
 		logger::info("[Streamline DX11] DLSS {} available", featureDLSS ? "is" : "is not");
 	} else {
 		checkFeatureAvailability(sl::kFeatureDLSS, "DLSS", featureDLSS);
-		checkFeatureAvailability(sl::kFeatureDLSS_G, "DLSS-G", featureDLSSG);
 		logger::info("[Streamline DX12] DLSS {} available", featureDLSS ? "is" : "is not");
-		logger::info("[Streamline DX12] DLSS-G {} available", featureDLSSG ? "is" : "is not");
+		if (!VrShortsFramegenAndReflex()) {
+			checkFeatureAvailability(sl::kFeatureDLSS_G, "DLSS-G", featureDLSSG);
+			logger::info("[Streamline DX12] DLSS-G {} available", featureDLSSG ? "is" : "is not");
+		}
 	}
 
-	if (reflexSupportedOnCurrentAdapter) {
+	if (VrShortsFramegenAndReflex()) {
+		featureDLSSG = false;
+		featureReflex = false;
+		featurePCL = false;
+	} else if (reflexSupportedOnCurrentAdapter) {
 		checkFeatureAvailability(sl::kFeatureReflex, "Reflex", featureReflex);
 		checkFeatureAvailability(sl::kFeaturePCL, "PCL", featurePCL);
 		logger::info("[Streamline {}] Reflex {} available", instanceTag, featureReflex ? "is" : "is not");
@@ -269,6 +292,15 @@ void Streamline::RequestFeatureLoad(sl::Feature a_feature, const char* a_feature
 
 void Streamline::BindReflexAndPCL()
 {
+	if (VrShortsFramegenAndReflex()) {
+		slReflexGetState = nullptr;
+		slReflexSleep = nullptr;
+		slReflexSetOptions = nullptr;
+		slPCLSetMarker = nullptr;
+		featureReflex = false;
+		featurePCL = false;
+		return;
+	}
 	if (!slGetFeatureFunction || !reflexSupportedOnCurrentAdapter)
 		return;
 
@@ -327,28 +359,42 @@ void Streamline::PostDevice()
 			else
 				logger::warn("[Streamline DX12] DLSS runtime controls are unavailable");
 
-			bool dlssgFnsBound = true;
-			dlssgFnsBound &= BindFeatureFunction(sl::kFeatureDLSS_G, "slDLSSGGetState", (void*&)slDLSSGGetState);
-			dlssgFnsBound &= BindFeatureFunction(sl::kFeatureDLSS_G, "slDLSSGSetOptions", (void*&)slDLSSGSetOptions);
-			featureDLSSG = dlssgSupported && dlssgFnsBound && slDLSSGGetState && slDLSSGSetOptions;
+			if (!VrShortsFramegenAndReflex()) {
+				bool dlssgFnsBound = true;
+				dlssgFnsBound &= BindFeatureFunction(sl::kFeatureDLSS_G, "slDLSSGGetState", (void*&)slDLSSGGetState);
+				dlssgFnsBound &= BindFeatureFunction(sl::kFeatureDLSS_G, "slDLSSGSetOptions", (void*&)slDLSSGSetOptions);
+				featureDLSSG = dlssgSupported && dlssgFnsBound && slDLSSGGetState && slDLSSGSetOptions;
 
-			if (!featureDLSSG) {
-				logger::warn("[Streamline DX12] DLSS-G functions missing; DLSS-G runtime controls will be disabled");
-				dlssgMaxFramesToGenerate = 1;
-			} else {
-				logger::info("[Streamline DX12] DLSS-G runtime controls are available");
-
-				sl::DLSSGState state{};
-				if (SL_FAILED(result, slDLSSGGetState(viewport, state, nullptr))) {
-					logger::warn("[Streamline DX12] slDLSSGGetState failed querying numFramesToGenerateMax: {}", magic_enum::enum_name(result));
+				if (!featureDLSSG) {
+					logger::warn("[Streamline DX12] DLSS-G functions missing; DLSS-G runtime controls will be disabled");
 					dlssgMaxFramesToGenerate = 1;
 				} else {
-					dlssgMaxFramesToGenerate = std::max<uint32_t>(1, state.numFramesToGenerateMax);
-					logger::info("[Streamline DX12] DLSS-G supports up to {}x frame generation", dlssgMaxFramesToGenerate + 1);
-				}
-			}
+					logger::info("[Streamline DX12] DLSS-G runtime controls are available");
 
-			BindReflexAndPCL();
+					sl::DLSSGState state{};
+					if (SL_FAILED(result, slDLSSGGetState(viewport, state, nullptr))) {
+						logger::warn("[Streamline DX12] slDLSSGGetState failed querying numFramesToGenerateMax: {}", magic_enum::enum_name(result));
+						dlssgMaxFramesToGenerate = 1;
+					} else {
+						dlssgMaxFramesToGenerate = std::max<uint32_t>(1, state.numFramesToGenerateMax);
+						logger::info("[Streamline DX12] DLSS-G supports up to {}x frame generation", dlssgMaxFramesToGenerate + 1);
+					}
+				}
+
+				BindReflexAndPCL();
+			}
+		}
+
+		if (VrShortsFramegenAndReflex()) {
+			featureDLSSG = false;
+			slDLSSGGetState = nullptr;
+			slDLSSGSetOptions = nullptr;
+			slReflexGetState = nullptr;
+			slReflexSleep = nullptr;
+			slReflexSetOptions = nullptr;
+			slPCLSetMarker = nullptr;
+			featureReflex = false;
+			featurePCL = false;
 		}
 
 		reflexOptionsCache = {};
@@ -370,7 +416,8 @@ void Streamline::PostDevice()
 	featureReflex = false;
 	featurePCL = false;
 
-	BindReflexAndPCL();
+	if (!VrShortsFramegenAndReflex())
+		BindReflexAndPCL();
 
 	reflexOptionsCache = {};
 	lastReflexSleepFrame = UINT32_MAX;
@@ -1180,6 +1227,8 @@ void Streamline::Upscale(ID3D11Resource* a_upscalingTexture, ID3D11Resource* a_r
 
 void Streamline::UpdateReflex()
 {
+	if (VrShortsFramegenAndReflex())
+		return;
 	if (!initialized || !reflexSupportedOnCurrentAdapter || !featureReflex || !slReflexSetOptions)
 		return;
 
@@ -1268,6 +1317,8 @@ void Streamline::UpdateReflex()
 
 void Streamline::EmitPCLMarker(sl::PCLMarker a_marker)
 {
+	if (VrShortsFramegenAndReflex())
+		return;
 	if (!initialized || !featurePCL || !slPCLSetMarker)
 		return;
 	if (!EnsureFrameToken())
@@ -1285,6 +1336,8 @@ void Streamline::EmitPCLMarker(sl::PCLMarker a_marker)
 
 void Streamline::EmitPCLMarker(sl::PCLMarker marker, const sl::FrameToken& token)
 {
+	if (VrShortsFramegenAndReflex())
+		return;
 	if (!initialized || !featurePCL || !slPCLSetMarker)
 		return;
 	const sl::Result markerResult = slPCLSetMarker(marker, token);
@@ -1305,6 +1358,8 @@ void Streamline::ConfigureDLSSG(sl::ViewportHandle viewportHandle, bool enabled,
 	uint32_t guideHeight, uint32_t colorWidth, uint32_t colorHeight, DXGI_FORMAT depthFormat,
 	DXGI_FORMAT motionFormat, DXGI_FORMAT hudLessFormat, DXGI_FORMAT uiFormat, uint32_t backBufferCount)
 {
+	if (VrShortsFramegenAndReflex())
+		return;
 	if (!initialized || !slDLSSGSetOptions)
 		return;
 
@@ -1370,6 +1425,8 @@ void Streamline::ConfigureDLSSG(sl::ViewportHandle viewportHandle, bool enabled,
 
 void Streamline::ShutdownDLSSG()
 {
+	if (VrShortsFramegenAndReflex())
+		return;
 	if (!initialized || !slDLSSGSetOptions)
 		return;
 	ConfigureDLSSG(false);
@@ -1471,6 +1528,11 @@ void Streamline::DestroyDLSSResources()
 	if (globals::game::isVR) {
 		slDLSSSetOptions(viewportRight, dlssOptions);
 		slFreeResources(sl::kFeatureDLSS, viewportRight);
+		// Six-pass ACT2 uses these viewports per eye. A crop change has to free them too.
+		slDLSSSetOptions(flatPostInjectViewport, dlssOptions);
+		slFreeResources(sl::kFeatureDLSS, flatPostInjectViewport);
+		slDLSSSetOptions(flatAct2Viewport, dlssOptions);
+		slFreeResources(sl::kFeatureDLSS, flatAct2Viewport);
 	} else {
 		slDLSSSetOptions(flatPostInjectViewport, dlssOptions);
 		slFreeResources(sl::kFeatureDLSS, flatPostInjectViewport);

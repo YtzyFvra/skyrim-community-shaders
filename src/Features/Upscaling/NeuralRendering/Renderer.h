@@ -42,7 +42,9 @@ namespace NeuralRendering
 			std::uint32_t guideWidth, std::uint32_t guideHeight,
 			std::uint32_t colorWidth, std::uint32_t colorHeight,
 			float motionVectorScaleX, float motionVectorScaleY, const Tuning& tuning,
-			bool forceReset = false);
+			bool forceReset = false, bool deferWait = false);
+		/** @brief Waits for an Apply submitted with deferWait and copies that eye's output. */
+		bool FinishApply(ID3D11DeviceContext* context, std::uint32_t eyeIndex, ID3D11Resource* output);
 		bool ApplyToOutput(ID3D11Device* device, ID3D11DeviceContext* context, std::uint32_t eyeIndex,
 			ID3D11Resource* color, ID3D11Resource* output,
 			ID3D11Resource* depth, ID3D11ShaderResourceView* depthSRV, ID3D11Resource* motionVectors,

@@ -25,6 +25,9 @@ namespace NeuralRendering
 		{
 			std::uint64_t engineReady = 0;
 			std::uint64_t nrDone = 0;
+			// 0 stays the original queue. 1 is the second DIRECT queue so the
+			// other eye can execute without waiting for this fence.
+			std::uint32_t queueIndex = 0;
 		};
 
 		~D3D12Interop();
@@ -70,6 +73,7 @@ namespace NeuralRendering
 			Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
 			Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> commandList;
 			std::uint64_t fenceValue = 0;
+			std::uint32_t fenceQueue = 0;
 			bool timingPending = false;
 			std::uint32_t timingPairCount = 0;
 			bool totalTimingPending = false;
@@ -79,7 +83,7 @@ namespace NeuralRendering
 		D3D12Interop() = default;
 		friend class Renderer;
 		bool RecordFailure(HRESULT result);
-		bool WaitForFence(std::uint64_t value);
+		bool WaitForFence(std::uint64_t value, std::uint32_t queueIndex);
 		void ResolveCompletedTiming(std::size_t contextIndex);
 		bool ResolveTimingBuffer(ID3D12Resource* readback, std::size_t contextIndex, std::uint32_t pairCount, double& gpuMs);
 
@@ -87,8 +91,10 @@ namespace NeuralRendering
 		Microsoft::WRL::ComPtr<ID3D11DeviceContext4> context11_;
 		Microsoft::WRL::ComPtr<ID3D11Fence> engineReadyFence11_;
 		Microsoft::WRL::ComPtr<ID3D11Fence> nrDoneFence11_;
+		Microsoft::WRL::ComPtr<ID3D11Fence> nrDoneFence11Eye_;
 		Microsoft::WRL::ComPtr<ID3D12Device> device12_;
 		Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue12_;
+		Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue12Eye_;
 		Microsoft::WRL::ComPtr<ID3D12QueryHeap> timestampHeap_;
 		Microsoft::WRL::ComPtr<ID3D12Resource> timestampReadback_;
 		Microsoft::WRL::ComPtr<ID3D12QueryHeap> totalTimestampHeap_;
@@ -96,10 +102,11 @@ namespace NeuralRendering
 		std::array<CommandContext, kCommandContextCount> commandContexts_;
 		Microsoft::WRL::ComPtr<ID3D12Fence> engineReadyFence12_;
 		Microsoft::WRL::ComPtr<ID3D12Fence> nrDoneFence12_;
+		Microsoft::WRL::ComPtr<ID3D12Fence> nrDoneFence12Eye_;
 		HANDLE fenceEvent_ = nullptr;
 		std::uint64_t engineReadyFenceValue_ = 0;
-		std::uint64_t nrDoneFenceValue_ = 0;
-		std::uint64_t finalizedNrDoneFenceValue_ = 0;
+		std::uint64_t nrDoneFenceValue_[2]{};
+		std::uint64_t finalizedNrDoneFenceValue_[2]{};
 		HRESULT lastError_ = S_OK;
 		const char* lastOperation_ = "none";
 		std::uint32_t lastResourceFlags_ = 0;

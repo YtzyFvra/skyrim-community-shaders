@@ -44,9 +44,6 @@ namespace
 		const uint debugVisualize = to.debugVisualize;
 		const uint peripheryAAMode = to.peripheryAAMode;
 		const float peripheryTemporalAlpha = to.peripheryTemporalAlpha;
-		const uint subrectBlendMode = to.subrectBlendMode;
-		const float subrectFeatherWidth = to.subrectFeatherWidth;
-		const float subrectDitherStrength = to.subrectDitherStrength;
 		to = from;
 		to.enabled = enabled;
 		to.dlssMode = dlssMode;
@@ -55,12 +52,9 @@ namespace
 		to.debugVisualize = debugVisualize;
 		to.peripheryAAMode = peripheryAAMode;
 		to.peripheryTemporalAlpha = peripheryTemporalAlpha;
-		to.subrectBlendMode = subrectBlendMode;
-		to.subrectFeatherWidth = subrectFeatherWidth;
-		to.subrectDitherStrength = subrectDitherStrength;
 	}
 
-	void DrawReconstructionExtents(Upscaling& upscaling, FoveatedRender& foveated)
+	void DrawReconstructionExtents(Upscaling& upscaling, FoveatedRender& foveated, Util::Subrect::Controller& vrCrop)
 	{
 		Util::DrawSectionHeader(T(TKEY("pipeline"), "Reconstruction Pipeline"), false, false);
 		if (!globals::game::isVR) {
@@ -80,14 +74,39 @@ namespace
 					preview.neuralN.width, preview.neuralN.height,
 					preview.displayD.width, preview.displayD.height);
 			}
+			ImGui::TextWrapped("%s", T(TKEY("vr_subrect_blend"),
+				"How the reconstructed box is written onto the display image. Hard Copy is a sharp seam. Feather and Dither soften it."));
+			foveated.DrawEdgeBlendControls("flatTd", foveated.settings.subrectBlendMode,
+				foveated.settings.subrectFeatherWidth, foveated.settings.subrectDitherStrength);
 			return;
 		}
 
 		ImGui::TextDisabled("%s", T(TKEY("pipeline_vr"),
-			"VR: per-eye 8-pass on kTEMP, write the box back to engine SBS. No FG. ARISE stays Flat-only."));
-		if (!foveated.settings.neuralRenderingEnabled)
-			return;
-		const auto& previewUV = foveated.subrectController.GetUV();
+			"VR: per-eye 8-pass on kTEMP. Single-thread PerfMode keeps engine RTs at logical R and submits the HMD size."));
+		foveated.DrawLogicalPerfModeControls();
+		ImGui::Separator();
+		ImGui::Text("%s", T(TKEY("vr_subrect"), "VR Subrect"));
+		ImGui::TextWrapped("%s", T(TKEY("vr_subrect_desc"),
+			"Drag the region SR and NR reconstruct. This box overrides Upscaling's foveated crop. Keep it as small as you can."));
+		auto renderer = globals::game::renderer;
+		ID3D11ShaderResourceView* previewSrv = nullptr;
+		ID3D11Texture2D* previewTex = nullptr;
+		if (auto* owned = NeuralRendering::GetVrOwnedComposite(&previewSrv)) {
+			previewTex = owned;
+		} else if (renderer) {
+			auto& temp = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kIMAGESPACE_TEMP_COPY];
+			previewSrv = temp.SRV;
+			previewTex = static_cast<ID3D11Texture2D*>(temp.texture);
+		}
+		if (previewSrv && previewTex)
+			vrCrop.DrawEditor(previewSrv, previewTex, 0.5f, 0.0f, Util::Subrect::OpaquePreviewBlendCallback);
+		else
+			vrCrop.DrawEditor(nullptr, nullptr, 0.5f);
+		ImGui::TextWrapped("%s", T(TKEY("vr_subrect_blend"),
+			"How the reconstructed box is written onto the HMD-size image. Hard Copy is a sharp seam. Feather and Dither soften it."));
+		foveated.DrawEdgeBlendControls("vrTd", foveated.settings.subrectBlendMode,
+			foveated.settings.subrectFeatherWidth, foveated.settings.subrectDitherStrength);
+		const auto& previewUV = vrCrop.GetUV();
 		uint32_t vrRenderW = 0, vrRenderH = 0, vrDisplayW = 0, vrDisplayH = 0;
 		NeuralRendering::GetVrOwnedEyeSizes(vrRenderW, vrRenderH, vrDisplayW, vrDisplayH);
 		const uint32_t inW = std::max(1u, static_cast<uint32_t>(vrRenderW * previewUV.w));
@@ -236,6 +255,13 @@ void DLSSBooster::LoadSettings(json& o_json)
 		settings = o_json;
 	else
 		ImportFromRuntime();
+	if (o_json.is_object() && o_json.contains("vrSubrect") && o_json["vrSubrect"].is_object()) {
+		vrSubrect.SetStereoEnabled(true);
+		vrSubrect.LoadSettings(o_json["vrSubrect"]);
+		vrSubrectHasSavedCrop = true;
+		vrSubrectSeeded = false;
+	}
+	PrepareVrSubrect();
 	if (settings.overrideEnabled)
 		PushToRuntime();
 	settings.reconstructionPreset = ClassifyReconstructionPreset(settings.reconstruction);
@@ -246,7 +272,11 @@ void DLSSBooster::SaveSettings(json& o_json)
 {
 	if (settings.overrideEnabled)
 		PullFromRuntime();
+	PrepareVrSubrect();
 	o_json = settings;
+	json crop = json::object();
+	vrSubrect.SaveSettings(crop);
+	o_json["vrSubrect"] = std::move(crop);
 }
 
 void DLSSBooster::RestoreDefaultSettings()
@@ -255,8 +285,45 @@ void DLSSBooster::RestoreDefaultSettings()
 	settings = {};
 	ApplyConservativePreset(settings.reconstruction);
 	settings.reconstructionPreset = 0;
+	vrSubrectHasSavedCrop = false;
+	vrSubrectSeeded = false;
+	PrepareVrSubrect();
 	if (wasOverride)
 		PushToRuntime();
+}
+
+void DLSSBooster::PostPostLoad()
+{
+	PrepareVrSubrect();
+}
+
+void DLSSBooster::PrepareVrSubrect()
+{
+	if (vrSubrectSeeded)
+		return;
+	vrSubrect.SetStereoEnabled(true);
+	vrSubrect.SeedDefaultPresets({
+		{ .name = FoveatedRender::kPresetCenter50, .uv = { 0.25f, 0.25f, 0.5f, 0.5f } },
+		{ .name = FoveatedRender::kPresetCenter75, .uv = { 0.125f, 0.125f, 0.75f, 0.75f } },
+		{ .name = FoveatedRender::kPresetNasalConvergence50,
+			.uv = { 0.5f, 0.25f, 0.5f, 0.5f },
+			.rightUV = Util::Subrect::UVRegion{ 0.0f, 0.25f, 0.5f, 0.5f } },
+		{ .name = FoveatedRender::kPresetFullEye, .uv = { 0.0f, 0.0f, 1.0f, 1.0f } },
+	});
+	vrSubrect.MaterializeNewDefaults();
+	if (!vrSubrectHasSavedCrop)
+		vrSubrect.ApplyPresetByName(FoveatedRender::kPresetCenter50);
+	vrSubrectSeeded = true;
+}
+
+bool DLSSBooster::TryGetVrSubrect(const Util::Subrect::UVRegion*& left, const Util::Subrect::UVRegion*& right)
+{
+	if (!loaded || !settings.overrideEnabled || !globals::game::isVR)
+		return false;
+	PrepareVrSubrect();
+	left = &vrSubrect.GetUV();
+	right = &vrSubrect.GetRightEyeUV();
+	return left && right;
 }
 
 void DLSSBooster::Prepass()
@@ -340,6 +407,7 @@ void DLSSBooster::DrawSettings()
 		return;
 	}
 
+	PrepareVrSubrect();
 	DrawReconstructionPreset();
 	DrawIntro();
 	ImGui::Spacing();
@@ -359,7 +427,7 @@ void DLSSBooster::DrawSettings()
 	FoveatedRender::Settings reconstructionBackup = foveated.settings;
 	CopyReconstruction(settings.reconstruction, foveated.settings);
 
-	DrawReconstructionExtents(upscaling, foveated);
+	DrawReconstructionExtents(upscaling, foveated, vrSubrect);
 
 	if (ImGui::CollapsingHeader(T(TKEY("six_pass"), "Six-Pass Reconstruction"), ImGuiTreeNodeFlags_DefaultOpen))
 		foveated.DrawNeuralRenderingSettings(false);

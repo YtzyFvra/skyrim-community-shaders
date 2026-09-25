@@ -3,8 +3,8 @@
 #ifdef ENABLE_SKYRIM_VR
 
 /**
- * Hot master switch. Sits in front of G.
- * On = eOn and the G chain. Off = eOff and the bridge.
+ * Hot master switch. Sits in front of the interpolator.
+ * On = FSR-FG operator. Off = bridge.
  */
 namespace VrSwitch
 {
@@ -13,7 +13,7 @@ namespace VrSwitch
 
 	/**
 	 * @brief Apply a settings edge.
-	 * Falling edge shuts G down per SL/NGX (eOff + free).
+	 * Falling edge tears the interpolator down off the doorbell thread.
 	 */
 	void Tick();
 }

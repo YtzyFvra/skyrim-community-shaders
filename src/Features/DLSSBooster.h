@@ -3,6 +3,7 @@
 #include "Feature.h"
 #include "Upscaling/FoveatedRender.h"
 #include "Utils/BootSnapshot.h"
+#include "Utils/Subrect.h"
 
 /**
  * @brief Sibling Display tab that owns the RTX reconstruction settings blob.
@@ -62,6 +63,13 @@ struct DLSSBooster : Feature
 	virtual void SaveSettings(json& o_json) override;
 	virtual void RestoreDefaultSettings() override;
 	virtual void Prepass() override;
+	virtual void PostPostLoad() override;
+
+	/**
+	 * @brief VR crop owned by this page. When the override is on, the six-pass uses it
+	 * instead of Upscaling's foveated subrect.
+	 */
+	bool TryGetVrSubrect(const Util::Subrect::UVRegion*& left, const Util::Subrect::UVRegion*& right);
 
 	virtual std::span<const Util::Settings::RestartFieldInfo> GetRestartRequiredFields() const override
 	{
@@ -77,4 +85,9 @@ private:
 	void ImportFromRuntime();
 	void PullFromRuntime();
 	void PushToRuntime() const;
+	void PrepareVrSubrect();
+
+	Util::Subrect::Controller vrSubrect;
+	bool vrSubrectSeeded = false;
+	bool vrSubrectHasSavedCrop = false;
 };

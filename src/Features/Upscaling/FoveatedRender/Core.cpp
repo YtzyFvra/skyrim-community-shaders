@@ -277,6 +277,19 @@ namespace FoveatedRenderImpl::Ops
 		}
 	}
 
+	void ReleaseVRSubrectTextures()
+	{
+		for (int i = 0; i < 2; ++i) {
+			Core::vrSubrectColorIn[i].reset();
+			Core::vrSubrectColorOut[i].reset();
+			Core::vrSubrectDepth[i].reset();
+			Core::vrSubrectMotionVectors[i].reset();
+			Core::vrSubrectReactiveMask[i].reset();
+			Core::vrSubrectTransparencyMask[i].reset();
+		}
+		Core::vrSubrectInW = Core::vrSubrectInH = Core::vrSubrectOutW = Core::vrSubrectOutH = 0;
+	}
+
 	bool PreparePerEyeInputs(
 		ID3D11Resource* colorSrc,
 		ID3D11ShaderResourceView* depthSRV,
@@ -380,7 +393,10 @@ namespace FoveatedRenderImpl::Ops
 		uint32_t srcWidth,
 		uint32_t srcHeight,
 		uint32_t srcEyeWidth,
-		uint32_t srcEyeHeight)
+		uint32_t srcEyeHeight,
+		int stretchModeOverride,
+		float blurRadiusOverride,
+		bool debugTint)
 	{
 		auto context = globals::d3d::context;
 
@@ -452,15 +468,17 @@ namespace FoveatedRenderImpl::Ops
 			cb.data[5] = srcHeight;
 			cb.data[6] = srcEyeWidth;
 			cb.data[7] = srcEyeHeight;
-			cb.stretchMode = enhSettings.stretchMode;
+			cb.stretchMode = stretchModeOverride >= 0 ? static_cast<uint32_t>(stretchModeOverride) : enhSettings.stretchMode;
 			// BlurRadius is in SOURCE-texel units, scaled onto screen pixels by
 			// r = dstWidth/srcEyeWidth. Floor r at kMinPeripheryBlurRatio so the
 			// periphery is never blurred less on-screen than at that reference
 			// scale -- only boosts the radius near-native, never reduces real DRS blur.
 			constexpr float kMinPeripheryBlurRatio = 2.0f;  // reference: never softer than a 50%-render-scale stretch
 			const float r = srcEyeWidth > 0 ? (float)dstWidth / (float)srcEyeWidth : 1.0f;
-			cb.blurRadius = enhSettings.peripheryBlurRadius * (std::max(r, kMinPeripheryBlurRatio) / r);
-			cb.debugVisualize = (enhSettings.debugVisualize != 0 || globals::features::upscaling.foveatedRender.ShouldForceVisualize()) ? 1u : 0u;
+			cb.blurRadius = blurRadiusOverride >= 0.0f ? blurRadiusOverride :
+				enhSettings.peripheryBlurRadius * (std::max(r, kMinPeripheryBlurRatio) / r);
+			cb.debugVisualize = debugTint && (enhSettings.debugVisualize != 0 ||
+				globals::features::upscaling.foveatedRender.ShouldForceVisualize()) ? 1u : 0u;
 			std::memcpy(mapped.pData, &cb, sizeof(cb));
 			context->Unmap(Core::vrSubrectStretchCB.get(), 0);
 		}
@@ -694,7 +712,8 @@ namespace FoveatedRenderImpl::Ops
 		float DitherStrength;
 		uint32_t MaskMode;
 		float FalloffCurve;
-		uint32_t _pad0;
+		uint32_t SrcWidth;
+		uint32_t SrcHeight;
 	};
 
 	uint64_t ComputeSubrectUVHash(const Util::Subrect::UVRegion& leftUV,
@@ -724,7 +743,7 @@ namespace FoveatedRenderImpl::Ops
 
 	void StretchDRSBothEyes(ID3D11UnorderedAccessView* dstUAV, uint32_t eyeWidthOut, uint32_t eyeHeightOut,
 		uint32_t eyeWidthIn, uint32_t eyeHeightIn, uint32_t renderW, uint32_t renderH,
-		ID3D11ShaderResourceView* srcOverride)
+		ID3D11ShaderResourceView* srcOverride, int stretchModeOverride, float blurRadiusOverride, bool debugTint)
 	{
 		// Snapshot creation can fail or be skipped on a fresh frame; degrade
 		// rather than dereference vrRenderSBS->srv on the null path.
@@ -741,7 +760,8 @@ namespace FoveatedRenderImpl::Ops
 				src, dstUAV,
 				dstX, eyeWidthOut, eyeHeightOut,
 				srcX, renderW, renderH,
-				eyeWidthIn, eyeHeightIn);
+				eyeWidthIn, eyeHeightIn,
+				stretchModeOverride, blurRadiusOverride, debugTint);
 		}
 	}
 
@@ -760,9 +780,21 @@ namespace FoveatedRenderImpl::Ops
 	{
 		auto context = globals::d3d::context;
 		const auto blendMode = static_cast<FoveatedRender::SubrectBlendMode>(std::min(blendModeValue, 3u));
+		uint32_t srcWidth = subWidth;
+		uint32_t srcHeight = subHeight;
+		if (dlssSrc) {
+			winrt::com_ptr<ID3D11Texture2D> srcTex;
+			if (SUCCEEDED(dlssSrc->QueryInterface(IID_PPV_ARGS(srcTex.put())))) {
+				D3D11_TEXTURE2D_DESC srcDesc{};
+				srcTex->GetDesc(&srcDesc);
+				srcWidth = srcDesc.Width;
+				srcHeight = srcDesc.Height;
+			}
+		}
+		const bool scaleToBox = srcWidth != subWidth || srcHeight != subHeight;
 
-		// Fast path: hard copy (original behaviour)
-		if (blendMode == FoveatedRender::SubrectBlendMode::kHardCopy) {
+		// Fast path: hard copy when the reconstructed box is already the TD hole.
+		if (blendMode == FoveatedRender::SubrectBlendMode::kHardCopy && !scaleToBox) {
 			D3D11_BOX srcBox = { srcOffsetX, 0, 0, srcOffsetX + subWidth, subHeight, 1 };
 			context->CopySubresourceRegion(dst, 0, dstOffsetX, dstOffsetY, 0, dlssSrc, 0, &srcBox);
 			return;
@@ -848,9 +880,13 @@ namespace FoveatedRenderImpl::Ops
 			cb->FeatherWidth = featherWidth;
 			cb->FrameIndex = globals::state ? globals::state->frameCount : 0;
 			cb->SrcOffsetX = srcOffsetX;
-			cb->DitherStrength = foveated.settings.subrectDitherStrength;
+			cb->DitherStrength = ditherStrength;
 			cb->MaskMode = static_cast<uint32_t>(foveated.GetSubrectMaskMode());
 			cb->FalloffCurve = foveated.settings.subrectFalloffCurve;
+			cb->SrcWidth = srcWidth;
+			cb->SrcHeight = srcHeight;
+			if (blendMode == FoveatedRender::SubrectBlendMode::kHardCopy && scaleToBox)
+				cb->BlendMode = 3u;
 			context->Unmap(Core::vrSubrectBlendCB.get(), 0);
 		}
 
