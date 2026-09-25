@@ -1573,6 +1573,15 @@ double VrAriseTail::LastKickFenceMs()
 #endif
 }
 
+bool VrAriseTail::HasWorldPublish()
+{
+#ifdef ENABLE_SKYRIM_VR
+	return haveWorldPublish.load(std::memory_order_acquire);
+#else
+	return false;
+#endif
+}
+
 bool VrAriseTail::HistoryResetPending()
 {
 #ifdef ENABLE_SKYRIM_VR
@@ -1587,6 +1596,59 @@ void VrAriseTail::ClearHistoryReset()
 #ifdef ENABLE_SKYRIM_VR
 	historyResetPending.store(false, std::memory_order_release);
 #endif
+}
+
+ID3D11Texture2D* ScaleLoadToTd(ID3D11Texture2D* src, UINT srcW, UINT srcH, UINT dstW, UINT dstH)
+{
+	static ComPtr<ID3D11Texture2D> dst;
+	static ComPtr<ID3D11ShaderResourceView> srv;
+	static ComPtr<ID3D11UnorderedAccessView> uav;
+	static ID3D11Texture2D* lastSrc = nullptr;
+	static UINT cachedW = 0;
+	static UINT cachedH = 0;
+	if (!src || !globals::d3d::device || srcW < 2 || !srcH || dstW < 2 || !dstH)
+		return nullptr;
+	if (srcW == dstW && srcH == dstH)
+		return src;
+	if (!dst || cachedW != dstW || cachedH != dstH) {
+		D3D11_TEXTURE2D_DESC desc{};
+		src->GetDesc(&desc);
+		desc.Width = dstW;
+		desc.Height = dstH;
+		desc.MipLevels = 1;
+		desc.ArraySize = 1;
+		desc.SampleDesc.Count = 1;
+		desc.Usage = D3D11_USAGE_DEFAULT;
+		desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+		desc.CPUAccessFlags = 0;
+		desc.MiscFlags = 0;
+		dst.Reset();
+		uav.Reset();
+		if (FAILED(globals::d3d::device->CreateTexture2D(&desc, nullptr, dst.ReleaseAndGetAddressOf())))
+			return nullptr;
+		Util::SetResourceName(dst.Get(), "VrAriseTail::LoadTd");
+		D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
+		uavDesc.Format = desc.Format;
+		uavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+		if (FAILED(globals::d3d::device->CreateUnorderedAccessView(dst.Get(), &uavDesc, uav.ReleaseAndGetAddressOf())))
+			return nullptr;
+		cachedW = dstW;
+		cachedH = dstH;
+	}
+	if (lastSrc != src) {
+		D3D11_TEXTURE2D_DESC srcDesc{};
+		src->GetDesc(&srcDesc);
+		D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+		srvDesc.Format = srcDesc.Format;
+		srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+		srvDesc.Texture2D.MipLevels = 1;
+		srv.Reset();
+		if (FAILED(globals::d3d::device->CreateShaderResourceView(src, &srvDesc, srv.ReleaseAndGetAddressOf())))
+			return nullptr;
+		lastSrc = src;
+	}
+	FoveatedRenderImpl::Ops::StretchDRSBothEyes(uav.Get(), dstW / 2, dstH, srcW / 2, srcH, srcW, srcH, srv.Get(), 2, 1.0f, false);
+	return dst.Get();
 }
 
 void LogAlphaProbe(const char* name, ID3D11Texture2D* tex)
@@ -1755,16 +1817,35 @@ void VrAriseTail::PublishKTemp(ID3D11Texture2D* kTemp)
 	if (globals::state && globals::state->isLoadingMenuOpen) {
 		if (!publishPausedForLoad.exchange(true)) {
 			logger::info("[VrAriseTail] X4 publish paused (loading/no world)");
-			LogAlphaProbe("load kTEMP", kTemp);
+			LogAlphaProbe("load submit", kTemp);
 			LogAlphaProbe("load kTOTAL", EngineRt(RE::RENDER_TARGETS::kTOTAL));
 			LogAlphaProbe("load kMENUBG", EngineRt(RE::RENDER_TARGETS::kMENUBG));
-			LogAlphaProbe("load kFRAMEBUFFER", EngineRt(RE::RENDER_TARGETS::kFRAMEBUFFER));
 		}
 		publishResumeQpc.store(0, std::memory_order_release);
-		// kTEMP is cleared for the whole LoadingMenu. Scaling it submits black
-		// at TD size, and the shared-fence restart then stops later kicks.
-		NoteNoNewFrame("loading");
-		return;
+		auto& perfMode = globals::features::upscaling.perfMode;
+		const UINT tdW = perfMode.GetDisplayEyeWidth() * 2;
+		const UINT tdH = perfMode.GetDisplayEyeHeight();
+		// The shared slot stays at whatever size the world already published.
+		// Resizing it resets the fence and later world frames never prepare.
+		if (!tdW || !tdH || !sharedWidth || sharedWidth != tdW || sharedHeight != tdH) {
+			NoteNoNewFrame("loading");
+			return;
+		}
+		D3D11_TEXTURE2D_DESC srcDesc{};
+		kTemp->GetDesc(&srcDesc);
+		ID3D11Texture2D* scaled = ScaleLoadToTd(kTemp, srcDesc.Width, srcDesc.Height, tdW, tdH);
+		if (!scaled) {
+			NoteNoNewFrame("loading");
+			return;
+		}
+		static bool loggedLoad = false;
+		if (!loggedLoad) {
+			loggedLoad = true;
+			logger::info("[VrAriseTail] loading submit {}x{} -> {}x{} (slot unchanged)",
+				srcDesc.Width, srcDesc.Height, tdW, tdH);
+		}
+		colorSrc = scaled;
+		colorOnly = true;
 	}
 	D3D11_TEXTURE2D_DESC desc{};
 	colorSrc->GetDesc(&desc);

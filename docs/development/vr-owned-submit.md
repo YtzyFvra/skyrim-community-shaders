@@ -21,7 +21,7 @@ Engine world @ native E SBS
 
 Do not write the box back to kTEMP. Do not invent per-eye `{0,1}–{1,0}` bounds (that flipped and zoomed the first cut). Do not flip `useArise` on VR. Do not engage the enlarge-RT PerfMode (kTEMP/kTOTAL grown to display size) on this path. Single-thread logical eye is the VR size lie; without it, TD equals E. No fake Present. No DLSS-G.
 
-`LoadingMenu` clears kTEMP. The live window is the menu, not that texture. `PublishKTemp` returns without publishing while the menu is open. Do not scale kTEMP to true-display and kick it: the HMD stays black, recreating the shared slots resets the D3D11 fence to 0, and a tail that only prepares when `fenceValue > lastConsumed` then never kicks again. The first real publish after the menu closes resumes and resets frame generation once.
+`LoadingMenu` sleeps the six-pass and frame generation. The engine Submit texture is scaled into the shared slot only when that slot is already true-display size, then we submit it. Do not resize the slot: recreating it resets the D3D11 fence to 0, and a tail that only prepares when `fenceValue > lastConsumed` then never kicks again. The first real publish after the menu closes resumes and resets frame generation once. Confirmed on device: the HMD shows the loading image instead of holding the previous frame.
 
 ## Inject
 

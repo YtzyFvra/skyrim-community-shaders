@@ -312,10 +312,11 @@ namespace
 		prepare.commandList = list.Get();
 		prepare.frameID = id;
 		prepare.flags = 0;
-		// Guides stay at the engine SBS. 1.0 is one eye of the presented image.
+		// motionVectorScale is a multiplier. MV stays at render size and the
+		// display-resolution flag is off, so 1.0 is one render-size eye.
 		prepare.renderSize = { inGuideW, inGuideH };
-		prepare.motionVectorScale.x = static_cast<float>(inColorW) * 0.5f;
-		prepare.motionVectorScale.y = static_cast<float>(inColorH);
+		prepare.motionVectorScale.x = static_cast<float>(inGuideW) * 0.5f;
+		prepare.motionVectorScale.y = static_cast<float>(inGuideH);
 		static bool loggedScale = false;
 		if (!loggedScale && (inColorW != inGuideW || inColorH != inGuideH)) {
 			loggedScale = true;
@@ -529,6 +530,67 @@ void VrFfxOp::NoteDiscontinuity()
 		return WaitOwnFence(kFenceWaitMs);
 	}
 
+	bool LogStampedPixel(ID3D12Resource* src, UINT x, UINT y)
+	{
+		if (!src || !device || !queue || !list || !allocator)
+			return false;
+		ComPtr<ID3D12Resource> readback;
+		D3D12_HEAP_PROPERTIES heap{};
+		heap.Type = D3D12_HEAP_TYPE_READBACK;
+		D3D12_RESOURCE_DESC buffer{};
+		buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+		buffer.Width = 256;
+		buffer.Height = 1;
+		buffer.DepthOrArraySize = 1;
+		buffer.MipLevels = 1;
+		buffer.Format = DXGI_FORMAT_UNKNOWN;
+		buffer.SampleDesc.Count = 1;
+		buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+		if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer,
+				D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback))))
+			return false;
+		if (!WaitOwnFence(kFenceWaitMs) || FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.Get(), nullptr)))
+			return false;
+		D3D12_RESOURCE_BARRIER toCopy{};
+		toCopy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+		toCopy.Transition.pResource = src;
+		toCopy.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+		toCopy.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+		toCopy.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+		list->ResourceBarrier(1, &toCopy);
+		D3D12_TEXTURE_COPY_LOCATION dstLoc{};
+		dstLoc.pResource = readback.Get();
+		dstLoc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+		D3D12_RESOURCE_DESC srcDesc = src->GetDesc();
+		device->GetCopyableFootprints(&srcDesc, 0, 1, 0, &dstLoc.PlacedFootprint, nullptr, nullptr, nullptr);
+		dstLoc.PlacedFootprint.Footprint.Width = 1;
+		dstLoc.PlacedFootprint.Footprint.Height = 1;
+		D3D12_TEXTURE_COPY_LOCATION srcLoc{};
+		srcLoc.pResource = src;
+		srcLoc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+		D3D12_BOX box{ x, y, 0, x + 1, y + 1, 1 };
+		list->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, &box);
+		D3D12_RESOURCE_BARRIER back = toCopy;
+		back.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+		back.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+		list->ResourceBarrier(1, &back);
+		if (FAILED(list->Close()))
+			return false;
+		ID3D12CommandList* lists[]{ list.Get() };
+		queue->ExecuteCommandLists(1, lists);
+		++fenceValue;
+		if (FAILED(queue->Signal(fence.Get(), fenceValue)) || !WaitOwnFence(kFenceWaitMs))
+			return false;
+		void* mapped = nullptr;
+		if (FAILED(readback->Map(0, nullptr, &mapped)) || !mapped)
+			return false;
+		const auto* px = static_cast<const std::uint8_t*>(mapped);
+		logger::info("[VrFfxOp] HUD stamp readback tex={} px={},{} rgba={},{},{},{}",
+			static_cast<void*>(src), x, y, px[0], px[1], px[2], px[3]);
+		readback->Unmap(0, nullptr);
+		return true;
+	}
+
 	void StampHud(ID3D12Resource* generated, ID3D12Resource* scene, UINT outW, UINT outH)
 	{
 		const UINT64 want = VrAriseTail::HudFenceValue();
@@ -569,9 +631,13 @@ void VrFfxOp::NoteDiscontinuity()
 		const bool genOk = StampOne(generated, hud12.Get(), outW, outH, hudW, hudH);
 		if (!logged && (sceneOk || genOk)) {
 			logged = true;
-			logger::info("[VrFfxOp] HUD stamp {}x{} onto {}x{} scene={} gen={}",
-				hudW, hudH, outW, outH, sceneOk ? 1 : 0, genOk ? 1 : 0);
+			logger::info("[VrFfxOp] HUD stamp {}x{} onto {}x{} scene={} gen={} submitTex={}",
+				hudW, hudH, outW, outH, sceneOk ? 1 : 0, genOk ? 1 : 0,
+				static_cast<void*>(scene));
 		}
+		static bool loggedPixel = false;
+		if (sceneOk && scene && !loggedPixel)
+			loggedPixel = LogStampedPixel(scene, outW / 4, outH / 2);
 	}
 
 bool VrFfxOp::OnDbFinalColor(ID3D12Resource* color, ID3D12Resource* depth, ID3D12Resource* mvec,

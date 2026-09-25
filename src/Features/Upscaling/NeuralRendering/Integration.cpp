@@ -1871,6 +1871,8 @@ namespace NeuralRendering
 
 			if (!upscaling.IsVrDlssPostInjectActive())
 				return false;
+			if (globals::state && globals::state->isLoadingMenuOpen)
+				return false;
 
 			CS_GPU_PASS("NeuralRendering::VrOwnedSubmit");
 			auto* renderer = globals::game::renderer;

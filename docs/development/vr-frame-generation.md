@@ -67,7 +67,7 @@ Optical flow runs on the color at E×E; its outputs (`opticalFlowVector`, `optic
 
 ## Rules
 
-- FG off, menus, pause, map: `ShouldUseFrameGenerationThisFrame()` false → exactly the current owned Submit, one frame, no FI dispatch. `LoadingMenu` does not Submit: kTEMP is clear, and a true-display scale of it blacks the HMD (see `vr-owned-submit.md`).
+- FG off, menus, pause, map: `ShouldUseFrameGenerationThisFrame()` false → exactly the current owned Submit, one frame, no FI dispatch. `LoadingMenu` sleeps six-pass and FG, scales the engine Submit into the existing true-display slot, and submits that (see `vr-owned-submit.md`).
 - `planChanged` or a failed eye: no pack, no Submit, FI `reset = true` next frame.
 - Never `WaitGetPoses` ourselves. Poses are read from the engine's own call.
 - Never submit frames out of order: interp(N-½) then real(N), every frame, or real(N) alone when FI failed.

@@ -311,9 +311,12 @@ bool VrSubmitDlssg::TrySubmit(RE::BSOpenVR*, const vr::Texture_t* texture,
 		handle = reinterpret_cast<ID3D11Resource*>(const_cast<vr::Texture_t*>(texture));
 	const bool isOverlay = handle && IsOverlayRt(handle);
 	if (handle && !isOverlay && VrAriseTail::IsActive() && !VrBoosterTail::OwnsSubmit()) {
-		// VR HUD is kMENUBG (KIT enlarges that slot). kHUDMENU is the flat enum.
-		if (ID3D11Resource* menu = Rt(RE::RENDER_TARGETS::kMENUBG))
-			VrAriseTail::NoteHud(static_cast<ID3D11Texture2D*>(menu));
+		// Before the world, kMENUBG alpha is all zero. The picture is kTOTAL.
+		ID3D11Resource* hud = VrAriseTail::HasWorldPublish() ?
+			Rt(RE::RENDER_TARGETS::kMENUBG) :
+			Rt(RE::RENDER_TARGETS::kTOTAL);
+		if (hud)
+			VrAriseTail::NoteHud(static_cast<ID3D11Texture2D*>(hud));
 		VrAriseTail::PublishKTemp(static_cast<ID3D11Texture2D*>(handle));
 	}
 

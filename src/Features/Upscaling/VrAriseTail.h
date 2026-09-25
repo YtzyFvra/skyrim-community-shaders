@@ -29,6 +29,8 @@ namespace VrAriseTail
 	void PublishKTemp(ID3D11Texture2D* kTemp);
 	/** @brief Game thread: copy kMENUBG into its own shared texture. Not the publish fence. */
 	void NoteHud(ID3D11Texture2D* hud);
+	/** @brief True after a world publish. Before that, kMENUBG alpha is zero. */
+	bool HasWorldPublish();
 	void* HudSharedHandle();
 	void* HudFenceHandle();
 	std::uint64_t HudFenceValue();
