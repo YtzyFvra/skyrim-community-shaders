@@ -2166,7 +2166,7 @@ namespace NeuralRendering
 			if (!vrSixPassLogged) {
 				D3D11_TEXTURE2D_DESC postDesc{};
 				postTemp->GetDesc(&postDesc);
-				logger::info("[VrSixPass] Tonemap wrote kTEMP {}x{} E={}x{} cropR={}x{} cropD={}x{}",
+				logger::info("[VrSixPass] UI composite read kTEMP {}x{} E={}x{} cropR={}x{} cropD={}x{}",
 					postDesc.Width, postDesc.Height, engineW, engineH, subInW, subInH, subOutW, subOutH);
 				vrSixPassLogged = true;
 			}

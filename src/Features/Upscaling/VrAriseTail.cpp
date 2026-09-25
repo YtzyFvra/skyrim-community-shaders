@@ -1814,7 +1814,8 @@ void VrAriseTail::PublishKTemp(ID3D11Texture2D* kTemp)
 		return;
 	bool colorOnly = false;
 	ID3D11Texture2D* colorSrc = kTemp;
-	if (globals::state && globals::state->isLoadingMenuOpen) {
+	const bool loading = globals::state && globals::state->isLoadingMenuOpen;
+	if (loading) {
 		if (!publishPausedForLoad.exchange(true)) {
 			logger::info("[VrAriseTail] X4 publish paused (loading/no world)");
 			LogAlphaProbe("load submit", kTemp);
@@ -1822,30 +1823,29 @@ void VrAriseTail::PublishKTemp(ID3D11Texture2D* kTemp)
 			LogAlphaProbe("load kMENUBG", EngineRt(RE::RENDER_TARGETS::kMENUBG));
 		}
 		publishResumeQpc.store(0, std::memory_order_release);
-		auto& perfMode = globals::features::upscaling.perfMode;
-		const UINT tdW = perfMode.GetDisplayEyeWidth() * 2;
-		const UINT tdH = perfMode.GetDisplayEyeHeight();
-		// The shared slot stays at whatever size the world already published.
-		// Resizing it resets the fence and later world frames never prepare.
-		if (!tdW || !tdH || !sharedWidth || sharedWidth != tdW || sharedHeight != tdH) {
-			NoteNoNewFrame("loading");
-			return;
-		}
-		D3D11_TEXTURE2D_DESC srcDesc{};
-		kTemp->GetDesc(&srcDesc);
+		colorOnly = true;
+	}
+	auto& perfMode = globals::features::upscaling.perfMode;
+	const UINT tdW = perfMode.GetDisplayEyeWidth() * 2;
+	const UINT tdH = perfMode.GetDisplayEyeHeight();
+	D3D11_TEXTURE2D_DESC srcDesc{};
+	kTemp->GetDesc(&srcDesc);
+	// A 4K publish recreates the shared slot and resets its fence. Scale first
+	// so the slot is created at true-display size and never changes.
+	if (perfMode.IsLogicalEyeActive() && tdW && tdH &&
+		(srcDesc.Width != tdW || srcDesc.Height != tdH)) {
 		ID3D11Texture2D* scaled = ScaleLoadToTd(kTemp, srcDesc.Width, srcDesc.Height, tdW, tdH);
 		if (!scaled) {
-			NoteNoNewFrame("loading");
+			NoteNoNewFrame(loading ? "loading" : "not td");
 			return;
 		}
-		static bool loggedLoad = false;
-		if (!loggedLoad) {
-			loggedLoad = true;
-			logger::info("[VrAriseTail] loading submit {}x{} -> {}x{} (slot unchanged)",
+		static bool loggedScale = false;
+		if (!loggedScale) {
+			loggedScale = true;
+			logger::info("[VrAriseTail] submit {}x{} -> {}x{} before slot",
 				srcDesc.Width, srcDesc.Height, tdW, tdH);
 		}
 		colorSrc = scaled;
-		colorOnly = true;
 	}
 	D3D11_TEXTURE2D_DESC desc{};
 	colorSrc->GetDesc(&desc);

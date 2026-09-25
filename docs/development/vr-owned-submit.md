@@ -16,16 +16,17 @@ Engine world @ native E SBS
     -> BSOpenVR::Submit once on that SBS (vfunc 0x03 already does both eyes)
     -> same path as the engine; VDXR sits here. Do not call GetIVRCompositor from the DLL
     -> engine world Submit is swallowed. Overlay RTs are not passed through.
-    -> kMENUBG (VR HUD, the slot KIT enlarges) is copied aside and stamped onto the real and generated SBS after FG
+    -> at UI composite, before the engine blends kMENUBG onto kTOTAL: run the graph from kTEMP, and copy kMENUBG aside
+    -> stamp that HUD onto the real and generated SBS after FG
 ```
 
 Do not write the box back to kTEMP. Do not invent per-eye `{0,1}–{1,0}` bounds (that flipped and zoomed the first cut). Do not flip `useArise` on VR. Do not engage the enlarge-RT PerfMode (kTEMP/kTOTAL grown to display size) on this path. Single-thread logical eye is the VR size lie; without it, TD equals E. No fake Present. No DLSS-G.
 
-`LoadingMenu` sleeps the six-pass and frame generation. The engine Submit texture is scaled into the shared slot only when that slot is already true-display size, then we submit it. Do not resize the slot: recreating it resets the D3D11 fence to 0, and a tail that only prepares when `fenceValue > lastConsumed` then never kicks again. The first real publish after the menu closes resumes and resets frame generation once. Confirmed on device: the HMD shows the loading image instead of holding the previous frame.
+`LoadingMenu` sleeps the six-pass and frame generation. Any logical-eye publish whose source is not true-display size is scaled to that size before it touches the shared slot, including the first Submit and a frame the six-pass did not publish. Do not create or resize the slot at engine SBS: recreating it resets the D3D11 fence to 0, and a tail that only prepares when `fenceValue > lastConsumed` then never kicks again. The first real publish after the menu closes resumes and resets frame generation once. Confirmed on device: the HMD follows the loading image instead of holding a pinned frame.
 
 ## Inject
 
-`Main_PostProcessing` only runs Flat after Post. VR runs after `ISHDRTonemapBlendCinematic` / `...Fade` (`HDRTonemapRenderHook`), the same point KIT TemporalSmooth uses: read kTEMP. Failed isolated passes do not Submit (engine world Submit stays live). The first history-reset frame does not Submit.
+`Main_PostProcessing` only runs Flat after Post. VR runs in `UICompositeRenderHook`, before the engine blends `kMENUBG` onto `kTOTAL`. World color, depth, and motion are still read from `kTEMP` (the copy into `kTOTAL` has already happened). `kMENUBG` is copied in the same hook. Tonemap itself is not patched on VR. Failed isolated passes do not Submit (engine world Submit stays live). The first history-reset frame does not Submit.
 
 Early `Upscale()` encode + KIT/standard DLSS are skipped when `IsVrDlssPostInjectActive()` or RTX DLSS Booster override is on (`ShouldSkipUpscalingDlss`), so ACT1 owns reconstruction.
 

@@ -12,6 +12,7 @@
 #include "NeuralRendering/Integration.h"
 #include "NeuralRendering/ArisePipeline.h"
 #include "NeuralRendering/Renderer.h"
+#include "VrAriseTail.h"
 #include "VrSubmitDlssg.h"
 #include "Profiler.h"
 
@@ -204,10 +205,7 @@ void FoveatedRender::PostPostLoad()
 	NeuralRendering::ARISE::Pipeline::Instance().SetWorkerNrEnabled(settings.ariseWorkerNr);
 	NeuralRendering::ARISE::Pipeline::Instance().SetEnabled(settings.ariseShadowScheduler);
 	stl::write_vfunc<0x1, UICompositeRenderHook>(RE::VTABLE_BSImagespaceShaderCopyDynamicFetchDisabled[3]);
-	if (globals::game::isVR) {
-		stl::write_vfunc<0x1, HDRTonemapRenderHook>(RE::VTABLE_BSImagespaceShaderHDRTonemapBlendCinematic[3]);
-		stl::write_vfunc<0x1, HDRTonemapFadeRenderHook>(RE::VTABLE_BSImagespaceShaderHDRTonemapBlendCinematicFade[3]);
-	} else if (WantsLogicalPerfMode()) {
+	if (!globals::game::isVR && WantsLogicalPerfMode()) {
 		// Title/loading blit + Map/ISHDR scopes. ESC/TAB stay unpatched — see docs/development/flat-arise-menu.md.
 		stl::write_vfunc<0x1, MapRenderHook>(RE::VTABLE_BSImagespaceShaderMap[3]);
 		stl::write_vfunc<0x1, WorldMapRenderHook>(RE::VTABLE_BSImagespaceShaderWorldMap[3]);
@@ -223,6 +221,20 @@ void FoveatedRender::PostPostLoad()
 
 void FoveatedRender::UICompositeRenderHook::thunk(void* imageSpaceShader, RE::BSTriShape* shape, RE::ImageSpaceEffectParam* param)
 {
+#ifdef ENABLE_SKYRIM_VR
+	// One point, before the engine blends kMENUBG onto kTOTAL: world image,
+	// depth, motion, and the HUD are all still the frames just drawn.
+	if (globals::game::isVR) {
+		NeuralRendering::ApplyVrAfterTonemap();
+		if (VrAriseTail::IsActive() && globals::game::renderer) {
+			auto* menu = globals::game::renderer->GetRuntimeData()
+							 .renderTargets[RE::RENDER_TARGETS::kMENUBG]
+							 .texture;
+			if (menu)
+				VrAriseTail::NoteHud(static_cast<ID3D11Texture2D*>(menu));
+		}
+	}
+#endif
 	func(imageSpaceShader, shape, param);
 }
 
@@ -544,7 +556,6 @@ void FoveatedRender::HDRTonemapRenderHook::thunk(
 {
 	if (globals::game::isVR) {
 		func(imageSpaceShader, shape, param);
-		NeuralRendering::ApplyVrAfterTonemap();
 		return;
 	}
 	RunImagespaceAtDestinationViewport<HDRTonemapRenderHook>(imageSpaceShader, shape, param);
@@ -555,7 +566,6 @@ void FoveatedRender::HDRTonemapFadeRenderHook::thunk(
 {
 	if (globals::game::isVR) {
 		func(imageSpaceShader, shape, param);
-		NeuralRendering::ApplyVrAfterTonemap();
 		return;
 	}
 	RunImagespaceAtDestinationViewport<HDRTonemapFadeRenderHook>(imageSpaceShader, shape, param);

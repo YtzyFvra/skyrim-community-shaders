@@ -310,21 +310,12 @@ bool VrSubmitDlssg::TrySubmit(RE::BSOpenVR*, const vr::Texture_t* texture,
 	if (texture && textureAddr >= 0x10000 && textureAddr <= 0x00007FFFFFFFFFFFull)
 		handle = reinterpret_cast<ID3D11Resource*>(const_cast<vr::Texture_t*>(texture));
 	const bool isOverlay = handle && IsOverlayRt(handle);
-	if (handle && !isOverlay && VrAriseTail::IsActive() && !VrBoosterTail::OwnsSubmit()) {
-		// Before the world, kMENUBG alpha is all zero. The picture is kTOTAL.
-		ID3D11Resource* hud = VrAriseTail::HasWorldPublish() ?
-			Rt(RE::RENDER_TARGETS::kMENUBG) :
-			Rt(RE::RENDER_TARGETS::kTOTAL);
-		if (hud)
-			VrAriseTail::NoteHud(static_cast<ID3D11Texture2D*>(hud));
+	if (handle && !isOverlay && VrAriseTail::IsActive() && !VrBoosterTail::OwnsSubmit())
 		VrAriseTail::PublishKTemp(static_cast<ID3D11Texture2D*>(handle));
-	}
 
 	// Contract B: swallow vs not-takeover only. Overlay RTs are not a
 	// passthrough. Out of scope this round: HUD/menu is swallowed and not folded into SBS.
 	if (isOverlay) {
-		if (handle == Rt(RE::RENDER_TARGETS::kMENUBG))
-			VrAriseTail::NoteHud(static_cast<ID3D11Texture2D*>(handle));
 		static std::atomic<std::uint32_t> overlaySwallowed{ 0 };
 		const std::uint32_t n = ++overlaySwallowed;
 		if (n <= 16 || (n % 120) == 0)
