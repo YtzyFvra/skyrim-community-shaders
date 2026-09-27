@@ -191,6 +191,15 @@ public:
 	bool BeginCpuPass(std::string_view name);
 	void EndCpuPass();
 
+	/**
+	 * @brief GPU milliseconds measured on another queue. Merged on the next collect.
+	 * @param countInFrameTotal When false, the row is shown but omitted from the frame total.
+	 * @param serial Doorbell frame id. Samples stay queued until that id reports VrAsync::Wall.
+	 */
+	void AddExternalGpuSample(std::string name, float gpuMs, bool countInFrameTotal = true, std::uint64_t serial = 0);
+	/** @brief CPU milliseconds from another thread. Same merge rules as AddExternalGpuSample. */
+	void AddExternalCpuSample(std::string name, float cpuMs, bool countInFrameTotal = true, std::uint64_t serial = 0);
+
 	/** @brief Gets the per-pass timing results from the last collected frame. */
 	const std::vector<TimerResult>& GetResults() const { return results; }
 
@@ -338,6 +347,7 @@ private:
 
 	PerfEventCallback beginPerfEvent;
 	PerfEventCallback endPerfEvent;
+	std::mutex externalMutex;
 
 	std::vector<TimerResult> results;
 
@@ -351,8 +361,20 @@ private:
 		bool activeGpu = false;
 		bool activeCpu = false;
 		float topLevelMs = 0.0f;
+		/// Doorbell rows are not one sample per engine frame. A missing collect
+		/// must not push a zero or the average understates the pass.
+		bool externalOnly = false;
 		uint64_t lastSampleCycle = 0;
 	};
+	struct ExternalSample
+	{
+		std::string name;
+		float ms = 0.0f;
+		bool cpu = false;
+		bool countInFrameTotal = true;
+		std::uint64_t serial = 0;
+	};
+	std::vector<ExternalSample> externalSamples;
 	std::vector<KnownTimer> knownTimers;
 	std::unordered_map<std::string, size_t> knownTimerIndex;
 	uint64_t captureCycleCount = 0;

@@ -27,26 +27,24 @@ namespace VrAriseTail
 	 * slots and Signal one fence. Tail opens the handles on its D3D12 device.
 	 */
 	void PublishKTemp(ID3D11Texture2D* kTemp);
-	/** @brief Game thread: copy kMENUBG into its own shared texture. Not the publish fence. */
-	void NoteHud(ID3D11Texture2D* hud);
-	/** @brief True after a world publish. Before that, kMENUBG alpha is zero. */
-	bool HasWorldPublish();
-	void* HudSharedHandle();
-	void* HudFenceHandle();
-	std::uint64_t HudFenceValue();
+	/** @brief Game thread, UI-composite hook: copy kTEMP. kMENUBG is copied in the same call. */
+	void PublishComposite();
 	/** @brief A frame published nothing since the last success. DLSS/NR must reset. */
 	bool HistoryResetPending();
 	/** @brief Six-pass consumed the pending history reset. */
 	void ClearHistoryReset();
+	/**
+	 * @brief Block the engine until this frame's doorbell releases it.
+	 * Single-thread waits until FSR has submitted. ARISE returns after the input copy.
+	 */
+	void WaitSpPresent();
+	/** @brief Single-thread doorbell: the beat calls this after OpenVR Submit returns. */
+	void ReleaseEngine(std::uint64_t publishFence);
 
-	/** @brief Last doorbell kick-fence wait, in milliseconds. */
-	double LastKickFenceMs();
 	/** @brief Last shared-fence value the game thread signaled. */
 	std::uint64_t LastPublishFence();
-	/** @brief Last shared-fence value PrepareShared consumed. */
+	/** @brief Last shared-fence value the doorbell copy consumed. */
 	std::uint64_t LastConsumedFence();
-	/** @brief Start the tail if VR is up. Safe to call from the tonemap hook. */
-	void EnsureRunning();
 
 	struct Status
 	{
@@ -57,24 +55,6 @@ namespace VrAriseTail
 		int lastWaitErr = 0;
 		int lastSubmitL = 0;
 		int lastSubmitR = 0;
-
-		// Doorbell double-buffer diagnostics (bridge and G paths both feed
-		// this). Correlate a lastSnapshotWaitMs/lastKickWaitMs spike or a
-		// droppedGens increase with "when did it start juddering" in the log.
-		std::uint32_t lastKeepSlot = 0;
-		double lastSnapshotWaitMs = 0.0;
-		double lastKickWaitMs = 0.0;
-		std::uint64_t droppedGens = 0;
-
-		// PrepareShared (X2, D3D11->D3D12 cross-API handoff) failure
-		// tracking. sharedPrepareFails climbing every poll (not just once)
-		// means it's stuck failing every cycle, not a self-corrected hitch.
-		std::uint64_t sharedPrepareFails = 0;
-		const char* lastSharedFailReason = "";
-
-		// Same idea for Snapshot (keep-buffer double-copy before Kick).
-		std::uint64_t snapshotFails = 0;
-		const char* lastSnapshotFailReason = "";
 	};
 
 	/** @brief X1 counters for the menu / devbench. */

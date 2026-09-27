@@ -6,15 +6,20 @@
 #	include "Features/Upscaling.h"
 #	include "Features/Upscaling/FidelityFX.h"
 #	include "Features/Upscaling/VrAriseTail.h"
+#	include "Features/Upscaling/VrPassTimer.h"
+#	include "Features/Upscaling/VrSharedDevice.h"
 #	include "Features/Upscaling/VrBeat/Metronome.h"
 #	include "Features/Upscaling/VrPose/Absolute.h"
 #	include "Globals.h"
+#	include "Utils/FileSystem.h"
 #	include "Utils/Game.h"
 
 #	include <array>
 #	include <atomic>
 #	include <cmath>
+#	include <filesystem>
 #	include <mutex>
+#	include <vector>
 
 #	include <d3dcompiler.h>
 #	include <wrl/client.h>
@@ -23,8 +28,6 @@ using Microsoft::WRL::ComPtr;
 
 namespace
 {
-	constexpr DWORD kFenceWaitMs = 16;
-
 	std::mutex opMutex;
 	ID3D12Device* device = nullptr;
 	ID3D12CommandQueue* queue = nullptr;
@@ -33,6 +36,7 @@ namespace
 	ComPtr<ID3D12Fence> fence;
 	HANDLE fenceEvent = nullptr;
 	UINT64 fenceValue = 0;
+	ID3D12Resource* pairedHud = nullptr;
 	ComPtr<ID3D12Resource> interp;
 	ffx::Context context = nullptr;
 	bool haveContext = false;
@@ -48,6 +52,21 @@ namespace
 	uint64_t dispatches = 0;
 	VrPose::Body prevKick{};
 	std::atomic<bool> fgResetPending{ false };
+	struct StoredView
+	{
+		float right[3]{};
+		float up[3]{};
+		float fwd[3]{};
+		float pos[3]{};
+		float jitterX = 0.0f;
+		float jitterY = 0.0f;
+		float nearZ = 0.15f;
+		float farZ = 2000.0f;
+		float fov = 1.0f;
+		float frameMs = 11.11f;
+		bool valid = false;
+	};
+	StoredView latchedView;
 
 	std::array<float, 4> ToQuaternion(const vr::HmdMatrix34_t& m)
 	{
@@ -282,7 +301,7 @@ namespace
 			return false;
 		if (!globals::game::cameraNear || !globals::game::cameraFar)
 			return false;
-		if (!WaitOwnFence(kFenceWaitMs))
+		if (!WaitOwnFence(INFINITE))
 			return false;
 		if (FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.Get(), nullptr)))
 			return false;
@@ -298,8 +317,8 @@ namespace
 		config.frameGenerationCallbackUserContext = nullptr;
 		config.frameGenerationEnabled = true;
 		config.allowAsyncWorkloads = false;
-		// Dispatch interpolates presentColor. HUDLess is the scene; UI is stamped after.
-		config.HUDLessColor = ffxApiGetResourceDX12(color, FFX_API_RESOURCE_STATE_COMMON);
+		// UI is stamped after dispatch. A HUDLess image equal to the scene extracts nothing.
+		config.HUDLessColor = {};
 		config.flags = FFX_FRAMEGENERATION_FLAG_NO_SWAPCHAIN_CONTEXT_NOTIFY;
 		config.onlyPresentGenerated = false;
 		config.generationRect.left = 0;
@@ -324,30 +343,45 @@ namespace
 				inGuideW, inGuideH, inColorW, inColorH,
 				prepare.motionVectorScale.x, prepare.motionVectorScale.y);
 		}
-		prepare.jitterOffset.x = -upscaling.jitter.x;
-		prepare.jitterOffset.y = -upscaling.jitter.y;
-		prepare.frameTimeDelta = RE::GetSecondsSinceLastFrame() * 1000.f;
-		prepare.cameraNear = *globals::game::cameraNear;
-		prepare.cameraFar = *globals::game::cameraFar;
-		prepare.cameraFovAngleVertical = Util::GetVerticalFOVRad();
+		prepare.jitterOffset.x = latchedView.valid ? latchedView.jitterX : -upscaling.jitter.x;
+		prepare.jitterOffset.y = latchedView.valid ? latchedView.jitterY : -upscaling.jitter.y;
+		prepare.frameTimeDelta = latchedView.valid ? latchedView.frameMs : 11.11f;
+		prepare.cameraNear = latchedView.valid ? latchedView.nearZ : *globals::game::cameraNear;
+		prepare.cameraFar = latchedView.valid ? latchedView.farZ : *globals::game::cameraFar;
+		prepare.cameraFovAngleVertical = latchedView.valid ? latchedView.fov : Util::GetVerticalFOVRad();
 		prepare.viewSpaceToMetersFactor = 0.01428222656f;
 		prepare.depth = ffxApiGetResourceDX12(depth, FFX_API_RESOURCE_STATE_COMMON);
 		prepare.motionVectors = ffxApiGetResourceDX12(mvec, FFX_API_RESOURCE_STATE_COMMON);
 
 		ffx::DispatchDescFrameGenerationPrepareCameraInfo cameraConfig{};
-		auto viewMatrix = globals::game::frameBufferCached.GetCameraViewInverse(0).Transpose();
-		cameraConfig.cameraRight[0] = viewMatrix._11;
-		cameraConfig.cameraRight[1] = viewMatrix._12;
-		cameraConfig.cameraRight[2] = viewMatrix._13;
-		cameraConfig.cameraUp[0] = viewMatrix._21;
-		cameraConfig.cameraUp[1] = viewMatrix._22;
-		cameraConfig.cameraUp[2] = viewMatrix._23;
-		cameraConfig.cameraForward[0] = viewMatrix._31;
-		cameraConfig.cameraForward[1] = viewMatrix._32;
-		cameraConfig.cameraForward[2] = viewMatrix._33;
-		cameraConfig.cameraPosition[0] = globals::game::frameBufferCached.GetCameraPosAdjust(0).x;
-		cameraConfig.cameraPosition[1] = globals::game::frameBufferCached.GetCameraPosAdjust(0).y;
-		cameraConfig.cameraPosition[2] = globals::game::frameBufferCached.GetCameraPosAdjust(0).z;
+		if (latchedView.valid) {
+			cameraConfig.cameraRight[0] = latchedView.right[0];
+			cameraConfig.cameraRight[1] = latchedView.right[1];
+			cameraConfig.cameraRight[2] = latchedView.right[2];
+			cameraConfig.cameraUp[0] = latchedView.up[0];
+			cameraConfig.cameraUp[1] = latchedView.up[1];
+			cameraConfig.cameraUp[2] = latchedView.up[2];
+			cameraConfig.cameraForward[0] = latchedView.fwd[0];
+			cameraConfig.cameraForward[1] = latchedView.fwd[1];
+			cameraConfig.cameraForward[2] = latchedView.fwd[2];
+			cameraConfig.cameraPosition[0] = latchedView.pos[0];
+			cameraConfig.cameraPosition[1] = latchedView.pos[1];
+			cameraConfig.cameraPosition[2] = latchedView.pos[2];
+		} else {
+			auto viewMatrix = globals::game::frameBufferCached.GetCameraViewInverse(0).Transpose();
+			cameraConfig.cameraRight[0] = viewMatrix._11;
+			cameraConfig.cameraRight[1] = viewMatrix._12;
+			cameraConfig.cameraRight[2] = viewMatrix._13;
+			cameraConfig.cameraUp[0] = viewMatrix._21;
+			cameraConfig.cameraUp[1] = viewMatrix._22;
+			cameraConfig.cameraUp[2] = viewMatrix._23;
+			cameraConfig.cameraForward[0] = viewMatrix._31;
+			cameraConfig.cameraForward[1] = viewMatrix._32;
+			cameraConfig.cameraForward[2] = viewMatrix._33;
+			cameraConfig.cameraPosition[0] = globals::game::frameBufferCached.GetCameraPosAdjust(0).x;
+			cameraConfig.cameraPosition[1] = globals::game::frameBufferCached.GetCameraPosAdjust(0).y;
+			cameraConfig.cameraPosition[2] = globals::game::frameBufferCached.GetCameraPosAdjust(0).z;
+		}
 
 		ffx::DispatchDescFrameGeneration generate{};
 		generate.commandList = list.Get();
@@ -371,12 +405,30 @@ namespace
 			return false;
 
 		ID3D12CommandList* lists[]{ list.Get() };
-		queue->ExecuteCommandLists(1, lists);
-		++fenceValue;
-		if (FAILED(queue->Signal(fence.Get(), fenceValue)))
+		HRESULT signalHr = S_OK;
+		const UINT64 signaled = fenceValue + 1;
+		VrSharedDevice::WithQueue([&] {
+			queue->ExecuteCommandLists(1, lists);
+			signalHr = queue->Signal(fence.Get(), signaled);
+		});
+		if (FAILED(signalHr))
 			return false;
+		fenceValue = signaled;
 		++frameID;
-		if (!WaitOwnFence(kFenceWaitMs))
+		float fsrMs = 0.0f;
+		auto waitFsr = [&]() {
+			LARGE_INTEGER freq{};
+			LARGE_INTEGER start{};
+			LARGE_INTEGER end{};
+			QueryPerformanceFrequency(&freq);
+			QueryPerformanceCounter(&start);
+			const bool done = WaitOwnFence(INFINITE);
+			QueryPerformanceCounter(&end);
+			if (freq.QuadPart)
+				fsrMs += static_cast<float>(static_cast<double>(end.QuadPart - start.QuadPart) * 1000.0 / static_cast<double>(freq.QuadPart));
+			return done;
+		};
+		if (!waitFsr())
 			return false;
 		// Same Queue12 as VrBeat::CopyGpuInterp (Tail dx12->queue). In-queue
 		// order already covers this barrier; the second wait is extra.
@@ -392,11 +444,19 @@ namespace
 		if (FAILED(list->Close()))
 			return false;
 		ID3D12CommandList* toCommonLists[]{ list.Get() };
-		queue->ExecuteCommandLists(1, toCommonLists);
-		++fenceValue;
-		if (FAILED(queue->Signal(fence.Get(), fenceValue)))
+		signalHr = S_OK;
+		const UINT64 signaledCommon = fenceValue + 1;
+		VrSharedDevice::WithQueue([&] {
+			queue->ExecuteCommandLists(1, toCommonLists);
+			signalHr = queue->Signal(fence.Get(), signaledCommon);
+		});
+		if (FAILED(signalHr))
 			return false;
-		return WaitOwnFence(kFenceWaitMs);
+		fenceValue = signaledCommon;
+		if (!waitFsr())
+			return false;
+		VrPassTimer::ReportSpan("VrDb::Fsr", fsrMs);
+		return true;
 	}
 }
 
@@ -407,6 +467,34 @@ bool VrFfxOp::Ensure(ID3D12Device* inDevice, ID3D12CommandQueue* inQueue,
 	std::lock_guard lock(opMutex);
 	return EnsureUnlocked(inDevice, inQueue, inColorW, inColorH, inGuideW, inGuideH,
 		inColorFmt, inDepthFmt, inMvecFmt);
+}
+
+void VrFfxOp::NotePairedHud(ID3D12Resource* hud)
+{
+	pairedHud = hud;
+}
+
+void VrFfxOp::NoteLatchedView(const LatchedView& view)
+{
+	latchedView.right[0] = view.right[0];
+	latchedView.right[1] = view.right[1];
+	latchedView.right[2] = view.right[2];
+	latchedView.up[0] = view.up[0];
+	latchedView.up[1] = view.up[1];
+	latchedView.up[2] = view.up[2];
+	latchedView.fwd[0] = view.fwd[0];
+	latchedView.fwd[1] = view.fwd[1];
+	latchedView.fwd[2] = view.fwd[2];
+	latchedView.pos[0] = view.pos[0];
+	latchedView.pos[1] = view.pos[1];
+	latchedView.pos[2] = view.pos[2];
+	latchedView.jitterX = view.jitterX;
+	latchedView.jitterY = view.jitterY;
+	latchedView.nearZ = view.nearZ;
+	latchedView.farZ = view.farZ;
+	latchedView.fov = view.fov;
+	latchedView.frameMs = std::isfinite(view.frameMs) ? std::clamp(view.frameMs, 1.0f, 100.0f) : 11.11f;
+	latchedView.valid = true;
 }
 
 void VrFfxOp::NoteDiscontinuity()
@@ -436,8 +524,16 @@ void VrFfxOp::NoteDiscontinuity()
 				"  float2 uv = (float2(id.xy) + 0.5) / float2(outSize);\n"
 				"  float4 h = Hud.SampleLevel(Samp, uv, 0);\n"
 				"  float4 c = Out[id.xy];\n"
-				"  float a = saturate(h.a);\n"
-				"  c.rgb = c.rgb * (1.0 - a) + h.rgb;\n"
+				// kMENUBG's alpha runs the opposite of the usual "0 =
+				// transparent" convention on this engine: with h.a used
+				// directly, the headset showed solid black everywhere
+				// *except* where UI was on screen, with the scene showing
+				// through *there* instead -- the mirror image of a correct
+				// composite (a bug probe separately showed most of kMENUBG
+				// sampling back near-opaque even off any drawn UI). 1-h.a
+				// matches the engine's own kMENUBG-onto-kTOTAL composite.
+				"  float a = saturate(1.0 - h.a);\n"
+				"  c.rgb = lerp(c.rgb, h.rgb, a);\n"
 				"  c.a = 1.0;\n"
 				"  Out[id.xy] = c;\n"
 				"}\n";
@@ -452,8 +548,19 @@ void VrFfxOp::NoteDiscontinuity()
 			D3D12_DESCRIPTOR_RANGE ranges[2]{};
 			ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
 			ranges[0].NumDescriptors = 1;
+			// Zero-init leaves this at 0 for *both* ranges, which is a
+			// literal offset (not D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND) --
+			// the root signature then believes t0 and u0 both live at
+			// table offset 0, even though the CPU descriptor writes below
+			// put the UAV one slot later. The compute shader's UAV write
+			// (meant for composite/dst) resolved against that wrong offset
+			// and landed back on the SRV's own resource (hudCopy) instead,
+			// which is why it came back solid black after StampOne despite
+			// only ever being bound read-only.
+			ranges[0].OffsetInDescriptorsFromTableStart = 0;
 			ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
 			ranges[1].NumDescriptors = 1;
+			ranges[1].OffsetInDescriptorsFromTableStart = 1;
 			D3D12_ROOT_PARAMETER params[2]{};
 			params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
 			params[0].DescriptorTable.NumDescriptorRanges = 2;
@@ -486,7 +593,15 @@ void VrFfxOp::NoteDiscontinuity()
 			if (FAILED(device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&heap))))
 				return false;
 		}
-		if (!WaitOwnFence(kFenceWaitMs) || FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.Get(), nullptr)))
+		if (!WaitOwnFence(INFINITE)) {
+			static bool loggedOwn = false;
+			if (!loggedOwn) {
+				loggedOwn = true;
+				logger::warn("[VrFfxOp] HUD stamp skipped: own fence not ready");
+			}
+			return false;
+		}
+		if (FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.Get(), nullptr)))
 			return false;
 		D3D12_RESOURCE_BARRIER toUav{};
 		toUav.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -495,6 +610,13 @@ void VrFfxOp::NoteDiscontinuity()
 		toUav.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
 		toUav.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 		list->ResourceBarrier(1, &toUav);
+		D3D12_RESOURCE_BARRIER hudToRead{};
+		hudToRead.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+		hudToRead.Transition.pResource = hud;
+		hudToRead.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+		hudToRead.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+		hudToRead.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+		list->ResourceBarrier(1, &hudToRead);
 		const UINT inc = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 		D3D12_CPU_DESCRIPTOR_HANDLE cpu = heap->GetCPUDescriptorHandleForHeapStart();
 		D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc{};
@@ -516,6 +638,10 @@ void VrFfxOp::NoteDiscontinuity()
 		const UINT constants[4]{ outW, outH, hudW, hudH };
 		list->SetComputeRoot32BitConstants(1, 4, constants, 0);
 		list->Dispatch((outW + 7) / 8, (outH + 7) / 8, 1);
+		D3D12_RESOURCE_BARRIER hudToCommon = hudToRead;
+		hudToCommon.Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+		hudToCommon.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+		list->ResourceBarrier(1, &hudToCommon);
 		D3D12_RESOURCE_BARRIER toCommon = toUav;
 		toCommon.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
 		toCommon.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
@@ -523,121 +649,18 @@ void VrFfxOp::NoteDiscontinuity()
 		if (FAILED(list->Close()))
 			return false;
 		ID3D12CommandList* lists[]{ list.Get() };
-		queue->ExecuteCommandLists(1, lists);
-		++fenceValue;
-		if (FAILED(queue->Signal(fence.Get(), fenceValue)))
+		HRESULT signalHr = S_OK;
+		const UINT64 signaled = fenceValue + 1;
+		VrSharedDevice::WithQueue([&] {
+			queue->ExecuteCommandLists(1, lists);
+			signalHr = queue->Signal(fence.Get(), signaled);
+		});
+		if (FAILED(signalHr))
 			return false;
-		return WaitOwnFence(kFenceWaitMs);
-	}
-
-	bool LogStampedPixel(ID3D12Resource* src, UINT x, UINT y)
-	{
-		if (!src || !device || !queue || !list || !allocator)
+		fenceValue = signaled;
+		if (!WaitOwnFence(INFINITE))
 			return false;
-		ComPtr<ID3D12Resource> readback;
-		D3D12_HEAP_PROPERTIES heap{};
-		heap.Type = D3D12_HEAP_TYPE_READBACK;
-		D3D12_RESOURCE_DESC buffer{};
-		buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-		buffer.Width = 256;
-		buffer.Height = 1;
-		buffer.DepthOrArraySize = 1;
-		buffer.MipLevels = 1;
-		buffer.Format = DXGI_FORMAT_UNKNOWN;
-		buffer.SampleDesc.Count = 1;
-		buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-		if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer,
-				D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback))))
-			return false;
-		if (!WaitOwnFence(kFenceWaitMs) || FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.Get(), nullptr)))
-			return false;
-		D3D12_RESOURCE_BARRIER toCopy{};
-		toCopy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-		toCopy.Transition.pResource = src;
-		toCopy.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
-		toCopy.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-		toCopy.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-		list->ResourceBarrier(1, &toCopy);
-		D3D12_TEXTURE_COPY_LOCATION dstLoc{};
-		dstLoc.pResource = readback.Get();
-		dstLoc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-		D3D12_RESOURCE_DESC srcDesc = src->GetDesc();
-		device->GetCopyableFootprints(&srcDesc, 0, 1, 0, &dstLoc.PlacedFootprint, nullptr, nullptr, nullptr);
-		dstLoc.PlacedFootprint.Footprint.Width = 1;
-		dstLoc.PlacedFootprint.Footprint.Height = 1;
-		D3D12_TEXTURE_COPY_LOCATION srcLoc{};
-		srcLoc.pResource = src;
-		srcLoc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-		D3D12_BOX box{ x, y, 0, x + 1, y + 1, 1 };
-		list->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, &box);
-		D3D12_RESOURCE_BARRIER back = toCopy;
-		back.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
-		back.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
-		list->ResourceBarrier(1, &back);
-		if (FAILED(list->Close()))
-			return false;
-		ID3D12CommandList* lists[]{ list.Get() };
-		queue->ExecuteCommandLists(1, lists);
-		++fenceValue;
-		if (FAILED(queue->Signal(fence.Get(), fenceValue)) || !WaitOwnFence(kFenceWaitMs))
-			return false;
-		void* mapped = nullptr;
-		if (FAILED(readback->Map(0, nullptr, &mapped)) || !mapped)
-			return false;
-		const auto* px = static_cast<const std::uint8_t*>(mapped);
-		logger::info("[VrFfxOp] HUD stamp readback tex={} px={},{} rgba={},{},{},{}",
-			static_cast<void*>(src), x, y, px[0], px[1], px[2], px[3]);
-		readback->Unmap(0, nullptr);
 		return true;
-	}
-
-	void StampHud(ID3D12Resource* generated, ID3D12Resource* scene, UINT outW, UINT outH)
-	{
-		const UINT64 want = VrAriseTail::HudFenceValue();
-		void* texHandle = VrAriseTail::HudSharedHandle();
-		void* fenceHandle = VrAriseTail::HudFenceHandle();
-		if (!want || !texHandle || !fenceHandle || !device || !queue || !list)
-			return;
-		static ComPtr<ID3D12Resource> hud12;
-		static ComPtr<ID3D12Fence> hudFence12;
-		static void* openedTex = nullptr;
-		static void* openedFence = nullptr;
-		static HANDLE hudEvent = nullptr;
-		static bool logged = false;
-		if (openedTex != texHandle || openedFence != fenceHandle) {
-			hud12.Reset();
-			hudFence12.Reset();
-			openedTex = nullptr;
-			openedFence = nullptr;
-			if (FAILED(device->OpenSharedHandle(static_cast<HANDLE>(texHandle), IID_PPV_ARGS(&hud12))) ||
-				FAILED(device->OpenSharedHandle(static_cast<HANDLE>(fenceHandle), IID_PPV_ARGS(&hudFence12))))
-				return;
-			openedTex = texHandle;
-			openedFence = fenceHandle;
-		}
-		if (!hudEvent)
-			hudEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-		if (!hudEvent)
-			return;
-		ResetEvent(hudEvent);
-		if (hudFence12->GetCompletedValue() < want) {
-			if (FAILED(hudFence12->SetEventOnCompletion(want, hudEvent)) ||
-				WaitForSingleObject(hudEvent, kFenceWaitMs) != WAIT_OBJECT_0)
-				return;
-		}
-		const UINT hudW = static_cast<UINT>(hud12->GetDesc().Width);
-		const UINT hudH = hud12->GetDesc().Height;
-		const bool sceneOk = StampOne(scene, hud12.Get(), outW, outH, hudW, hudH);
-		const bool genOk = StampOne(generated, hud12.Get(), outW, outH, hudW, hudH);
-		if (!logged && (sceneOk || genOk)) {
-			logged = true;
-			logger::info("[VrFfxOp] HUD stamp {}x{} onto {}x{} scene={} gen={} submitTex={}",
-				hudW, hudH, outW, outH, sceneOk ? 1 : 0, genOk ? 1 : 0,
-				static_cast<void*>(scene));
-		}
-		static bool loggedPixel = false;
-		if (sceneOk && scene && !loggedPixel)
-			loggedPixel = LogStampedPixel(scene, outW / 4, outH / 2);
 	}
 
 bool VrFfxOp::OnDbFinalColor(ID3D12Resource* color, ID3D12Resource* depth, ID3D12Resource* mvec,
@@ -667,7 +690,31 @@ bool VrFfxOp::OnDbFinalColor(ID3D12Resource* color, ID3D12Resource* depth, ID3D1
 	if (dispatches <= 8 || (dispatches % 120) == 0)
 		logger::info("[VrFfxOp] dispatch {:.2f} ms ok={}", ms, dispatchOk ? 1 : 0);
 
-	StampHud(dispatchOk ? interp.Get() : nullptr, color, inColorW, inColorH);
+	// Composite the HUD onto what's actually about to be submitted. FSR's
+	// own dispatch already ran on the HUD-free color/depth/mvec above
+	// (interp was generated from pure scene motion; baking the HUD in
+	// before that would have handed FSR's motion estimation static UI
+	// pixels to warp, ghosting the HUD in the generated frame), so this
+	// must run after DispatchUnlocked and before either buffer leaves this
+	// function. pairedHud is read-only here (SRV bind inside StampOne), so
+	// it is safe to read the Doorbell-owned keepHud directly.
+	if (pairedHud) {
+		const D3D12_RESOURCE_DESC hudDesc = pairedHud->GetDesc();
+		const UINT hudW = static_cast<UINT>(hudDesc.Width);
+		const UINT hudH = hudDesc.Height;
+		LARGE_INTEGER hudFreq{};
+		LARGE_INTEGER hudStart{};
+		LARGE_INTEGER hudEnd{};
+		QueryPerformanceFrequency(&hudFreq);
+		QueryPerformanceCounter(&hudStart);
+		if (dispatchOk && cur.valid)
+			StampOne(interp.Get(), pairedHud, inColorW, inColorH, hudW, hudH);
+		StampOne(color, pairedHud, inColorW, inColorH, hudW, hudH);
+		QueryPerformanceCounter(&hudEnd);
+		if (hudFreq.QuadPart)
+			VrPassTimer::ReportSpan("VrDb::Hud", static_cast<float>(
+				static_cast<double>(hudEnd.QuadPart - hudStart.QuadPart) * 1000.0 / static_cast<double>(hudFreq.QuadPart)));
+	}
 
 	const std::uint64_t pair = VrBeat::NextPair();
 	if (dispatchOk && cur.valid) {
@@ -698,11 +745,10 @@ bool VrFfxOp::OnDbFinalColor(ID3D12Resource* color, ID3D12Resource* depth, ID3D1
 		const bool fullTd = tdW && tdH && inColorW == tdW && inColorH == tdH;
 		const auto& fov = globals::features::upscaling.foveatedRender;
 		const double engineMs = RE::GetSecondsSinceLastFrame() * 1000.0;
-		logger::info("[VrFfxOp] pace dispatch={:.2f} ms color={}x{} td={} nr={} q={} engine={:.1f} ms kickFence={:.2f} copyFence={:.2f} want={} consumed={}",
+		logger::info("[VrFfxOp] pace dispatch={:.2f} ms color={}x{} td={} nr={} q={} engine={:.1f} ms want={} consumed={}",
 			ms, inColorW, inColorH, fullTd ? 1 : 0,
 			fov.settings.neuralRenderingEnabled ? 1 : 0, fov.GetQualityModeAtBoot(),
-			engineMs, VrAriseTail::LastKickFenceMs(), VrBeat::LastCopyFenceMs(),
-			VrAriseTail::LastPublishFence(), VrAriseTail::LastConsumedFence());
+			engineMs, VrAriseTail::LastPublishFence(), VrAriseTail::LastConsumedFence());
 	}
 	return copied;
 }

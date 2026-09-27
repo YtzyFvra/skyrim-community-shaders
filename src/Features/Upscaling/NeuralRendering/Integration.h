@@ -1,5 +1,7 @@
 #pragma once
 
+#include "Features/Upscaling/FoveatedRender.h"
+
 #include <cstdint>
 #include <d3d11.h>
 
@@ -16,6 +18,8 @@ namespace NeuralRendering
 	bool ApplyFoveatedLdr();
 	/** VR: after ISHDR Tonemap, read kTEMP, run per-eye 8-pass, Submit ourselves. */
 	bool ApplyVrAfterTonemap();
+	/** Keeps VR ACT1 inside the NGX range for the DX12 doorbell. */
+	void ReconcileVrAct1Plan(FoveatedRender::FlatPipelinePlan& plan);
 	/** Owned SBS: both eyes from kTEMP half-eye (TD = E on this cut). */
 	bool GetVrOwnedEyeSizes(uint32_t& renderW, uint32_t& renderH, uint32_t& displayW, uint32_t& displayH);
 	/** Private SBS packed after a successful owned Submit; null if that frame fell back. */

@@ -33,6 +33,25 @@ namespace VrFfxOp
 	 */
 	void NoteDiscontinuity();
 
+	/** @brief HUD already copied off the color slot this Kick is using. Null if that publish had none. */
+	void NotePairedHud(ID3D12Resource* hud);
+
+	/** @brief Camera and frame length captured with this publish, not read later. */
+	struct LatchedView
+	{
+		float right[3]{};
+		float up[3]{};
+		float fwd[3]{};
+		float pos[3]{};
+		float jitterX = 0.0f;
+		float jitterY = 0.0f;
+		float nearZ = 0.15f;
+		float farZ = 2000.0f;
+		float fov = 1.0f;
+		float frameMs = 11.11f;
+	};
+	void NoteLatchedView(const LatchedView& view);
+
 	/** @brief Tear down context and GPU objects. Idempotent; may run off the doorbell thread. */
 	void Shutdown();
 }

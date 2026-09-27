@@ -41,6 +41,7 @@ namespace NeuralRendering
 			D3D12_RESOURCE_STATES outputState = D3D12_RESOURCE_STATE_COMMON;
 			D3D12_RESOURCE_STATES depthState = D3D12_RESOURCE_STATE_COMMON;
 			D3D12_RESOURCE_STATES motionVectorState = D3D12_RESOURCE_STATE_COMMON;
+			bool colorBuffersHDR = true;
 		};
 
 		struct Statistics

@@ -1,4 +1,5 @@
 #include "D3D12Interop.h"
+#include "Features/Upscaling/VrSharedDevice.h"
 
 #include "Utils/D3D.h"
 
@@ -26,17 +27,14 @@ namespace NeuralRendering
 		if (FAILED(result)) return RecordFailure(result);
 		result = context->QueryInterface(IID_PPV_ARGS(&context11_));
 		if (FAILED(result)) return RecordFailure(result);
-		result = D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&device12_));
-		if (FAILED(result)) return RecordFailure(result);
+		ID3D12Device* shared = VrSharedDevice::Get(adapter);
+		ID3D12CommandQueue* sharedQueue = VrSharedDevice::Queue(adapter);
+		if (!shared || !sharedQueue)
+			return RecordFailure(E_FAIL);
+		device12_ = shared;
+		queue12_ = sharedQueue;
+		queue12Eye_ = sharedQueue;
 
-		D3D12_COMMAND_QUEUE_DESC queueDesc{};
-		queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-		result = device12_->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&queue12_));
-		if (FAILED(result)) return RecordFailure(result);
-		result = device12_->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&queue12Eye_));
-		if (FAILED(result)) return RecordFailure(result);
-		queue12_->SetName(L"NeuralRendering::Queue0");
-		queue12Eye_->SetName(L"NeuralRendering::Queue1");
 		result = queue12_->GetTimestampFrequency(&timestampFrequency_);
 		if (FAILED(result) || !timestampFrequency_) return RecordFailure(FAILED(result) ? result : E_FAIL);
 		D3D12_QUERY_HEAP_DESC queryDesc{};

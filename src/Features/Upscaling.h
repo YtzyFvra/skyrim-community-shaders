@@ -92,8 +92,6 @@ public:
 		// Generated frames per real frame (1=2x). Clamped at apply time to the
 		// hardware-reported DLSSGState::numFramesToGenerateMax.
 		uint dlssgFramesToGenerate = 1;
-		// VR owned-Submit test. 0 = form 1 (engine Submit). Runtime; VR menu only.
-		uint vrSubmitTest = 0;
 		// VR ARISE Tail owns WaitGetPoses + Submit. Restart-gated; do not flip useArise.
 		bool vrArise = false;
 		// VR G master. Hot. On = eOn + G chain. Off = eOff + bridge.

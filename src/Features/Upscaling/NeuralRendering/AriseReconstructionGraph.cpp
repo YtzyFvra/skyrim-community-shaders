@@ -1,5 +1,7 @@
 #include "AriseReconstructionGraph.h"
 
+#include "../VrPassTimer.h"
+
 #include "Renderer.h"
 #include "Utils/Game.h"
 
@@ -469,6 +471,7 @@ Destination[p]=float4((lobe*(b+d+f+h)+e)/(4*lobe+1),1);})";
 			std::uint32_t act1Width = plan.sceneInputWidth;
 			std::uint32_t act1Height = plan.sceneInputHeight;
 			bool act1DlssSucceeded = false;
+			VrPassTimer::Mark(list, "VrDb::DlssSr");
 			if (plan.renderDocReplacement && plan.act1 == Act1Backend::kDLSS) {
 				act1DlssSucceeded = DispatchResample(list, slot, inputs.scene, slot.act1Dlss.Get(),
 					plan.sceneInputWidth, plan.sceneInputHeight, plan.act1OutputWidth, plan.act1OutputHeight,
@@ -481,7 +484,8 @@ Destination[p]=float4((lobe*(b+d+f+h)+e)/(4*lobe+1),1);})";
 					.quality = plan.act1Quality, .preset = plan.act1Preset, .reset = plan.reset,
 					.camera = plan.act1Camera,
 					.color = inputs.scene, .output = slot.act1Dlss.Get(), .depth = inputs.depth,
-					.motionVectors = inputs.motionVectors });
+					.motionVectors = inputs.motionVectors,
+					.colorBuffersHDR = plan.colorBuffersHDR });
 			}
 			if (act1DlssSucceeded) {
 				act1Color = slot.act1Dlss.Get();
@@ -496,19 +500,23 @@ Destination[p]=float4((lobe*(b+d+f+h)+e)/(4*lobe+1),1);})";
 			const DXGI_FORMAT act1Format = act1Color == slot.act1Dlss.Get() ? kColorFormat :
 				SrvFormat(inputs.scene->GetDesc().Format);
 			ID3D12PipelineState* downsample = plan.act1Downsample == 1 ? resampleTent.Get() : resample.Get();
+			ID3D12Resource* finalColor = nullptr;
+			ID3D12Resource* act2Rc = nullptr;
+			bool nrSucceeded = false;
+			bool fusionSucceeded = false;
 			if (!plan.requested) {
+				// No NR: the SR image is larger than D. Downsample it to D, then ACT3 and RCAS.
+				VrPassTimer::Mark(list, "VrDb::ToD");
 				if (!DispatchResample(list, slot, act1Color, slot.displayA.Get(), act1Width, act1Height,
 						plan.displayWidth, plan.displayHeight, act1Format, kColorFormat, downsample)) {
 					++failed;
 					return result;
 				}
-				ID3D12Resource* finalColor = slot.displayA.Get();
-				if (plan.sharpen && DispatchRcas(list, slot, finalColor, slot.displayB.Get(), plan))
-					finalColor = slot.displayB.Get();
-				activePath.store(plan.sharpen ? 2u : 1u, std::memory_order_relaxed);
-				result = { finalColor, D3D12_RESOURCE_STATE_COMMON, true };
-				return result;
-			}
+				++lanczos;
+				finalColor = slot.displayA.Get();
+				act2Rc = finalColor;
+			} else {
+			VrPassTimer::Mark(list, "VrDb::ToN");
 			if (!DispatchResample(list, slot, act1Color, slot.colorN.Get(), act1Width, act1Height,
 					plan.nrWidth, plan.nrHeight, act1Format, kColorFormat, downsample) ||
 				!DispatchResizeGuides(list, slot, inputs.depth, inputs.motionVectors, slot.depthN.Get(), slot.motionN.Get(),
@@ -518,7 +526,7 @@ Destination[p]=float4((lobe*(b+d+f+h)+e)/(4*lobe+1),1);})";
 				return result;
 			}
 			++lanczos;
-			bool nrSucceeded = false;
+			VrPassTimer::Mark(list, "VrDb::Nr");
 			if (plan.renderDocReplacement) {
 				nrSucceeded = DispatchResample(list, slot, slot.colorN.Get(), slot.neuralN.Get(),
 					plan.nrWidth, plan.nrHeight, plan.nrWidth, plan.nrHeight, kColorFormat, kColorFormat);
@@ -545,7 +553,8 @@ Destination[p]=float4((lobe*(b+d+f+h)+e)/(4*lobe+1),1);})";
 				++fallback;
 			}
 			const bool identityDisplay = plan.nrWidth == plan.displayWidth && plan.nrHeight == plan.displayHeight;
-			ID3D12Resource* finalColor = neural;
+			finalColor = neural;
+			VrPassTimer::Mark(list, "VrDb::ToD");
 			if (!identityDisplay) {
 				if (!DispatchResample(list, slot, neural, slot.displayA.Get(), plan.nrWidth, plan.nrHeight,
 						plan.displayWidth, plan.displayHeight, kColorFormat, kColorFormat,
@@ -567,14 +576,15 @@ Destination[p]=float4((lobe*(b+d+f+h)+e)/(4*lobe+1),1);})";
 						.quality = plan.act2Quality, .preset = plan.act2Preset, .reset = plan.reset,
 						.camera = plan.act2Camera,
 						.color = neural, .output = slot.act2Dlss.Get(), .depth = slot.depthN.Get(),
-						.motionVectors = slot.motionN.Get() }))
+						.motionVectors = slot.motionN.Get(),
+						.colorBuffersHDR = plan.colorBuffersHDR }))
 						finalColor = slot.act2Dlss.Get();
 					else
 						++fallback;
 				}
 			}
-			ID3D12Resource* act2Rc = finalColor;
-			bool fusionSucceeded = false;
+			act2Rc = finalColor;
+			VrPassTimer::Mark(list, "VrDb::Guidance");
 			if (plan.fusionEnabled) {
 				ID3D12Resource* referenceG = act1DlssSucceeded ? slot.act1Dlss.Get() : slot.referenceD.Get();
 				const std::uint32_t referenceWidth = act1DlssSucceeded ? plan.act1OutputWidth : plan.displayWidth;
@@ -600,9 +610,11 @@ Destination[p]=float4((lobe*(b+d+f+h)+e)/(4*lobe+1),1);})";
 					++fallback;
 				}
 			}
-			const bool act3OwnGuidance = plan.act3.enabled && plan.act3.guidanceEnabled;
+			}
+			const bool act3OwnGuidance = plan.act3.enabled && plan.act3.guidanceEnabled && plan.requested;
 			bool rcasSucceeded = false;
 			auto applyRcas = [&]() {
+				VrPassTimer::Mark(list, "VrDb::Rcas");
 				ID3D12Resource* target = finalColor == slot.displayA.Get() ? slot.displayB.Get() : slot.displayA.Get();
 				if (DispatchRcas(list, slot, finalColor, target, plan)) {
 					finalColor = target;
@@ -617,6 +629,7 @@ Destination[p]=float4((lobe*(b+d+f+h)+e)/(4*lobe+1),1);})";
 			if (plan.sharpen && !act3OwnGuidance)
 				applyRcas();
 			if (plan.act3.enabled && plan.act3.cropWidth >= 8 && plan.act3.cropHeight >= 8) {
+				VrPassTimer::Mark(list, "VrDb::Act3");
 				if (act3OwnGuidance && !plan.fusionEnabled) {
 					const bool spatialAct2 = plan.act2Sr == Act2SrBackend::kLanczos || plan.act2Sr == Act2SrBackend::kTent ||
 						plan.act2Sr == Act2SrBackend::kMitchell || plan.act2Sr == Act2SrBackend::kEasu;

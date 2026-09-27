@@ -225,14 +225,12 @@ void FoveatedRender::UICompositeRenderHook::thunk(void* imageSpaceShader, RE::BS
 	// One point, before the engine blends kMENUBG onto kTOTAL: world image,
 	// depth, motion, and the HUD are all still the frames just drawn.
 	if (globals::game::isVR) {
-		NeuralRendering::ApplyVrAfterTonemap();
-		if (VrAriseTail::IsActive() && globals::game::renderer) {
-			auto* menu = globals::game::renderer->GetRuntimeData()
-							 .renderTargets[RE::RENDER_TARGETS::kMENUBG]
-							 .texture;
-			if (menu)
-				VrAriseTail::NoteHud(static_cast<ID3D11Texture2D*>(menu));
-		}
+		if (VrAriseTail::IsActive()) {
+			// kMENUBG is complete here. Publish copies it with kTEMP; DX12 draws the doorbell.
+			VrAriseTail::PublishComposite();
+			VrAriseTail::WaitSpPresent();
+		} else
+			NeuralRendering::ApplyVrAfterTonemap();
 	}
 #endif
 	func(imageSpaceShader, shape, param);
@@ -1330,12 +1328,25 @@ void FoveatedRender::DrawLogicalPerfModeControls()
 {
 	if (globals::game::isVR) {
 		auto& upscaling = globals::features::upscaling;
-		if (ImGui::Checkbox(T(TKEY("pipeline_single_thread"), "Single-thread PerfMode"), &settings.singleThreadPerfMode) &&
-			settings.singleThreadPerfMode)
+		int mode = settings.ariseModel3 ? 1 : (settings.singleThreadPerfMode ? 0 : -1);
+		if (ImGui::RadioButton(T(TKEY("pipeline_single_thread"), "Single-thread PerfMode"), mode == 0)) {
 			settings.ariseModel3 = false;
+			settings.singleThreadPerfMode = true;
+		}
+		if (ImGui::RadioButton(T(TKEY("pipeline_arise"), "ARISE Async PerfMode"), mode == 1)) {
+			settings.ariseModel3 = true;
+			settings.singleThreadPerfMode = false;
+		}
 		Util::UI::RestartGatedAnnotate(bootSnapshot, settings, &Settings::singleThreadPerfMode,
 			T(TKEY("pipeline_vr_logical_restart"),
-				"Engine RTs allocate at logical R from the ACT1 preset, HMD size, and SRSS. Submit stays at the HMD size. Restart required."));
+				"Single-thread: the engine waits at the hook until FSR has submitted. Restart required."));
+		Util::UI::RestartGatedAnnotate(bootSnapshot, settings, &Settings::ariseModel3,
+			T(TKEY("pipeline_vr_arise_restart"),
+				"ARISE: the engine returns after the input copy. FSR keeps running on the doorbell. Restart required."));
+		bootSnapshot.LatchIfNeeded(settings);
+		ImGui::TextDisabled("%s", bootSnapshot.Boot(&Settings::ariseModel3) ?
+			T(TKEY("pipeline_active_arise"), "Active this session: ARISE asynchronous Tail") :
+			T(TKEY("pipeline_active_single_thread"), "Active this session: Single-thread synchronous Tail"));
 		if (upscaling.perfMode.IsLogicalEyeActive())
 			ImGui::TextDisabled(T(TKEY("pipeline_vr_logical_active"),
 				"Active: engine R %ux%u per eye, submit TD %ux%u"),

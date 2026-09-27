@@ -5,6 +5,9 @@
 
 #	include "../../../GpuPass.h"
 #	include "../../../Utils/WinApi.h"
+#	include "../VrAriseTail.h"
+#	include "../VrPassTimer.h"
+#	include "../VrSharedDevice.h"
 
 #	include <atomic>
 #	include <chrono>
@@ -23,11 +26,9 @@
 namespace
 {
 	std::atomic<bool> running{ false };
-	std::atomic<bool> ownsWait{ false };
 	std::atomic<bool> firstSubmit{ false };
 	std::atomic<DWORD> beatThreadId{ 0 };
 
-	std::mutex waitGate;
 	std::mutex mailboxMutex;
 	std::mutex statusMutex;
 	std::atomic<bool> ocPeriodOpen{ false };
@@ -65,12 +66,27 @@ namespace
 	UINT interpH = 0;
 	DXGI_FORMAT interpFmt = DXGI_FORMAT_UNKNOWN;
 	std::atomic<bool> gInterpPending{ false };
+	std::atomic<std::uint64_t> mailSerial{ 0 };
+	std::atomic<std::uint64_t> mailDone{ 0 };
+	std::mutex mailDoneMutex;
+	std::condition_variable mailDoneCv;
 	std::atomic<uint64_t> pairSeq{ 0 };
 	std::atomic<uint64_t> interpPair{ 0 };
 	std::mutex interpPoseMutex;
 	vr::HmdMatrix34_t interpPose{};
 
+	struct PendingSpan
+	{
+		std::int64_t start = 0;
+		std::uint64_t serial = 0;
+		std::uint64_t publishFence = 0;
+		bool armed = false;
+		bool releaseAfterSubmit = false;
+	};
+	PendingSpan pendingSpan;
+
 	using SetEnqueueKindFn = void (*)(int);
+	using SetEnqueuePairFn = void (*)(std::uint64_t);
 	SetEnqueueKindFn ResolveSetEnqueueKind()
 	{
 		static SetEnqueueKindFn fn = []() -> SetEnqueueKindFn {
@@ -88,6 +104,25 @@ namespace
 	{
 		if (auto fn = ResolveSetEnqueueKind())
 			fn(kind);
+	}
+
+	SetEnqueuePairFn ResolveSetEnqueuePair()
+	{
+		static SetEnqueuePairFn fn = []() -> SetEnqueuePairFn {
+			HMODULE module = GetModuleHandleW(L"openvr_api.dll");
+			if (!module)
+				module = GetModuleHandleW(L"vrclient_x64.dll");
+			if (!module)
+				return nullptr;
+			return reinterpret_cast<SetEnqueuePairFn>(GetProcAddress(module, "OC_L1_SetNextEnqueuePair"));
+		}();
+		return fn;
+	}
+
+	void SetOcEnqueuePair(std::uint64_t pair)
+	{
+		if (auto fn = ResolveSetEnqueuePair())
+			fn(pair);
 	}
 
 	using InterpAllowedFn = int (*)();
@@ -142,29 +177,17 @@ namespace
 		return copyEvent != nullptr;
 	}
 
-	std::atomic<double> lastCopyFenceMs{ 0.0 };
-
 	bool WaitCopyDone()
 	{
 		if (!copyFence || copyFenceValue == 0)
 			return true;
-		LARGE_INTEGER freq{}, start{}, end{};
-		QueryPerformanceFrequency(&freq);
-		QueryPerformanceCounter(&start);
-		if (copyFence->GetCompletedValue() >= copyFenceValue) {
-			lastCopyFenceMs.store(0.0, std::memory_order_relaxed);
+		if (copyFence->GetCompletedValue() >= copyFenceValue)
 			return true;
-		}
 		if (!copyEvent || FAILED(copyFence->SetEventOnCompletion(copyFenceValue, copyEvent)))
 			return false;
-		// Unbounded wait here is the doorbell thread going silent for the whole stall.
 		const bool done = WaitForSingleObject(copyEvent, 1000) == WAIT_OBJECT_0;
-		QueryPerformanceCounter(&end);
-		const double ms = freq.QuadPart ?
-			(static_cast<double>(end.QuadPart - start.QuadPart) * 1000.0 / static_cast<double>(freq.QuadPart)) : 0.0;
-		lastCopyFenceMs.store(ms, std::memory_order_relaxed);
 		if (!done)
-			logger::warn("[VrBeat] copy fence timeout {:.0f} ms", ms);
+			logger::warn("[VrBeat] copy fence timeout");
 		return done;
 	}
 
@@ -399,13 +422,8 @@ namespace
 		const vr::VRTextureBounds_t full{ 0.f, 0.f, 1.f, 1.f };
 		const vr::VRTextureBounds_t leftSbs{ 0.f, 0.f, 0.5f, 1.f };
 		const vr::VRTextureBounds_t rightSbs{ 0.5f, 0.f, 1.f, 1.f };
-		vr::HmdMatrix34_t pose{};
-		bool poseValid = false;
-		{
-			std::lock_guard lock(submitPoseMutex);
-			pose = submitPose;
-			poseValid = submitPoseValid;
-		}
+		vr::HmdMatrix34_t pose = frame.pose;
+		const bool poseValid = frame.poseValid;
 		if (!frame.queue12 || !frame.left12 || !frame.right12)
 			return false;
 		if (!poseValid) {
@@ -425,7 +443,9 @@ namespace
 			tex.eType = vr::TextureType_DirectX12;
 			tex.eColorSpace = vr::ColorSpace_Auto;
 			tex.mDeviceToAbsoluteTracking = pose;
-			err = openvr->Submit(eyeIndex, &tex, &bounds, vr::Submit_TextureWithPose);
+			VrSharedDevice::WithQueue([&] {
+				err = openvr->Submit(eyeIndex, &tex, &bounds, vr::Submit_TextureWithPose);
+			});
 		};
 		if (frame.sbs) {
 			submitOne(vr::Eye_Left, frame.left12, leftSbs, errL);
@@ -437,10 +457,28 @@ namespace
 		return true;
 	}
 
+	void WaitMailWritable()
+	{
+		const std::uint64_t published = mailSerial.load(std::memory_order_acquire);
+		if (mailDone.load(std::memory_order_acquire) >= published)
+			return;
+		std::unique_lock lock(mailDoneMutex);
+		mailDoneCv.wait(lock, [&] {
+			return mailDone.load(std::memory_order_acquire) >= published;
+		});
+	}
+
+	void FinishMail()
+	{
+		mailDone.store(mailSerial.load(std::memory_order_acquire), std::memory_order_release);
+		mailDoneCv.notify_all();
+	}
+
 	bool CopyGpuInterp(ID3D12Resource* src, UINT width, UINT height, DXGI_FORMAT format)
 	{
 		if (!src || !gpuQueue || !EnsureCopyList() || !EnsureInterpSbs(width, height, format))
 			return false;
+		WaitMailWritable();
 		if (!WaitCopyDone())
 			return false;
 		// Same copyList/copyAlloc/copyFence as CopyGpu -- calls here and
@@ -457,22 +495,21 @@ namespace
 		if (FAILED(copyList->Close()))
 			return false;
 		ID3D12CommandList* lists[]{ copyList.Get() };
-		gpuQueue->ExecuteCommandLists(1, lists);
 		++copyFenceValue;
-		gpuQueue->Signal(copyFence.Get(), copyFenceValue);
+		const UINT64 signaled = copyFenceValue;
+		VrSharedDevice::WithQueue([&] {
+			gpuQueue->ExecuteCommandLists(1, lists);
+			gpuQueue->Signal(copyFence.Get(), signaled);
+		});
 		return WaitCopyDone();
 	}
 
-	void SubmitInterpFrame(vr::IVRCompositor* openvr, vr::EVRCompositorError& errL, vr::EVRCompositorError& errR)
+	void SubmitInterpFrame(vr::IVRCompositor* openvr, const vr::HmdMatrix34_t& pose,
+		vr::EVRCompositorError& errL, vr::EVRCompositorError& errR)
 	{
 		// No CS_GPU_PASS: see the identical note in SubmitFrame.
 		const vr::VRTextureBounds_t leftSbs{ 0.f, 0.f, 0.5f, 1.f };
 		const vr::VRTextureBounds_t rightSbs{ 0.5f, 0.f, 1.f, 1.f };
-		vr::HmdMatrix34_t pose{};
-		{
-			std::lock_guard lock(interpPoseMutex);
-			pose = interpPose;
-		}
 		if (!gpuQueue || !interpSbs)
 			return;
 		auto submitOne = [&](vr::EVREye eyeIndex, const vr::VRTextureBounds_t& bounds, vr::EVRCompositorError& err) {
@@ -484,7 +521,9 @@ namespace
 			tex.eType = vr::TextureType_DirectX12;
 			tex.eColorSpace = vr::ColorSpace_Auto;
 			tex.mDeviceToAbsoluteTracking = pose;
-			err = openvr->Submit(eyeIndex, &tex, &bounds, vr::Submit_TextureWithPose);
+			VrSharedDevice::WithQueue([&] {
+				err = openvr->Submit(eyeIndex, &tex, &bounds, vr::Submit_TextureWithPose);
+			});
 		};
 		submitOne(vr::Eye_Left, leftSbs, errL);
 		submitOne(vr::Eye_Right, rightSbs, errR);
@@ -540,18 +579,12 @@ namespace
 			}
 			const bool haveTex = snap.queue12 && snap.left12 && snap.right12;
 			if (!haveTex) {
+				FinishMail();
 				PublishStatus(local);
 				continue;
 			}
 
-			const bool hadInterp = gInterpPending.exchange(false, std::memory_order_acq_rel);
-			bool poseOk = false;
-			{
-				std::lock_guard poseLock(submitPoseMutex);
-				poseOk = submitPoseValid;
-			}
-			const bool pair = hadInterp && interpSbs && OcInterpAllowed() && poseOk &&
-				interpPair.load(std::memory_order_acquire) == snap.pair;
+			const bool hadInterp = snap.interpPending && snap.poseValid;
 			vr::EVRCompositorError errL = vr::VRCompositorError_None;
 			vr::EVRCompositorError errR = vr::VRCompositorError_None;
 			vr::EVRCompositorError interpL = vr::VRCompositorError_None;
@@ -559,13 +592,22 @@ namespace
 			LARGE_INTEGER submitStart{};
 			LARGE_INTEGER submitEnd{};
 			QueryPerformanceCounter(&submitStart);
-			if (pair) {
+			if (hadInterp && interpSbs && OcInterpAllowed()) {
+				SetOcEnqueuePair(snap.pair);
 				SetOcEnqueueKind(1);
-				SubmitInterpFrame(openvr, interpL, interpR);
+				SubmitInterpFrame(openvr, snap.interpPose, interpL, interpR);
 			}
+			SetOcEnqueuePair(snap.pair);
 			SetOcEnqueueKind(0);
 			const bool submitted = SubmitFrame(openvr, snap, errL, errR);
 			QueryPerformanceCounter(&submitEnd);
+			FinishMail();
+			if (snap.spanArmed) {
+				VrPassTimer::BindReportSerial(snap.spanSerial);
+				VrPassTimer::ReportWallClock(snap.releaseAfterSubmit ? "VrSingle::Total" : "VrArise::Total", snap.spanStart, false);
+			}
+			if (snap.releaseAfterSubmit && snap.publishFence)
+				VrAriseTail::ReleaseEngine(snap.publishFence);
 			const bool usedTwP = submitted;
 			local.lastSubmitL = static_cast<int>(errL);
 			local.lastSubmitR = static_cast<int>(errR);
@@ -590,24 +632,10 @@ namespace
 					static_cast<int>(errR), CompositorErrorName(errR));
 				loggedTwP = true;
 			}
-			if (local.submits <= 8 || (local.submits % 120) == 0) {
-				if (pair)
-					logger::info("[VrBeat] L1 pair interp then real n={} TwP={} interpL={} interpR={}",
-						local.submits, usedTwP ? 1 : 0, static_cast<int>(interpL), static_cast<int>(interpR));
-				else if (hadInterp)
-					logger::info("[VrBeat] L1 skip interp n={} TwP={}", local.submits, usedTwP ? 1 : 0);
-				else
-					logger::info("[VrBeat] L1 enqueue n={} TwP={}", local.submits, usedTwP ? 1 : 0);
-			}
 			PublishStatus(local);
 		}
 
-		{
-			std::lock_guard lock(waitGate);
-			ownsWait.store(false, std::memory_order_release);
-		}
 		local.running = false;
-		local.ownsWait = false;
 		PublishStatus(local);
 		timeEndPeriod(1);
 	}
@@ -645,6 +673,7 @@ namespace
 		}
 		if (!WaitCopyDone())
 			return false;
+		WaitMailWritable();
 		// No CS_GPU_PASS: see the identical note in SubmitFrame above. This
 		// runs on the Doorbell worker thread, not the render thread.
 		if (FAILED(copyAlloc->Reset()) || FAILED(copyList->Reset(copyAlloc.Get(), nullptr)))
@@ -657,9 +686,12 @@ namespace
 		if (FAILED(copyList->Close()))
 			return false;
 		ID3D12CommandList* lists[]{ copyList.Get() };
-		gpuQueue->ExecuteCommandLists(1, lists);
 		++copyFenceValue;
-		gpuQueue->Signal(copyFence.Get(), copyFenceValue);
+		const UINT64 signaled = copyFenceValue;
+		VrSharedDevice::WithQueue([&] {
+			gpuQueue->ExecuteCommandLists(1, lists);
+			gpuQueue->Signal(copyFence.Get(), signaled);
+		});
 		return true;
 	}
 
@@ -671,7 +703,6 @@ void VrBeat::Start()
 	if (!running.compare_exchange_strong(expected, true))
 		return;
 	firstSubmit.store(false, std::memory_order_release);
-	ownsWait.store(false, std::memory_order_release);
 	logger::info("[VrBeat] metronome started");
 	worker = std::thread(BeatLoop);
 }
@@ -681,10 +712,6 @@ void VrBeat::Stop()
 	if (!running.exchange(false, std::memory_order_acq_rel)) {
 		firstSubmitCv.notify_all();
 		return;
-	}
-	{
-		std::lock_guard lock(waitGate);
-		ownsWait.store(false, std::memory_order_release);
 	}
 	firstSubmitCv.notify_all();
 	periodCv.notify_all();
@@ -697,11 +724,6 @@ void VrBeat::Stop()
 bool VrBeat::HasFirstSubmit()
 {
 	return firstSubmit.load(std::memory_order_acquire);
-}
-
-bool VrBeat::OwnsWait()
-{
-	return ownsWait.load(std::memory_order_acquire);
 }
 
 void VrBeat::HookCompositorPoses()
@@ -731,7 +753,6 @@ VrBeat::Status VrBeat::GetStatus()
 	std::lock_guard lock(statusMutex);
 	auto copy = status;
 	copy.running = running.load(std::memory_order_acquire);
-	copy.ownsWait = ownsWait.load(std::memory_order_acquire);
 	copy.firstSubmit = firstSubmit.load(std::memory_order_acquire);
 	return copy;
 }
@@ -742,14 +763,23 @@ void VrBeat::BindGpu(ID3D12Device* device, ID3D12CommandQueue* queue)
 	gpuQueue = queue;
 }
 
-double VrBeat::LastCopyFenceMs()
-{
-	return lastCopyFenceMs.load(std::memory_order_relaxed);
-}
-
 std::uint64_t VrBeat::NextPair()
 {
 	return pairSeq.fetch_add(1, std::memory_order_acq_rel) + 1;
+}
+
+void VrBeat::NoteSpan(std::int64_t startQpc, std::uint64_t serial, std::uint64_t publishFence, bool releaseAfterSubmit)
+{
+	pendingSpan.start = startQpc;
+	pendingSpan.serial = serial;
+	pendingSpan.publishFence = publishFence;
+	pendingSpan.armed = startQpc > 0;
+	pendingSpan.releaseAfterSubmit = releaseAfterSubmit;
+}
+
+void VrBeat::ClearSpan()
+{
+	pendingSpan = {};
 }
 
 bool VrBeat::CopySbs(ID3D12Resource* src, UINT width, UINT height, DXGI_FORMAT format,
@@ -765,11 +795,23 @@ bool VrBeat::CopySbs(ID3D12Resource* src, UINT width, UINT height, DXGI_FORMAT f
 		frame.queue12 = gpuQueue;
 		frame.sbs = true;
 		frame.pair = pair;
+		frame.pose = pose;
+		frame.poseValid = poseValid;
+		{
+			std::lock_guard lockInterp(interpPoseMutex);
+			frame.interpPending = gInterpPending.load(std::memory_order_acquire) &&
+				interpPair.load(std::memory_order_acquire) == pair;
+			frame.interpPose = interpPose;
+		}
+		frame.spanStart = pendingSpan.start;
+		frame.spanSerial = pendingSpan.serial;
+		frame.publishFence = pendingSpan.publishFence;
+		frame.spanArmed = pendingSpan.armed;
+		frame.releaseAfterSubmit = pendingSpan.releaseAfterSubmit;
+		pendingSpan = {};
 		mailbox = frame;
-		std::lock_guard lockPose(submitPoseMutex);
-		submitPose = pose;
-		submitPoseValid = poseValid;
 	}
+	mailSerial.fetch_add(1, std::memory_order_acq_rel);
 	haveGpuMail.store(true, std::memory_order_release);
 	mailCv.notify_all();
 	return true;

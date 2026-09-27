@@ -162,7 +162,7 @@ namespace NeuralRendering
 		options.mode = Streamline::DLSSModeForQualityMode(dispatch.quality);
 		options.outputWidth = dispatch.outputWidth;
 		options.outputHeight = dispatch.outputHeight;
-		options.colorBuffersHDR = sl::Boolean::eTrue;
+		options.colorBuffersHDR = dispatch.colorBuffersHDR ? sl::Boolean::eTrue : sl::Boolean::eFalse;
 		options.useAutoExposure = sl::Boolean::eTrue;
 		options.preExposure = 1.0f;
 		const auto preset = Preset(dispatch.preset);

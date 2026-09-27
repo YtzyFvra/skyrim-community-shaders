@@ -21,16 +21,23 @@ namespace VrBeat
 		ID3D12CommandQueue* queue12 = nullptr;
 		bool sbs = false;
 		std::uint64_t pair = 0;
+		vr::HmdMatrix34_t pose{};
+		bool poseValid = false;
+		vr::HmdMatrix34_t interpPose{};
+		bool interpPending = false;
+		std::int64_t spanStart = 0;
+		std::uint64_t spanSerial = 0;
+		std::uint64_t publishFence = 0;
+		bool spanArmed = false;
+		bool releaseAfterSubmit = false;
 	};
 
 	struct Status
 	{
 		bool running = false;
-		bool ownsWait = false;
 		bool firstSubmit = false;
 		double lastWaitMs = 0.0;
 		std::uint64_t submits = 0;
-		std::uint32_t waits = 0;
 		int lastWaitErr = 0;
 		int lastSubmitL = 0;
 		int lastSubmitR = 0;
@@ -54,11 +61,16 @@ namespace VrBeat
 	bool CopySbs(ID3D12Resource* src, UINT width, UINT height, DXGI_FORMAT format,
 		const vr::HmdMatrix34_t& pose, bool poseValid, std::uint64_t pair);
 
+	/**
+	 * @brief Attach this frame's latency span to the next CopySbs.
+	 * `releaseAfterSubmit` unblocks the engine only after OpenVR Submit returns.
+	 */
+	void NoteSpan(std::int64_t startQpc, std::uint64_t serial, std::uint64_t publishFence, bool releaseAfterSubmit);
+	/** @brief Drop a span that never reached CopySbs. */
+	void ClearSpan();
+
 	/** @brief True after at least one CopySbs. */
 	bool HasGpuMail();
-
-	/** @brief Last copy-fence wait on the doorbell queue, in milliseconds. */
-	double LastCopyFenceMs();
 
 	/**
 	 * @brief Copy the interpolated SBS for this Kick pair. Beat enqueues it
@@ -72,9 +84,6 @@ namespace VrBeat
 
 	/** @brief True after the first owned Submit (OC session bind). */
 	bool HasFirstSubmit();
-
-	/** @brief True while this thread owns WaitGetPoses. */
-	bool OwnsWait();
 
 	/**
 	 * @brief Hook IVRCompositor::WaitGetPoses/GetLastPoses as a passthrough snoop.

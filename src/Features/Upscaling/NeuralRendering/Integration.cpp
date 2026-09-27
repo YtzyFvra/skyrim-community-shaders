@@ -16,7 +16,6 @@
 #	include "Features/Upscaling/VrSubmitDlssg.h"
 #endif
 #include "Features/DLSSBooster.h"
-#include "Features/Upscaling/VrBoosterTail.h"
 #include "Globals.h"
 #include "GpuPass.h"
 #include "Utils/Game.h"
@@ -1910,18 +1909,6 @@ namespace NeuralRendering
 			// Engine eye is logical R. The center's display size is that same UV on the HMD eye.
 			const uint32_t displayW = logicalEye ? upscaling.perfMode.GetDisplayEyeWidth() : engineW;
 			const uint32_t displayH = logicalEye ? upscaling.perfMode.GetDisplayEyeHeight() : engineH;
-			// Logical eye's HMD image is the game-thread TD composite. Publishing raw
-			// kTEMP here skips that composite and the HMD falls back to the engine SBS.
-			if (!logicalEye && VrBoosterTail::UseAsyncTail() && globals::state && globals::state->worldRenderedThisFrame &&
-				!globals::state->isLoadingMenuOpen && !globals::state->isMainMenuOpen) {
-				VrAriseTail::EnsureRunning();
-				VrAriseTail::PublishKTemp(postTemp);
-				VrBoosterTail::PreparePresent(displayW * 2, displayH);
-				VrBoosterTail::NoteSealed(frame);
-				vrSixPassWasActive = true;
-				vrSixPassDoneFrame = frame;
-				return true;
-			}
 			auto atLeast = [](uint32_t size, uint32_t limit) {
 				const uint32_t floor = std::min(limit, 64u);
 				return std::min(limit, std::max(size, floor));
@@ -2176,8 +2163,6 @@ namespace NeuralRendering
 					VrAriseTail::PublishKTemp(presentTex);
 				if (logicalEye && presentTex != postTemp && !VrAriseTail::IsActive())
 					VrSubmitDlssg::SubmitOwnedSbs(presentTex, displayW * 2, displayH);
-				else if (!logicalEye)
-					VrSubmitDlssg::RunSubmitTest(postTemp, upscaling.settings.vrSubmitTest);
 			}
 			if (VrAriseTail::HistoryResetPending())
 				VrFfxOp::NoteDiscontinuity();
@@ -2547,6 +2532,11 @@ namespace NeuralRendering
 			return false;
 		}
 		return ApplyVrSixPass(upscaling, foveated);
+	}
+
+	void ReconcileVrAct1Plan(FoveatedRender::FlatPipelinePlan& plan)
+	{
+		ReconcileVrAct1DlssPlan(plan);
 	}
 
 	bool GetVrOwnedEyeSizes(uint32_t& renderW, uint32_t& renderH, uint32_t& displayW, uint32_t& displayH)

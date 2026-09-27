@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iterator>
 #include <unordered_map>
 
 namespace
@@ -402,11 +403,32 @@ void Profiler::EndCpuPass()
 	completedCpuTimers.push_back({ std::move(timer.name), cpuMs, timer.depth });
 }
 
+void Profiler::AddExternalGpuSample(std::string name, float gpuMs, bool countInFrameTotal, std::uint64_t serial)
+{
+	if (!IsUserEnabled() || !IsValidProfilerSample(gpuMs) || name.empty())
+		return;
+	std::lock_guard lock(externalMutex);
+	externalSamples.push_back({ std::move(name), gpuMs, false, countInFrameTotal, serial });
+}
+
+void Profiler::AddExternalCpuSample(std::string name, float cpuMs, bool countInFrameTotal, std::uint64_t serial)
+{
+	if (!IsUserEnabled() || !IsValidProfilerSample(cpuMs) || name.empty())
+		return;
+	std::lock_guard lock(externalMutex);
+	externalSamples.push_back({ std::move(name), cpuMs, true, countInFrameTotal, serial });
+}
+
 bool Profiler::CollectResults()
 {
 	readFrame = writeFrame;
 	auto& frame = frames[readFrame];
-	if (!frame.captureCycle)
+	bool pendingExternal = false;
+	{
+		std::lock_guard lock(externalMutex);
+		pendingExternal = !externalSamples.empty();
+	}
+	if (!frame.captureCycle && !pendingExternal)
 		return true;
 
 	struct ActiveTimerData
@@ -416,9 +438,12 @@ bool Profiler::CollectResults()
 		/// Inclusive depth-0 duration for the exact frame-total check.
 		float topLevelMs = 0.0f;
 		bool hasGpu = false;
+		float cpuMs = 0.0f;
+		bool hasCpu = false;
 	};
 	std::unordered_map<std::string, ActiveTimerData> activeTimers;
 	float activeTotalMs = 0.0f;
+	float activeCpuTotalMs = 0.0f;
 	bool gpuFrameResolved = false;
 
 	if (frame.inFlight) {
@@ -474,6 +499,72 @@ bool Profiler::CollectResults()
 		gpuFrameResolved = (status == Util::TimestampQueryBatch::Status::Ok);
 	}
 
+	// CPU-only scopes queued for this cycle, independent of whether a GPU
+	// pass ran (e.g. CPU-side bookkeeping with no GPU cost of its own).
+	const bool hadCpuTimers = !frame.cpuTimers.empty();
+	for (auto& timer : frame.cpuTimers) {
+		auto& entry = activeTimers[timer.name];
+		entry.cpuMs += timer.cpuMs;
+		entry.hasCpu = true;
+		// Only top-level scopes count toward the frame CPU total -- a nested
+		// CS_PROFILE_CPU_SCOPE, or one opened inside a CS_GPU_PASS, already
+		// falls within its parent's measured time.
+		if (timer.depth == 0)
+			activeCpuTotalMs += timer.cpuMs;
+
+		GetOrCreateTimer(timer.name);
+	}
+	frame.cpuTimers.clear();
+
+	{
+		std::vector<ExternalSample> external;
+		{
+			std::lock_guard lock(externalMutex);
+			external.swap(externalSamples);
+		}
+		std::uint64_t newestComplete = 0;
+		for (const auto& sample : external) {
+			if (sample.serial != 0 && (sample.name == "VrArise::Total" || sample.name == "VrSingle::Total"))
+				newestComplete = std::max(newestComplete, sample.serial);
+		}
+		std::vector<ExternalSample> keep;
+		for (auto& sample : external) {
+			if (sample.serial != 0 && newestComplete != 0 && sample.serial > newestComplete) {
+				keep.push_back(std::move(sample));
+				continue;
+			}
+			if (sample.serial != 0 && newestComplete != 0 && sample.serial < newestComplete)
+				continue;
+			if (sample.serial != 0 && newestComplete == 0) {
+				keep.push_back(std::move(sample));
+				continue;
+			}
+			if (!IsValidProfilerSample(sample.ms))
+				continue;
+			auto& known = GetOrCreateTimer(sample.name);
+			known.externalOnly = true;
+			auto& entry = activeTimers[sample.name];
+			if (sample.cpu) {
+				entry.cpuMs += sample.ms;
+				entry.hasCpu = true;
+				if (sample.countInFrameTotal)
+					activeCpuTotalMs += sample.ms;
+			} else {
+				entry.gpuMs += sample.ms;
+				entry.hasGpu = true;
+				if (sample.countInFrameTotal) {
+					entry.topLevelMs += sample.ms;
+					activeTotalMs += sample.ms;
+				}
+			}
+		}
+		if (!keep.empty()) {
+			std::lock_guard lock(externalMutex);
+			externalSamples.insert(externalSamples.begin(),
+				std::make_move_iterator(keep.begin()), std::make_move_iterator(keep.end()));
+		}
+	}
+
 	totalTimeMs = activeTotalMs;
 	resolvedTotalMs = activeTotalMs;
 	capturedGpuFrameCount = frame.capturedFrame;
@@ -491,10 +582,15 @@ bool Profiler::CollectResults()
 			known.gpu.PushSample(it->second.gpuMs);
 			known.activeGpu = true;
 			known.topLevelMs = it->second.topLevelMs;
-		} else if (gpuFrameResolved && includedByFilter && known.hasGpu) {
+		} else if (gpuFrameResolved && includedByFilter && known.hasGpu && !known.externalOnly) {
 			known.gpu.PushSample(0.0f);
 		}
-		if (freshGpu)
+		if (it != activeTimers.end() && it->second.hasCpu) {
+			known.hasCpu = true;
+			known.activeCpu = true;
+			known.cpu.PushSample(it->second.cpuMs);
+		}
+		if (freshGpu || (it != activeTimers.end() && it->second.hasCpu))
 			known.lastSampleCycle = std::max(known.lastSampleCycle, frame.capturedCycle);
 	}
 

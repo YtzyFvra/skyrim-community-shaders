@@ -1,10 +1,24 @@
-# VR Frame Generation (owned Submit, operator FG)
+# VR Frame Generation
 
-Contract for frame generation on the SkyrimVR owned-Submit path (`vr-owned-submit.md`). Working notes (git-excluded): `开发说明/OSDLSSNR/VR-FG/` only.
+The running path is FSR frame generation on the DX12 doorbell, after DLSS SR and neural rendering. The DLSS-G pump below is not what this line submits to the headset.
 
-## Decision
+## Running path
 
-Two backends share one core (pose ring, pose-tagged Submit, SBS rings, swallow rules):
+```text
+Publish at the UI-composite hook (color, depth, mvec, kMENUBG, camera, frame interval)
+  -> ARISE returns after the copy is queued; Single-thread waits for Submit
+  -> one D3D12 queue: SR, NR, stretch, blend, then FSR on the SBS
+  -> interpolated pose is the midpoint of the two publishes that were not skipped
+  -> a skipped publish resets FSR and clears that midpoint
+  -> beat thread: pair id, interpolated Submit, then real Submit
+  -> do not reuse those images until the Submit copy has finished
+```
+
+`motionVectorScale` is `(guideWidth/2, guideHeight)`: 1.0 in the buffer is one eye. Do not negate Y. OpenComposite must not play a later interpolated frame ahead of an older real frame.
+
+## Earlier DLSS-G pump (not this submit path)
+
+Two backends were designed to share pose-tagged Submit:
 
 - **DLSS-G pump (`VrFgPump`, primary).** A private D3D12 flip chain is the doorbell; G's own thread presents interpolated and real frames; our hook on the native `Present` copies each presented backbuffer and forwards it to the engine `BSOpenVR::Submit` path with the matching pose. This configuration has shown a compositor-measured 2× once (12 Sep, first cut), with a frozen colour input — the plumbing was right and the colour path was wrong. Everything since that cut that touched ordering, holding, harvesting or the Submit route is reverted.
 - **FFX Frame Interpolation (`FfxFrameInterpolator`, fallback).** Operator per eye at E×E on the game thread, no swapchain. Used if the pump cannot pass acceptance, and the only route that can avoid the SBS seam (one camera per eye).

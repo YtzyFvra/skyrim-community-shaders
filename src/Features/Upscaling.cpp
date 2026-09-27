@@ -46,7 +46,6 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	frameGenerationAllowInMenus,
 	preferFSRFrameGen,
 	dlssgFramesToGenerate,
-	vrSubmitTest,
 	vrArise,
 	vrG,
 	streamlineLogLevel,
@@ -687,15 +686,7 @@ void Upscaling::RegisterUxActions()
 			return out;
 		}));
 	FEATURE_QUERY("vrAriseStatus",
-		"X1 Tail status -> {active, path, lastWaitMs, submits, lastWaitErr, lastSubmitL, lastSubmitR, "
-		"lastKeepSlot, lastSnapshotWaitMs, lastKickWaitMs, droppedGens, sharedPrepareFails, "
-		"lastSharedFailReason, snapshotFails, lastSnapshotFailReason}. lastKeepSlot should alternate 0/1 "
-		"across polls (stuck = the Doorbell ping-pong broke); lastSnapshotWaitMs/lastKickWaitMs spiking "
-		"above a few ms is a frame-pipeline hitch; droppedGens rising means Kick fell behind and one or "
-		"more snapshotted frames were overwritten before it ever read them; sharedPrepareFails/"
-		"snapshotFails climbing every poll (not just once) means PrepareShared (D3D11->D3D12 handoff) or "
-		"Snapshot (keep-buffer copy) is stuck failing every cycle instead of self-correcting from a "
-		"one-off hitch -- the matching lastXFailReason names which check tripped.",
+		"VR tail status -> {active, path, lastWaitMs, submits, lastWaitErr, lastSubmitL, lastSubmitR}.",
 		([](const Feature*, const json&) -> json {
 			const auto s = VrAriseTail::GetStatus();
 			json out;
@@ -706,14 +697,6 @@ void Upscaling::RegisterUxActions()
 			out["lastWaitErr"] = s.lastWaitErr;
 			out["lastSubmitL"] = s.lastSubmitL;
 			out["lastSubmitR"] = s.lastSubmitR;
-			out["lastKeepSlot"] = s.lastKeepSlot;
-			out["lastSnapshotWaitMs"] = s.lastSnapshotWaitMs;
-			out["lastKickWaitMs"] = s.lastKickWaitMs;
-			out["droppedGens"] = s.droppedGens;
-			out["sharedPrepareFails"] = s.sharedPrepareFails;
-			out["lastSharedFailReason"] = s.lastSharedFailReason;
-			out["snapshotFails"] = s.snapshotFails;
-			out["lastSnapshotFailReason"] = s.lastSnapshotFailReason;
 			return out;
 		}));
 }
@@ -751,22 +734,14 @@ void Upscaling::DrawFrameGenerationSettings()
 {
 	if (ImGui::TreeNodeEx(T(TKEY("frame_generation"), "Frame Generation"), ImGuiTreeNodeFlags_DefaultOpen)) {
 		if (globals::game::isVR) {
-			ImGui::TextWrapped("%s", T(TKEY("frame_generation_vr_unavailable"),
-				"VR: frame generation is not wired on this build. Neural Rendering writes back to the engine frame; the engine submits."));
-			int submitTest = static_cast<int>(settings.vrSubmitTest);
-			if (ImGui::SliderInt(T(TKEY("vr_submit_test"), "VR Submit Test"), &submitTest, 0, 4))
-				settings.vrSubmitTest = static_cast<uint>(submitTest);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("%s", T(TKEY("vr_submit_test_tooltip"),
-					"0 = form 1. 1–3 = prior Submit tests. 4 = retired (do not use).\n"
-					"Runtime; no restart. Inert while VR ARISE is on."));
-			}
+			ImGui::TextWrapped("%s", T(TKEY("frame_generation_vr"),
+				"VR FSR frame generation: turn on VR ARISE, restart, then VR FSR-FG. The HUD is composited after interpolation onto the frames sent to the headset."));
 			ImGui::Checkbox(T(TKEY("vr_arise"), "VR ARISE (X2 Tail)"), &settings.vrArise);
 			Util::UI::RestartGatedAnnotate(bootSnapshot, settings, &Settings::vrArise,
 				T(TKEY("vr_arise_tooltip"),
 					"From the next launch, Tail owns WaitGetPoses and Submit on its own D3D12\n"
-					"device. Engine Submit is swallowed (no HUD this version). Do not enable\n"
-					"without a restart — the runtime session binds on the first Submit."));
+					"device. Engine Submit is swallowed. HUD is stamped after frame generation.\n"
+					"Do not enable without a restart — the runtime session binds on the first Submit."));
 			if (VrAriseTail::IsActive()) {
 				ImGui::Checkbox(T(TKEY("vr_g"), "VR FSR-FG"), &settings.vrG);
 				if (auto _tt = Util::HoverTooltipWrapper()) {
@@ -1644,9 +1619,7 @@ bool Upscaling::ShouldEngageVrLogicalEye() const
 		return false;
 	auto& foveated = foveatedRender;
 	foveated.bootSnapshot.LatchIfNeeded(foveated.settings);
-	if (foveated.bootSnapshot.Boot(&FoveatedRender::Settings::ariseModel3))
-		return false;
-	return foveated.bootSnapshot.Boot(&FoveatedRender::Settings::singleThreadPerfMode);
+	return foveated.BootUsesLogicalPerfMode();
 }
 
 void Upscaling::CreateUpscalingTextureResources(UpscaleMethod a_upscalemethod)

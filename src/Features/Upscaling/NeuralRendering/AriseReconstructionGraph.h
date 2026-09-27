@@ -123,6 +123,7 @@ namespace NeuralRendering
 			bool eligible = false;
 			bool renderDocReplacement = false;
 			bool reset = false;
+			bool colorBuffersHDR = true;
 		};
 
 		struct Inputs
