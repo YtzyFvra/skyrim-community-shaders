@@ -131,8 +131,6 @@ void DX12SwapChain::CreateSwapChain(IDXGIAdapter* adapter, DXGI_SWAP_CHAIN_DESC 
 			logger::warn("[DX12SwapChain] R10G10B10A2_UNORM not supported as render target, falling back to R8G8B8A8_UNORM");
 			negotiatedFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
 			fallbackUsed = true;
-		} else if (isVR) {
-			logger::info("[DX12SwapChain] VR detected with R10G10B10A2_UNORM support, attempting HDR");
 		}
 	} else {
 		logger::warn("[DX12SwapChain] CheckFeatureSupport failed for R10G10B10A2_UNORM, falling back to R8G8B8A8_UNORM");
@@ -205,14 +203,7 @@ void DX12SwapChain::CreateSwapChainDirect(IDXGIAdapter* adapter, DXGI_SWAP_CHAIN
 	DXGI_FORMAT negotiatedFormat = DXGI_FORMAT_R10G10B10A2_UNORM;
 	bool fallbackUsed = false;
 
-	if (globals::game::isVR) {
-		negotiatedFormat = a_swapChainDesc.BufferDesc.Format;
-		if (negotiatedFormat == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)
-			negotiatedFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
-		else if (negotiatedFormat == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB)
-			negotiatedFormat = DXGI_FORMAT_B8G8R8A8_UNORM;
-		fallbackUsed = true;
-	} else {
+	{
 		D3D12_FEATURE_DATA_FORMAT_SUPPORT formatSupport = { DXGI_FORMAT_R10G10B10A2_UNORM, D3D12_FORMAT_SUPPORT1_RENDER_TARGET, D3D12_FORMAT_SUPPORT2_NONE };
 		if (SUCCEEDED(d3d12Device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &formatSupport, sizeof(formatSupport)))) {
 			if ((formatSupport.Support1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET) == 0) {
@@ -968,27 +959,7 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 				swapChainBufferWrapped ? swapChainBufferWrapped->resource.get() : nullptr,
 				uiBufferWrapped ? uiBufferWrapped->resource.get() : nullptr,
 				swapChainDesc.Width, swapChainDesc.Height);
-			if (globals::game::isVR) {
-				const uint32_t guideW = upscaling.perfMode.GetRenderEyeWidth() * 2;
-				const uint32_t guideH = upscaling.perfMode.GetRenderEyeHeight();
-				DXGI_FORMAT motionFormat = DXGI_FORMAT_UNKNOWN;
-				DXGI_FORMAT uiFormat = DXGI_FORMAT_UNKNOWN;
-				if (motionVectorBufferShared12 && motionVectorBufferShared12->resource11) {
-					D3D11_TEXTURE2D_DESC motionDesc{};
-					motionVectorBufferShared12->resource11->GetDesc(&motionDesc);
-					motionFormat = motionDesc.Format;
-				}
-				if (uiBufferWrapped && uiBufferWrapped->resource11) {
-					D3D11_TEXTURE2D_DESC uiDesc{};
-					uiBufferWrapped->resource11->GetDesc(&uiDesc);
-					uiFormat = uiDesc.Format;
-				}
-				streamlineDX12.ConfigureDLSSG(upscaling.ShouldUseFrameGenerationThisFrame(),
-					guideW, guideH, swapChainDesc.Width, swapChainDesc.Height,
-					DXGI_FORMAT_R32_FLOAT, motionFormat, swapChainDesc.Format, uiFormat, 3);
-			} else {
-				streamlineDX12.ConfigureDLSSG(upscaling.ShouldUseFrameGenerationThisFrame());
-			}
+			streamlineDX12.ConfigureDLSSG(upscaling.ShouldUseFrameGenerationThisFrame());
 		} else {
 			streamlineDX12.ConfigureDLSSG(false);
 		}
