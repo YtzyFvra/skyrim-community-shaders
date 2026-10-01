@@ -1339,14 +1339,14 @@ void FoveatedRender::DrawLogicalPerfModeControls()
 		}
 		Util::UI::RestartGatedAnnotate(bootSnapshot, settings, &Settings::singleThreadPerfMode,
 			T(TKEY("pipeline_vr_logical_restart"),
-				"Single-thread: the engine waits at the hook until FSR has submitted. Restart required."));
+				"Single-thread: a fence-release bookkeeping mode on the doorbell, not a main-thread wait. Restart required."));
 		Util::UI::RestartGatedAnnotate(bootSnapshot, settings, &Settings::ariseModel3,
 			T(TKEY("pipeline_vr_arise_restart"),
-				"ARISE: the engine returns after the input copy. FSR keeps running on the doorbell. Restart required."));
+				"ARISE: the doorbell releases the engine's fence after its own Submit instead of the input copy. Restart required."));
 		bootSnapshot.LatchIfNeeded(settings);
 		ImGui::TextDisabled("%s", bootSnapshot.Boot(&Settings::ariseModel3) ?
-			T(TKEY("pipeline_active_arise"), "Active this session: ARISE asynchronous Tail") :
-			T(TKEY("pipeline_active_single_thread"), "Active this session: Single-thread synchronous Tail"));
+			T(TKEY("pipeline_active_arise"), "Active this session: ARISE doorbell fence release") :
+			T(TKEY("pipeline_active_single_thread"), "Active this session: single-thread fence release"));
 		if (upscaling.perfMode.IsLogicalEyeActive())
 			ImGui::TextDisabled(T(TKEY("pipeline_vr_logical_active"),
 				"Active: engine R %ux%u per eye, submit TD %ux%u"),

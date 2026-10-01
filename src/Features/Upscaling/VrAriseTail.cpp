@@ -2011,13 +2011,17 @@ namespace
 			return true;
 		}
 
+		// generated == nullptr skips the fullInterp half entirely (bridge/no-FG kick): only
+		// fullReal gets built, from keepBackdrop+keepStrip, which never depended on FG's
+		// output anyway.
 		bool CompositePair(UINT slot, ID3D12Resource* generated)
 		{
 			const auto& view = keepView[slot];
-			if (!view.active || !generated || !keepBackdrop[slot] || !keepStrip[slot] || !keepFullW || !keepFullH)
+			if (!view.active || !keepBackdrop[slot] || !keepStrip[slot] || !keepFullW || !keepFullH)
 				return false;
-			if (!EnsureSlot(fullReal, fullRealState, keepFullW, keepFullH, format, true, L"VrAriseTail::FullReal") ||
-				!EnsureSlot(fullInterp, fullInterpState, keepFullW, keepFullH, format, true, L"VrAriseTail::FullInterp"))
+			if (!EnsureSlot(fullReal, fullRealState, keepFullW, keepFullH, format, true, L"VrAriseTail::FullReal"))
+				return false;
+			if (generated && !EnsureSlot(fullInterp, fullInterpState, keepFullW, keepFullH, format, true, L"VrAriseTail::FullInterp"))
 				return false;
 			if (!paintAlloc) {
 				if (FAILED(dx12->device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&paintAlloc))) ||
@@ -2039,20 +2043,26 @@ namespace
 			auto* cmd = paintList.Get();
 			Transition(cmd, keepBackdrop[slot].Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
 			Transition(cmd, fullReal.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
-			Transition(cmd, fullInterp.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+			if (generated)
+				Transition(cmd, fullInterp.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
 			cmd->CopyResource(fullReal.Get(), keepBackdrop[slot].Get());
-			cmd->CopyResource(fullInterp.Get(), keepBackdrop[slot].Get());
+			if (generated)
+				cmd->CopyResource(fullInterp.Get(), keepBackdrop[slot].Get());
 			Transition(cmd, keepBackdrop[slot].Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
 			Transition(cmd, fullReal.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-			Transition(cmd, fullInterp.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+			if (generated)
+				Transition(cmd, fullInterp.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 			const UINT frameId = static_cast<UINT>(keepSerial[slot]);
-			if (!VrDx12Db::PaintCenters(cmd, dx12->device.Get(), keepStrip[slot].Get(), fullReal.Get(), view, frameId, 0) ||
-				!VrDx12Db::PaintCenters(cmd, dx12->device.Get(), generated, fullInterp.Get(), view, frameId, 4))
+			if (!VrDx12Db::PaintCenters(cmd, dx12->device.Get(), keepStrip[slot].Get(), fullReal.Get(), view, frameId, 0))
+				return false;
+			if (generated && !VrDx12Db::PaintCenters(cmd, dx12->device.Get(), generated, fullInterp.Get(), view, frameId, 4))
 				return false;
 			Transition(cmd, fullReal.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
-			Transition(cmd, fullInterp.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+			if (generated)
+				Transition(cmd, fullInterp.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
 			fullRealState = D3D12_RESOURCE_STATE_COMMON;
-			fullInterpState = D3D12_RESOURCE_STATE_COMMON;
+			if (generated)
+				fullInterpState = D3D12_RESOURCE_STATE_COMMON;
 			if (FAILED(cmd->Close()))
 				return false;
 			ID3D12CommandList* lists[]{ cmd };
@@ -2134,18 +2144,28 @@ namespace
 				loggedH = colorH;
 			}
 			bool ran = false;
-			if (VrSwitch::On() && keepView[slot].active) {
-				ID3D12Resource* generated = nullptr;
-				const auto& view = keepView[slot];
-				ran = VrFfxOp::OnDbFinalColor(
-					keepStrip[slot].Get(), keepDepth[slot].Get(), keepMvec[slot].Get(),
-					view.colorW, view.colorH, view.guideW, view.guideH,
-					format, keepDepthFmt, keepMvecFmt,
-					view.mvecScaleX, view.mvecScaleY, false, &generated);
-				if (ran && generated && CompositePair(slot, generated))
-					ran = VrFfxOp::PresentComposited(fullReal.Get(), fullInterp.Get(), keepFullW, keepFullH, format);
-				else
-					ran = false;
+			if (keepView[slot].active) {
+				if (VrSwitch::On()) {
+					ID3D12Resource* generated = nullptr;
+					const auto& view = keepView[slot];
+					ran = VrFfxOp::OnDbFinalColor(
+						keepStrip[slot].Get(), keepDepth[slot].Get(), keepMvec[slot].Get(),
+						view.colorW, view.colorH, view.guideW, view.guideH,
+						format, keepDepthFmt, keepMvecFmt,
+						view.mvecScaleX, view.mvecScaleY, false, &generated);
+					if (ran && generated && CompositePair(slot, generated))
+						ran = VrFfxOp::PresentComposited(fullReal.Get(), fullInterp.Get(), keepFullW, keepFullH, format);
+					else
+						ran = false;
+				}
+				// FG off, or the attempt above failed: the real frame alone still reaches
+				// the beat. fullReal never depended on FG's output (it's built from
+				// keepBackdrop+keepStrip), so CompositePair(slot, nullptr) just skips the
+				// fullInterp half instead of needing a separate no-FG composite path.
+				// Without this, turning vrG off left the metronome mailbox permanently
+				// empty and the engine's first takeover wait never returned.
+				if (!ran && CompositePair(slot, nullptr))
+					ran = VrBridge::OnDbFinalColor(fullReal.Get(), keepFullW, keepFullH, format);
 			} else if (VrSwitch::On()) {
 				const bool colorOnly = keepColorOnly[slot];
 				ran = VrFfxOp::OnDbFinalColor(
