@@ -48,6 +48,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	dlssgFramesToGenerate,
 	vrArise,
 	vrG,
+	vrSingleBlock,
 	streamlineLogLevel,
 	sharpnessFSR,
 	sharpnessEnabledDLSS,
@@ -759,18 +760,24 @@ void Upscaling::DrawFrameGenerationSettings()
 				}
 			}
 		}
-		ImGui::Text("%s", T(TKEY("frame_generation_desc"),
-							  "Frame Generation interpolates real frames with generated ones for a smoother experience"));
+		// This whole flat D3D11-to-D3D12 proxy path (frameGenerationMode and friends below)
+		// never engages in VR: DX12SwapChain::CreateSwapChainArise only runs from
+		// shouldProxy's `!isVR` branch. Hiding it here instead of leaving it toggleable
+		// is the fix for VR players enabling/disabling it expecting a VR effect.
+		if (!globals::game::isVR) {
+			ImGui::Text("%s", T(TKEY("frame_generation_desc"),
+								  "Frame Generation interpolates real frames with generated ones for a smoother experience"));
 
-		bool fgEnabled = settings.frameGenerationMode != 0;
-		if (ImGui::Checkbox(T(TKEY("frame_generation"), "Frame Generation"), &fgEnabled))
-			settings.frameGenerationMode = fgEnabled ? 1 : 0;
-		Util::UI::RestartGatedAnnotate(bootSnapshot, settings, &Settings::frameGenerationMode,
-			T(TKEY("frame_generation_tooltip"),
-				"Interpolate real frames with generated ones for a smoother experience. Uses NVIDIA\n"
-				"DLSS-G or AMD FSR Frame Generation depending on the adapter and preference below.\n"
-				"Requires a D3D11-to-D3D12 proxy swapchain which can introduce compatibility issues;\n"
-				"in particular, frame generation works only in windowed mode."));
+			bool fgEnabled = settings.frameGenerationMode != 0;
+			if (ImGui::Checkbox(T(TKEY("frame_generation"), "Frame Generation"), &fgEnabled))
+				settings.frameGenerationMode = fgEnabled ? 1 : 0;
+			Util::UI::RestartGatedAnnotate(bootSnapshot, settings, &Settings::frameGenerationMode,
+				T(TKEY("frame_generation_tooltip"),
+					"Interpolate real frames with generated ones for a smoother experience. Uses NVIDIA\n"
+					"DLSS-G or AMD FSR Frame Generation depending on the adapter and preference below.\n"
+					"Requires a D3D11-to-D3D12 proxy swapchain which can introduce compatibility issues;\n"
+					"in particular, frame generation works only in windowed mode."));
+		}
 
 		auto fgMethod = GetFrameGenMethod();
 		if (fgMethod == FrameGenMethod::kDLSSG) {

@@ -1347,6 +1347,10 @@ void FoveatedRender::DrawLogicalPerfModeControls()
 		ImGui::TextDisabled("%s", bootSnapshot.Boot(&Settings::ariseModel3) ?
 			T(TKEY("pipeline_active_arise"), "Active this session: ARISE doorbell fence release") :
 			T(TKEY("pipeline_active_single_thread"), "Active this session: single-thread fence release"));
+		ImGui::TextDisabled("%s", T(TKEY("pipeline_single_thread_disambiguation"),
+			"Neither radio button here blocks the main thread; both still run SR/NR/FG async on\n"
+			"the doorbell. For an engine that actually waits on the pipeline, see 'True Single'\n"
+			"under Frame Generation above."));
 		if (upscaling.perfMode.IsLogicalEyeActive())
 			ImGui::TextDisabled(T(TKEY("pipeline_vr_logical_active"),
 				"Active: engine R %ux%u per eye, submit TD %ux%u"),
