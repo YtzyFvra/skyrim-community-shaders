@@ -2489,7 +2489,6 @@ void Upscaling::SetupResources()
 void Upscaling::ClearShaderCache()
 {
 	foveatedRender.ClearShaderCache();
-	VrSubmitDlssg::ClearShaderCache();
 	for (auto& methodSlot : encodeTexturesCS) {
 		for (auto& outputSlot : methodSlot) {
 			outputSlot.Reset();
@@ -2506,7 +2505,7 @@ void Upscaling::ClearShaderCache()
 bool Upscaling::CopySharedD3D12Resources()
 {
 	if (!d3d12SwapChainActive)
-		return;
+		return false;
 	CS_GPU_PASS("Upscaling::CopySharedD3D12Resources");
 
 	auto* vs = GetUpscaleVS();

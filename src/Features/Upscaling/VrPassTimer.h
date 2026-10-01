@@ -18,6 +18,12 @@ namespace VrPassTimer
 	void Abort();
 	/** @brief After the fence for Finish, publishes each range to the overlay. */
 	void Report();
+	/** @brief GPU-only sum of the last resolved "VrDb::*" ranges, ms. Excludes mailbox/fence
+		wait; this is what OC's L1 pace gate should read instead of a wait-inclusive wall clock. */
+	float RdbGpuMs();
+	/** @brief Adds a GPU cost measured outside the timestamp-query ranges (e.g. FSR FG's own
+		dispatch+wait) onto the current doorbell frame's RdbGpuMs() total. Same thread as Report(). */
+	void AddRdbGpuMs(float extraMs);
 	/** @brief The serial passed to the latest Begin. */
 	std::uint64_t Serial();
 	/** @brief ReportSpan/ReportCpu on this thread use this doorbell frame. */

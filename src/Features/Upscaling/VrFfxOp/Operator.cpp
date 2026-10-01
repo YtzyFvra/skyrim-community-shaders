@@ -14,6 +14,7 @@
 #	include "Utils/FileSystem.h"
 #	include "Utils/Game.h"
 
+#	include <algorithm>
 #	include <array>
 #	include <atomic>
 #	include <cmath>
@@ -52,6 +53,9 @@ namespace
 	uint64_t dispatches = 0;
 	VrPose::Body prevKick{};
 	std::atomic<bool> fgResetPending{ false };
+	// EMA of FG's own dispatch+wait cost; DispatchUnlocked bails out before spending GPU
+	// time once this eats most of the period, instead of risking the next real frame's phase.
+	float fsrEma = 0.0f;
 	struct StoredView
 	{
 		float right[3]{};
@@ -257,7 +261,8 @@ namespace
 		queue = inQueue;
 
 		const bool sizeChanged = haveContext &&
-			(colorW != inColorW || colorH != inColorH || colorFmt != inColorFmt);
+			(colorW != inColorW || colorH != inColorH || guideW != inGuideW || guideH != inGuideH ||
+				colorFmt != inColorFmt);
 		if (sizeChanged && !DestroyContextIfAny())
 			return false;
 
@@ -267,7 +272,7 @@ namespace
 		if (!haveContext) {
 			ffx::CreateContextDescFrameGeneration createFg{};
 			createFg.displaySize = { inColorW, inColorH };
-			createFg.maxRenderSize = { inColorW, inColorH };
+			createFg.maxRenderSize = { (std::max)(inColorW, inGuideW), (std::max)(inColorH, inGuideH) };
 			createFg.flags = 0;
 			createFg.backBufferFormat = ffxApiGetSurfaceFormatDX12(DXGI_FORMAT_R8G8B8A8_UNORM);
 			ffx::CreateBackendDX12Desc backendDesc{};
@@ -295,12 +300,28 @@ namespace
 	}
 
 	bool DispatchUnlocked(ID3D12Resource* color, ID3D12Resource* depth, ID3D12Resource* mvec,
-		UINT inColorW, UINT inColorH, UINT inGuideW, UINT inGuideH)
+		UINT inColorW, UINT inColorH, UINT inGuideW, UINT inGuideH, float mvecScaleX, float mvecScaleY)
 	{
 		if (!haveContext || !list || !queue || !interp || !color || !depth || !mvec)
 			return false;
 		if (!globals::game::cameraNear || !globals::game::cameraFar)
 			return false;
+
+		// FG admission: bail before spending any GPU time if the last dispatch already
+		// ate most of this period's budget. OnDbFinalColor's dispatchOk=false path already
+		// presents the real frame without an interp companion, so skipping here just keeps
+		// the next real frame's phase steady instead of risking a late Evaluate.
+		const float periodMs = latchedView.valid ? latchedView.frameMs : 11.11f;
+		constexpr float kFgBudgetFraction = 0.85f;
+		if (fsrEma > periodMs * kFgBudgetFraction) {
+			static uint32_t admissionSkips = 0;
+			++admissionSkips;
+			if (admissionSkips <= 8 || (admissionSkips % 120) == 0)
+				logger::info("[VrFfxOp] FG admission skip ema={:.2f} ms budget={:.2f} ms", fsrEma, periodMs * kFgBudgetFraction);
+			fsrEma *= 0.5f; // decay so one spike doesn't wedge FG off indefinitely
+			return false;
+		}
+
 		if (!WaitOwnFence(INFINITE))
 			return false;
 		if (FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.Get(), nullptr)))
@@ -334,8 +355,9 @@ namespace
 		// motionVectorScale is a multiplier. MV stays at render size and the
 		// display-resolution flag is off, so 1.0 is one render-size eye.
 		prepare.renderSize = { inGuideW, inGuideH };
-		prepare.motionVectorScale.x = static_cast<float>(inGuideW) * 0.5f;
-		prepare.motionVectorScale.y = static_cast<float>(inGuideH);
+		// A stitched center passes the eye size. SBS keeps half the guide width: 1.0 is one eye.
+		prepare.motionVectorScale.x = mvecScaleX > 0.0f ? mvecScaleX : static_cast<float>(inGuideW) * 0.5f;
+		prepare.motionVectorScale.y = mvecScaleY > 0.0f ? mvecScaleY : static_cast<float>(inGuideH);
 		static bool loggedScale = false;
 		if (!loggedScale && (inColorW != inGuideW || inColorH != inGuideH)) {
 			loggedScale = true;
@@ -455,7 +477,10 @@ namespace
 		fenceValue = signaledCommon;
 		if (!waitFsr())
 			return false;
+		fsrEma = fsrEma > 0.0f ? fsrEma * 0.8f + fsrMs * 0.2f : fsrMs;
 		VrPassTimer::ReportSpan("VrDb::Fsr", fsrMs);
+		// Folds into the same T_rdb the pace gate reads; FG's own cost was invisible to it before.
+		VrPassTimer::AddRdbGpuMs(fsrMs);
 		return true;
 	}
 }
@@ -497,12 +522,14 @@ void VrFfxOp::NoteLatchedView(const LatchedView& view)
 	latchedView.valid = true;
 }
 
-void VrFfxOp::NoteDiscontinuity()
+void VrFfxOp::NoteDiscontinuity(bool resetFg)
 {
 	std::lock_guard lock(opMutex);
-	const bool already = fgResetPending.exchange(true, std::memory_order_acq_rel);
-	if (!already || prevKick.valid)
-		logger::info("[VrFfxOp] discontinuity: FG reset, prevKick cleared");
+	if (resetFg) {
+		const bool already = fgResetPending.exchange(true, std::memory_order_acq_rel);
+		if (!already || prevKick.valid)
+			logger::info("[VrFfxOp] discontinuity: FG reset, prevKick cleared");
+	}
 	prevKick = {};
 }
 
@@ -663,9 +690,16 @@ void VrFfxOp::NoteDiscontinuity()
 		return true;
 	}
 
+namespace
+{
+	VrPose::Body heldPose{};
+	bool heldPoseValid = false;
+}
+
 bool VrFfxOp::OnDbFinalColor(ID3D12Resource* color, ID3D12Resource* depth, ID3D12Resource* mvec,
 	UINT inColorW, UINT inColorH, UINT inGuideW, UINT inGuideH,
-	DXGI_FORMAT inColorFmt, DXGI_FORMAT inDepthFmt, DXGI_FORMAT inMvecFmt)
+	DXGI_FORMAT inColorFmt, DXGI_FORMAT inDepthFmt, DXGI_FORMAT inMvecFmt,
+	float mvecScaleX, float mvecScaleY, bool submit, ID3D12Resource** interpOut)
 {
 	if (!color || !inColorW || !inColorH)
 		return false;
@@ -681,7 +715,7 @@ bool VrFfxOp::OnDbFinalColor(ID3D12Resource* color, ID3D12Resource* depth, ID3D1
 	if (depth && mvec && inGuideW && inGuideH && device && queue &&
 		EnsureUnlocked(device, queue, inColorW, inColorH, inGuideW, inGuideH,
 			inColorFmt, inDepthFmt, inMvecFmt))
-		dispatchOk = DispatchUnlocked(color, depth, mvec, inColorW, inColorH, inGuideW, inGuideH);
+		dispatchOk = DispatchUnlocked(color, depth, mvec, inColorW, inColorH, inGuideW, inGuideH, mvecScaleX, mvecScaleY);
 	QueryPerformanceCounter(&end);
 	++dispatches;
 	const double ms = freq.QuadPart ?
@@ -689,6 +723,14 @@ bool VrFfxOp::OnDbFinalColor(ID3D12Resource* color, ID3D12Resource* depth, ID3D1
 		0.0;
 	if (dispatches <= 8 || (dispatches % 120) == 0)
 		logger::info("[VrFfxOp] dispatch {:.2f} ms ok={}", ms, dispatchOk ? 1 : 0);
+
+	if (!submit) {
+		heldPose = cur;
+		heldPoseValid = dispatchOk && cur.valid;
+		if (interpOut)
+			*interpOut = dispatchOk ? interp.Get() : nullptr;
+		return dispatchOk;
+	}
 
 	// Composite the HUD onto what's actually about to be submitted. FSR's
 	// own dispatch already ran on the HUD-free color/depth/mvec above
@@ -750,6 +792,34 @@ bool VrFfxOp::OnDbFinalColor(ID3D12Resource* color, ID3D12Resource* depth, ID3D1
 			fov.settings.neuralRenderingEnabled ? 1 : 0, fov.GetQualityModeAtBoot(),
 			engineMs, VrAriseTail::LastPublishFence(), VrAriseTail::LastConsumedFence());
 	}
+	return copied;
+}
+
+bool VrFfxOp::PresentComposited(ID3D12Resource* real, ID3D12Resource* generated, UINT width, UINT height, DXGI_FORMAT format)
+{
+	if (!real || !generated || !width || !height)
+		return false;
+	std::lock_guard lock(opMutex);
+	const VrPose::Body cur = heldPose;
+	if (pairedHud) {
+		const D3D12_RESOURCE_DESC hudDesc = pairedHud->GetDesc();
+		const UINT hudW = static_cast<UINT>(hudDesc.Width);
+		const UINT hudH = hudDesc.Height;
+		if (heldPoseValid)
+			StampOne(generated, pairedHud, width, height, hudW, hudH);
+		StampOne(real, pairedHud, width, height, hudW, hudH);
+	}
+	const std::uint64_t pair = VrBeat::NextPair();
+	if (heldPoseValid) {
+		const vr::HmdMatrix34_t mid = prevKick.valid ? InterpolatePose(prevKick.m, cur.m, 0.5f) : cur.m;
+		VrBeat::OfferGInterpolated(generated, width, height, format, mid, pair);
+	}
+	const bool copied = VrBeat::CopySbs(real, width, height, format, cur.m, cur.valid, pair);
+	if (!copied)
+		VrBeat::CancelInterp();
+	if (copied && cur.valid)
+		prevKick = cur;
+	heldPoseValid = false;
 	return copied;
 }
 

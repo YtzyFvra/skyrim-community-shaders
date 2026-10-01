@@ -7,6 +7,7 @@
 #include <d3d12.h>
 #include <wrl/client.h>
 
+#include <atomic>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -41,7 +42,11 @@ namespace
 	std::vector<Interval> intervals;
 	std::uint64_t querySerial = 0;
 	thread_local std::uint64_t reportSerial = 0;
+	// Previous resolve is still unread. Begin must not reuse the heap.
+	bool holdReport = false;
+	bool bypass = false;
 	KeepSlot keep[2];
+	std::atomic<float> lastRdbGpuMs{ 0.0f };
 
 	void Stamp(ID3D12GraphicsCommandList* list)
 	{
@@ -84,6 +89,11 @@ namespace VrPassTimer
 {
 	void Begin(ID3D12Device* device, ID3D12CommandQueue* inQueue, ID3D12GraphicsCommandList* list, std::uint64_t serial)
 	{
+		if (holdReport) {
+			bypass = true;
+			return;
+		}
+		bypass = false;
 		queue = inQueue;
 		cursor = 0;
 		openBegin = 0;
@@ -117,21 +127,30 @@ namespace VrPassTimer
 
 	void Mark(ID3D12GraphicsCommandList* list, const char* name)
 	{
+		if (bypass)
+			return;
 		Stamp(list);
 		openName = name;
 	}
 
 	void Finish(ID3D12GraphicsCommandList* list)
 	{
+		if (bypass)
+			return;
 		Stamp(list);
 		openName = nullptr;
 		if (!list || !heap || !readback || cursor == 0)
 			return;
 		list->ResolveQueryData(heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, cursor, readback.Get(), 0);
+		holdReport = true;
 	}
 
 	void Abort()
 	{
+		if (bypass) {
+			bypass = false;
+			return;
+		}
 		intervals.clear();
 		openName = nullptr;
 		cursor = 0;
@@ -148,6 +167,7 @@ namespace VrPassTimer
 		if (FAILED(readback->Map(0, nullptr, &mapped)) || !mapped)
 			return;
 		auto* ticks = static_cast<uint64_t*>(mapped);
+		float rdbSum = 0.0f;
 		for (const auto& interval : intervals) {
 			if (!interval.name || interval.end >= cursor || interval.begin >= interval.end)
 				continue;
@@ -156,14 +176,31 @@ namespace VrPassTimer
 			if (ms < kMinReportMs)
 				continue;
 			globals::profiler->AddExternalGpuSample(interval.name, ms, true, querySerial);
+			if (std::strncmp(interval.name, "VrDb::", 6) == 0)
+				rdbSum += ms;
 		}
 		readback->Unmap(0, nullptr);
+		// GPU-only busy time for this doorbell frame; excludes mailbox/fence wait entirely.
+		lastRdbGpuMs.store(rdbSum, std::memory_order_relaxed);
 		intervals.clear();
+		holdReport = false;
+		bypass = false;
 	}
 
 	std::uint64_t Serial()
 	{
 		return querySerial;
+	}
+
+	float RdbGpuMs()
+	{
+		return lastRdbGpuMs.load(std::memory_order_relaxed);
+	}
+
+	void AddRdbGpuMs(float extraMs)
+	{
+		if (extraMs > 0.0f)
+			lastRdbGpuMs.store(lastRdbGpuMs.load(std::memory_order_relaxed) + extraMs, std::memory_order_relaxed);
 	}
 
 	void BindReportSerial(std::uint64_t serial)

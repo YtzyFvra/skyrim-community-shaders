@@ -226,9 +226,9 @@ void FoveatedRender::UICompositeRenderHook::thunk(void* imageSpaceShader, RE::BS
 	// depth, motion, and the HUD are all still the frames just drawn.
 	if (globals::game::isVR) {
 		if (VrAriseTail::IsActive()) {
-			// kMENUBG is complete here. Publish copies it with kTEMP; DX12 draws the doorbell.
-			VrAriseTail::PublishComposite();
+			// Rate limit is L1's N×P at WaitGetPoses. This hook does not block.
 			VrAriseTail::WaitSpPresent();
+			VrAriseTail::PublishComposite();
 		} else
 			NeuralRendering::ApplyVrAfterTonemap();
 	}
@@ -308,7 +308,7 @@ namespace
 				{ RE::RENDER_TARGET::kTOTAL, "kTOTAL" },
 			};
 			for (const auto& slot : slots) {
-				if (targets[slot.id].texture == resource) {
+				if (Util::AsReal(targets[slot.id].texture) == resource) {
 					result.name = slot.name;
 					break;
 				}
@@ -333,8 +333,8 @@ namespace
 			return { "null", 0, 0 };
 		auto& target = renderer->GetRuntimeData().renderTargets[id];
 		if (target.texture)
-			return DescribeResource(target.texture);
-		return DescribeRTV(target.RTV);
+			return DescribeResource(Util::AsReal(target.texture));
+		return DescribeRTV(Util::AsReal(target.RTV));
 	}
 
 	void LogMenuPipelineImpl(const char* stage)
@@ -368,7 +368,7 @@ namespace
 		const auto mainColor = DescribeEngineSlot(RE::RENDER_TARGET::kMAIN);
 		NamedExtent framebufferRTV{ "null", 0, 0 };
 		if (auto* renderer = globals::game::renderer)
-			framebufferRTV = DescribeRTV(renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGET::kFRAMEBUFFER].RTV);
+			framebufferRTV = DescribeRTV(Util::AsReal(renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGET::kFRAMEBUFFER].RTV));
 		const bool uiBufferRedirect = swapChain.useArise ||
 			(upscaling.ShouldUseFrameGenerationThisFrame() && !upscaling.UsesDLSSGFrameGen());
 		logger::info(
@@ -527,7 +527,7 @@ void FoveatedRender::BlitTitleBackgroundToSwapChain() const
 	auto& menuBackground = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGET::kMENUBG];
 	if (!menuBackground.SRV)
 		return;
-	BlitSrvToSwapChain(menuBackground.SRV);
+	BlitSrvToSwapChain(Util::AsReal(menuBackground.SRV));
 	LogMenuPipeline("titleBlit");
 }
 

@@ -559,8 +559,6 @@ public:
 
 private:
 	void DrawUpscalingSettings();
-	void DrawFrameGenerationSettings();
-	void DrawReflexSettings();
 	void DrawBackendDiagnostics();
 
 	// OpenComposite conflict guard: when the OpenComposite VR shim runs its own

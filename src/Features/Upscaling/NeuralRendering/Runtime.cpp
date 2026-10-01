@@ -300,6 +300,7 @@ namespace NeuralRendering
 			featureColorWidth_[slot] != colorWidth || featureColorHeight_[slot] != colorHeight ||
 			featureOutputWidth_[slot] != outputWidth || featureOutputHeight_[slot] != outputHeight;
 		if (featureHandles_[slot] && dimensionsChanged) {
+			parameters->Set("FreeMemOnReleaseFeature", 1);
 			release(static_cast<NVSDK_NGX_Handle*>(featureHandles_[slot]));
 			featureHandles_[slot] = nullptr;
 		}

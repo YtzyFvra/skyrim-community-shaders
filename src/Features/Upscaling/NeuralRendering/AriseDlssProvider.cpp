@@ -40,12 +40,26 @@ namespace NeuralRendering
 		device_ = nullptr;
 	}
 
+	void AriseDlssProvider::ReleaseViewport(std::uint32_t viewport)
+	{
+		if (!streamline_ || !streamline_->featureDLSS)
+			return;
+		const sl::ViewportHandle handle(viewport);
+		if (streamline_->slDLSSSetOptions) {
+			sl::DLSSOptions off{};
+			off.mode = sl::DLSSMode::eOff;
+			streamline_->slDLSSSetOptions(handle, off);
+		}
+		if (streamline_->slFreeResources)
+			streamline_->slFreeResources(sl::kFeatureDLSS, handle);
+	}
+
 	void AriseDlssProvider::Reset()
 	{
-		if (streamline_ && streamline_->featureDLSS && streamline_->slFreeResources) {
+		if (streamline_ && streamline_->featureDLSS) {
 			const std::uint32_t viewports[]{ kAct1Viewport, kAct2Viewport, kAct1ViewportRight, kAct2ViewportRight };
 			for (const std::uint32_t viewport : viewports)
-				streamline_->slFreeResources(sl::kFeatureDLSS, sl::ViewportHandle(viewport));
+				ReleaseViewport(viewport);
 		}
 		for (std::size_t index = 0; index < 4; ++index) {
 			forceReset_[index] = true;
@@ -86,6 +100,8 @@ namespace NeuralRendering
 			static_cast<std::uint64_t>(std::bit_cast<std::uint32_t>(dispatch.camera.value.mvecScale.y)) })
 			hashCombine(value);
 		const bool contractChanged = lastContract_[index] != contract;
+		if (contractChanged)
+			ReleaseViewport(dispatch.viewport);
 		auto logContract = [&](bool ok, const char* stage, sl::Result result) {
 			const int outcome = ok ? 1 : -1;
 			if (!contractChanged && lastOutcome_[index] == outcome)

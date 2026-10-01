@@ -95,8 +95,8 @@ namespace
 			previewTex = owned;
 		} else if (renderer) {
 			auto& temp = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kIMAGESPACE_TEMP_COPY];
-			previewSrv = temp.SRV;
-			previewTex = static_cast<ID3D11Texture2D*>(temp.texture);
+			previewSrv = Util::AsReal(temp.SRV);
+			previewTex = Util::AsReal(temp.texture);
 		}
 		if (previewSrv && previewTex)
 			vrCrop.DrawEditor(previewSrv, previewTex, 0.5f, 0.0f, Util::Subrect::OpaquePreviewBlendCallback);

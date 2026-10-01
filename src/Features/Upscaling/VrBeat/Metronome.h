@@ -26,6 +26,7 @@ namespace VrBeat
 		vr::HmdMatrix34_t interpPose{};
 		bool interpPending = false;
 		std::int64_t spanStart = 0;
+		float drawMs = 0.0f;
 		std::uint64_t spanSerial = 0;
 		std::uint64_t publishFence = 0;
 		bool spanArmed = false;
@@ -65,7 +66,7 @@ namespace VrBeat
 	 * @brief Attach this frame's latency span to the next CopySbs.
 	 * `releaseAfterSubmit` unblocks the engine only after OpenVR Submit returns.
 	 */
-	void NoteSpan(std::int64_t startQpc, std::uint64_t serial, std::uint64_t publishFence, bool releaseAfterSubmit);
+	void NoteSpan(std::int64_t startQpc, std::uint64_t serial, std::uint64_t publishFence, bool releaseAfterSubmit, float drawMs = 0.0f);
 	/** @brief Drop a span that never reached CopySbs. */
 	void ClearSpan();
 

@@ -82,8 +82,23 @@ namespace
 		std::uint64_t publishFence = 0;
 		bool armed = false;
 		bool releaseAfterSubmit = false;
+		float drawMs = 0.0f;
 	};
 	PendingSpan pendingSpan;
+
+	using SetPipelineMsFn = void (*)(float, float);
+	SetPipelineMsFn ResolveSetPipelineMs()
+	{
+		static SetPipelineMsFn fn = []() -> SetPipelineMsFn {
+			HMODULE module = GetModuleHandleW(L"openvr_api.dll");
+			if (!module)
+				module = GetModuleHandleW(L"vrclient_x64.dll");
+			if (!module)
+				return nullptr;
+			return reinterpret_cast<SetPipelineMsFn>(GetProcAddress(module, "OC_L2_SetPipelineMs"));
+		}();
+		return fn;
+	}
 
 	using SetEnqueueKindFn = void (*)(int);
 	using SetEnqueuePairFn = void (*)(std::uint64_t);
@@ -604,7 +619,13 @@ namespace
 			FinishMail();
 			if (snap.spanArmed) {
 				VrPassTimer::BindReportSerial(snap.spanSerial);
-				VrPassTimer::ReportWallClock(snap.releaseAfterSubmit ? "VrSingle::Total" : "VrArise::Total", snap.spanStart, false);
+				const char* totalName = snap.releaseAfterSubmit ? "VrSingle::Total" : "VrArise::Total";
+				// This wall clock still feeds the overlay's total row, but must not also drive
+				// OC's pace gate: it includes mailbox/fence wait, which forms a feedback loop with
+				// N (see T_rdb in the VR-FSRFG notes). The gate reads GPU-only busy time instead.
+				VrPassTimer::ReportWallClock(totalName, snap.spanStart, false);
+				if (auto* setPipeline = ResolveSetPipelineMs())
+					setPipeline(snap.drawMs, VrPassTimer::RdbGpuMs());
 			}
 			if (snap.releaseAfterSubmit && snap.publishFence)
 				VrAriseTail::ReleaseEngine(snap.publishFence);
@@ -768,13 +789,14 @@ std::uint64_t VrBeat::NextPair()
 	return pairSeq.fetch_add(1, std::memory_order_acq_rel) + 1;
 }
 
-void VrBeat::NoteSpan(std::int64_t startQpc, std::uint64_t serial, std::uint64_t publishFence, bool releaseAfterSubmit)
+void VrBeat::NoteSpan(std::int64_t startQpc, std::uint64_t serial, std::uint64_t publishFence, bool releaseAfterSubmit, float drawMs)
 {
 	pendingSpan.start = startQpc;
 	pendingSpan.serial = serial;
 	pendingSpan.publishFence = publishFence;
 	pendingSpan.armed = startQpc > 0;
 	pendingSpan.releaseAfterSubmit = releaseAfterSubmit;
+	pendingSpan.drawMs = drawMs;
 }
 
 void VrBeat::ClearSpan()
@@ -808,6 +830,7 @@ bool VrBeat::CopySbs(ID3D12Resource* src, UINT width, UINT height, DXGI_FORMAT f
 		frame.publishFence = pendingSpan.publishFence;
 		frame.spanArmed = pendingSpan.armed;
 		frame.releaseAfterSubmit = pendingSpan.releaseAfterSubmit;
+		frame.drawMs = pendingSpan.drawMs;
 		pendingSpan = {};
 		mailbox = frame;
 	}

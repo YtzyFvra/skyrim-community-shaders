@@ -1,6 +1,7 @@
 #include "VrSubmitDlssg.h"
 
 #include "../../Globals.h"
+#include "../../Utils/D3D.h"
 #include "NeuralRendering/ArisePipeline.h"
 #include "VrAriseTail.h"
 #include <Windows.h>
@@ -18,7 +19,7 @@ namespace
 		auto* renderer = globals::game::renderer;
 		if (!renderer)
 			return nullptr;
-		return renderer->GetRuntimeData().renderTargets[slot].texture;
+		return Util::AsReal(renderer->GetRuntimeData().renderTargets[slot].texture);
 	}
 
 	bool IsOverlayRt(ID3D11Resource* handle)

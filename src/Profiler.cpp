@@ -499,23 +499,6 @@ bool Profiler::CollectResults()
 		gpuFrameResolved = (status == Util::TimestampQueryBatch::Status::Ok);
 	}
 
-	// CPU-only scopes queued for this cycle, independent of whether a GPU
-	// pass ran (e.g. CPU-side bookkeeping with no GPU cost of its own).
-	const bool hadCpuTimers = !frame.cpuTimers.empty();
-	for (auto& timer : frame.cpuTimers) {
-		auto& entry = activeTimers[timer.name];
-		entry.cpuMs += timer.cpuMs;
-		entry.hasCpu = true;
-		// Only top-level scopes count toward the frame CPU total -- a nested
-		// CS_PROFILE_CPU_SCOPE, or one opened inside a CS_GPU_PASS, already
-		// falls within its parent's measured time.
-		if (timer.depth == 0)
-			activeCpuTotalMs += timer.cpuMs;
-
-		GetOrCreateTimer(timer.name);
-	}
-	frame.cpuTimers.clear();
-
 	{
 		std::vector<ExternalSample> external;
 		{

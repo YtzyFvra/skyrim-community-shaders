@@ -13,6 +13,7 @@
 #include "Params.h"
 
 #include "../../../Globals.h"
+#include "../../../Utils/D3D.h"
 #include "../../../Utils/Subrect.h"
 #include "../../Upscaling.h"
 #include "../FidelityFX.h"
@@ -171,7 +172,7 @@ namespace FoveatedRenderImpl
 			D3D11_BOX sbsCrop = { sbsX, cropY, 0, sbsX + subInW, cropY + subInH, 1 };
 
 			context->CopySubresourceRegion(Core::vrSubrectColorIn[i]->resource.get(), 0, 0, 0, 0, Core::vrRenderSBS->resource.get(), 0, &sbsCrop);
-			if (!CopyDepthSubrect(depthSRV, Core::vrSubrectDepth[i]->uav.get(), sbsX, cropY, 0, 0, subInW, subInH)) {
+			if (!CopyDepthSubrect(Util::AsReal(depthSRV), Core::vrSubrectDepth[i]->uav.get(), sbsX, cropY, 0, 0, subInW, subInH)) {
 				logger::error("[FOVEATED] ExecuteDefaultMode depth subrect copy failed for eye {} — falling back", i);
 				return false;
 			}

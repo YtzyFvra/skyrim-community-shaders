@@ -131,6 +131,10 @@ namespace NeuralRendering
 			ID3D12Resource* scene = nullptr;
 			ID3D12Resource* depth = nullptr;
 			ID3D12Resource* motionVectors = nullptr;
+			// Already at N, with the ACT1 guidance grid baked in. Record copies
+			// these into the slot and skips the guide-resize shader.
+			ID3D12Resource* depthN = nullptr;
+			ID3D12Resource* motionN = nullptr;
 		};
 
 		struct Result
@@ -165,6 +169,8 @@ namespace NeuralRendering
 		void Shutdown();
 		/** @brief Invalidates temporal history and lazily rebuilt slot resources. */
 		void Reset();
+		/** @brief Drops the right-eye DLSS contexts. The stitched center uses the left viewport only. */
+		void ReleaseSecondaryViewports();
 		/** @brief Ensures one slot has resources matching the immutable plan and inputs. */
 		bool EnsureSlotResources(std::size_t slotIndex, const Inputs& inputs, const Plan& plan);
 		/** @brief Records the complete reconstruction tail and returns a COMMON-state color. */

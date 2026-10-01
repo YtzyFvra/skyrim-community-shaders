@@ -23,15 +23,25 @@ namespace VrFfxOp
 	 * On dispatch timeout the interpolated offer is skipped. On CopySbs
 	 * fail a prior offer is cancelled so Beat does not pair a stale interp.
 	 */
+	/**
+	 * @param mvecScaleX Pixels represented by a motion value of 1. Zero keeps the SBS half-width scale.
+	 * @param submit When false, FG runs and `interpOut` receives the generated image. HUD and CopySbs wait.
+	 */
 	bool OnDbFinalColor(ID3D12Resource* color, ID3D12Resource* depth, ID3D12Resource* mvec,
 		UINT colorW, UINT colorH, UINT guideW, UINT guideH,
-		DXGI_FORMAT colorFmt, DXGI_FORMAT depthFmt, DXGI_FORMAT mvecFmt);
+		DXGI_FORMAT colorFmt, DXGI_FORMAT depthFmt, DXGI_FORMAT mvecFmt,
+		float mvecScaleX = 0.0f, float mvecScaleY = 0.0f, bool submit = true,
+		ID3D12Resource** interpOut = nullptr);
+
+	/** @brief HUD-stamp and hand the composited true-display pair to the beat. */
+	bool PresentComposited(ID3D12Resource* real, ID3D12Resource* interp, UINT width, UINT height, DXGI_FORMAT format);
 
 	/**
 	 * @brief Publish serial skipped, or the plan changed.
-	 * Next FG dispatch resets. prevKick is cleared so the next pair is not a midpoint from the gap.
+	 * @param resetFg Next dispatch resets history. False only drops the pose midpoint.
+	 * A doorbell that stays behind must not reset on every skipped kick.
 	 */
-	void NoteDiscontinuity();
+	void NoteDiscontinuity(bool resetFg = true);
 
 	/** @brief HUD already copied off the color slot this Kick is using. Null if that publish had none. */
 	void NotePairedHud(ID3D12Resource* hud);

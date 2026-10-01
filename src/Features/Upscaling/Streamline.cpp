@@ -728,6 +728,48 @@ void Streamline::SetDLSSOptions(sl::ViewportHandle p_viewport, uint32_t width, u
 	dlssOptions.preExposure = 1.0f;
 	dlssOptions.sharpness = std::clamp(sharpnessOverride.value_or(0.0f), 0.0f, 1.0f);
 
+	struct LastOptions
+	{
+		std::uint32_t viewport = 0;
+		std::uint32_t width = 0;
+		std::uint32_t height = 0;
+		sl::DLSSMode mode = sl::DLSSMode::eOff;
+		bool used = false;
+	};
+	static LastOptions lastOptions[8]{};
+	const std::uint32_t viewportId = static_cast<std::uint32_t>(p_viewport);
+	LastOptions* previous = nullptr;
+	for (auto& entry : lastOptions) {
+		if (entry.used && entry.viewport == viewportId) {
+			previous = &entry;
+			break;
+		}
+	}
+	if (!previous) {
+		for (auto& entry : lastOptions) {
+			if (!entry.used) {
+				previous = &entry;
+				break;
+			}
+		}
+	}
+	if (previous && previous->used &&
+		(previous->width != dlssOptions.outputWidth || previous->height != dlssOptions.outputHeight ||
+			previous->mode != dlssOptions.mode)) {
+		sl::DLSSOptions off{};
+		off.mode = sl::DLSSMode::eOff;
+		slDLSSSetOptions(p_viewport, off);
+		if (slFreeResources)
+			slFreeResources(sl::kFeatureDLSS, p_viewport);
+	}
+	if (previous) {
+		previous->used = true;
+		previous->viewport = viewportId;
+		previous->width = dlssOptions.outputWidth;
+		previous->height = dlssOptions.outputHeight;
+		previous->mode = dlssOptions.mode;
+	}
+
 	if (SL_FAILED(result, slDLSSSetOptions(p_viewport, dlssOptions))) {
 		logger::critical("[Streamline DX11] Could not enable DLSS");
 	}
@@ -1174,13 +1216,13 @@ void Streamline::Upscale(ID3D11Resource* a_upscalingTexture, ID3D11Resource* a_r
 		const uint32_t outputHeight = act1Mode != 0 ? act1OutputHeight : static_cast<uint32_t>(displaySize.y);
 		sl::Extent extentOut{ 0, 0, outputWidth, outputHeight };
 		ID3D11Resource* colorIn = a_upscalingTexture;
-		ID3D11Resource* depthIn = depthTexture.texture;
+		ID3D11Resource* depthIn = Util::AsReal(depthTexture.texture);
 		ID3D11Resource* motionIn = a_motionVectors;
 		ID3D11Resource* reactiveIn = a_reactiveMask;
 		ID3D11Resource* transparencyIn = a_transparencyCompositionMask;
 		const bool isolateInputs = upscaling.bootSnapshot.Boot(&Upscaling::Settings::flatDlssInputIsolation);
 		if (isolateInputs) {
-			if (!PrepareFlatInputIsolation(globals::d3d::context, a_upscalingTexture, depthTexture.depthSRV,
+			if (!PrepareFlatInputIsolation(globals::d3d::context, a_upscalingTexture, Util::AsReal(depthTexture.depthSRV),
 					a_motionVectors, a_reactiveMask, a_transparencyCompositionMask,
 					flatRenderWidth, flatRenderHeight)) {
 				logger::error("[DLSS Isolation] Failed to prepare exact RenderRes inputs {}x{}",
@@ -1206,7 +1248,7 @@ void Streamline::Upscale(ID3D11Resource* a_upscalingTexture, ID3D11Resource* a_r
 		lastFlatAct1JitterMode = upscaling.settings.flatAct1JitterMode;
 		if (act1Mode != 0) {
 			auto& main = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN];
-			if (!evaluated || !main.UAV || !ResolveFlatAct1(globals::d3d::context, main.UAV,
+			if (!evaluated || !main.UAV || !ResolveFlatAct1(globals::d3d::context, Util::AsReal(main.UAV),
 					static_cast<uint32_t>(displaySize.x), static_cast<uint32_t>(displaySize.y))) {
 				logger::error("[ACT1] DLSS overshoot or Lanczos resolve failed mode={} input={}x{} output={}x{}",
 					act1Mode, flatRenderWidth, flatRenderHeight,

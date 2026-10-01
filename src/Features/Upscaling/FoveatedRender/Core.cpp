@@ -714,6 +714,7 @@ namespace FoveatedRenderImpl::Ops
 		float FalloffCurve;
 		uint32_t SrcWidth;
 		uint32_t SrcHeight;
+		uint32_t pad[3];  // tail so alignas(16) does not insert its own padding
 	};
 
 	uint64_t ComputeSubrectUVHash(const Util::Subrect::UVRegion& leftUV,
@@ -779,6 +780,7 @@ namespace FoveatedRenderImpl::Ops
 		uint32_t blendModeValue, float featherWidth, float ditherStrength)
 	{
 		auto context = globals::d3d::context;
+		auto& foveated = globals::features::upscaling.foveatedRender;
 		const auto blendMode = static_cast<FoveatedRender::SubrectBlendMode>(std::min(blendModeValue, 3u));
 		uint32_t srcWidth = subWidth;
 		uint32_t srcHeight = subHeight;

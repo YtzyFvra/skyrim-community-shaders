@@ -374,6 +374,12 @@ Destination[p]=float4((lobe*(b+d+f+h)+e)/(4*lobe+1),1);})";
 			dlss.Reset();
 		}
 
+		void ReleaseSecondaryViewports()
+		{
+			dlss.ReleaseViewport(AriseDlssProvider::kAct1ViewportRight);
+			dlss.ReleaseViewport(AriseDlssProvider::kAct2ViewportRight);
+		}
+
 		bool Ensure(std::size_t index, const Inputs& inputs, const Plan& plan)
 		{
 			if (!device || index >= slots.size() || !inputs.scene || !inputs.depth || !inputs.motionVectors ||
@@ -518,7 +524,15 @@ Destination[p]=float4((lobe*(b+d+f+h)+e)/(4*lobe+1),1);})";
 			} else {
 			VrPassTimer::Mark(list, "VrDb::ToN");
 			if (!DispatchResample(list, slot, act1Color, slot.colorN.Get(), act1Width, act1Height,
-					plan.nrWidth, plan.nrHeight, act1Format, kColorFormat, downsample) ||
+					plan.nrWidth, plan.nrHeight, act1Format, kColorFormat, downsample)) {
+				++failed;
+				return result;
+			}
+			// Engine already filtered depth/mvec on the ACT1 grid. A format or
+			// size miss falls back to the in-graph resize.
+			const bool prefiltered = act1DlssSucceeded &&
+				AdoptPrefilteredGuides(list, slot, inputs.depthN, inputs.motionN, plan.nrWidth, plan.nrHeight);
+			if (!prefiltered &&
 				!DispatchResizeGuides(list, slot, inputs.depth, inputs.motionVectors, slot.depthN.Get(), slot.motionN.Get(),
 					plan.sceneInputWidth, plan.sceneInputHeight, plan.nrWidth, plan.nrHeight,
 					act1Width, act1Height, plan.act1DepthDownsample)) {
@@ -843,6 +857,30 @@ Destination[p]=float4((lobe*(b+d+f+h)+e)/(4*lobe+1),1);})";
 			list->Dispatch((destinationWidth + 7) / 8, (destinationHeight + 7) / 8, 1);
 			Transition(list, source, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
 			Transition(list, destination, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+			return true;
+		}
+
+		bool AdoptPrefilteredGuides(ID3D12GraphicsCommandList* list, Slot& slot,
+			ID3D12Resource* depthN, ID3D12Resource* motionN, std::uint32_t width, std::uint32_t height)
+		{
+			if (!depthN || !motionN || !slot.depthN || !slot.motionN || !width || !height)
+				return false;
+			const auto depthDesc = depthN->GetDesc();
+			const auto motionDesc = motionN->GetDesc();
+			if (depthDesc.Width != width || depthDesc.Height != height ||
+				depthDesc.Format != DXGI_FORMAT_R32_FLOAT ||
+				motionDesc.Width != width || motionDesc.Height != height ||
+				motionDesc.Format != slot.motionOutputFormat)
+				return false;
+			auto copy = [&](ID3D12Resource* source, ID3D12Resource* destination) {
+				Transition(list, source, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+				Transition(list, destination, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+				list->CopyResource(destination, source);
+				Transition(list, source, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+				Transition(list, destination, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+			};
+			copy(depthN, slot.depthN.Get());
+			copy(motionN, slot.motionN.Get());
 			return true;
 		}
 
@@ -1230,6 +1268,7 @@ Destination[p]=float4((lobe*(b+d+f+h)+e)/(4*lobe+1),1);})";
 	}
 	void AriseReconstructionGraph::Shutdown() { state_->Shutdown(); }
 	void AriseReconstructionGraph::Reset() { state_->Reset(); }
+	void AriseReconstructionGraph::ReleaseSecondaryViewports() { state_->ReleaseSecondaryViewports(); }
 	bool AriseReconstructionGraph::EnsureSlotResources(std::size_t index, const Inputs& inputs, const Plan& plan)
 	{
 		return state_->Ensure(index, inputs, plan);

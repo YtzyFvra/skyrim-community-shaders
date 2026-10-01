@@ -319,7 +319,7 @@ namespace NeuralRendering
 			winrt::com_ptr<ID3D11Texture2D>& holder)
 		{
 			if (target.texture)
-				return target.texture;
+				return Util::AsReal(target.texture);
 			auto resolveView = [&](ID3D11View* view) -> ID3D11Texture2D* {
 				if (!view)
 					return nullptr;
@@ -329,9 +329,9 @@ namespace NeuralRendering
 					return nullptr;
 				return holder.get();
 			};
-			if (auto* texture = resolveView(target.SRV))
+			if (auto* texture = resolveView(Util::AsReal(target.SRV)))
 				return texture;
-			return resolveView(target.RTV);
+			return resolveView(Util::AsReal(target.RTV));
 		}
 
 		bool EnsureColorResources(ID3D11Resource* source, std::uint32_t width, std::uint32_t height)
@@ -1608,7 +1608,7 @@ namespace NeuralRendering
 			});
 			context->OMSetRenderTargets(0, nullptr, nullptr);
 
-			ID3D11ShaderResourceView* postSourceSRV = framebufferTarget.SRV;
+			ID3D11ShaderResourceView* postSourceSRV = Util::AsReal(framebufferTarget.SRV);
 			ID3D11Resource* postSourceResource = framebuffer;
 			if (!postSourceSRV) {
 				if (!EnsureColorResources(framebuffer, plan.displayWidth, plan.displayHeight))
@@ -1621,14 +1621,14 @@ namespace NeuralRendering
 			auto& streamline = Upscaling::streamline;
 			SixPassIsolated isolated{
 				postSourceResource, postSourceSRV,
-				depth.texture, depth.depthSRV,
+				Util::AsReal(depth.texture), Util::AsReal(depth.depthSRV),
 				upscaling.motionVectorCopyTexture->resource.get(), upscaling.motionVectorCopyTexture->srv.get(),
 				upscaling.reactiveMaskTexture->resource.get(),
 				upscaling.transparencyCompositionMaskTexture->resource.get(),
 				framebuffer, streamline.flatPostInjectViewport, streamline.flatAct2Viewport, 0
 			};
 			if (plan.act1Backend != Act1::kBypass) {
-				if (!streamline.PrepareFlatInputIsolation(context, framebuffer, depth.depthSRV,
+				if (!streamline.PrepareFlatInputIsolation(context, framebuffer, Util::AsReal(depth.depthSRV),
 						upscaling.motionVectorCopyTexture->resource.get(), upscaling.reactiveMaskTexture->resource.get(),
 						upscaling.transparencyCompositionMaskTexture->resource.get(), plan.engineWidth, plan.engineHeight))
 					return false;
@@ -1662,7 +1662,7 @@ namespace NeuralRendering
 				RE::RENDER_TARGETS::kIMAGESPACE_TEMP_COPY2,
 			};
 			for (const auto slot : preferred) {
-				auto* tex = static_cast<ID3D11Texture2D*>(targets[slot].texture);
+				auto* tex = Util::AsReal(targets[slot].texture);
 				if (!tex)
 					continue;
 				D3D11_TEXTURE2D_DESC desc{};
@@ -1721,103 +1721,9 @@ namespace NeuralRendering
 			return true;
 		}
 
-		// VR cannot shrink engine R. SRSS that only grows G will push G/R
-		// out of the selected NGX mode (Ultra Perf wants ~3x, guidance is <=2x).
-		void ReconcileVrAct1DlssPlan(FoveatedRender::FlatPipelinePlan& plan)
+		// The box is already moved onto the latched ratio and the NGX minimum.
+		void ReconcileVrAct1DlssPlan(FoveatedRender::FlatPipelinePlan&)
 		{
-			using Act1 = FoveatedRender::FlatAct1Backend;
-			if (plan.act1Backend != Act1::kDLSS || !plan.engineWidth || !plan.engineHeight ||
-				!plan.act1OutputWidth || !plan.act1OutputHeight)
-				return;
-
-			auto& streamline = Upscaling::streamline;
-			const uint32_t renderW = plan.engineWidth;
-			const uint32_t renderH = plan.engineHeight;
-			const uint32_t guidanceW = plan.act1OutputWidth;
-			const uint32_t guidanceH = plan.act1OutputHeight;
-			const float actualRatio = static_cast<float>(guidanceW) / static_cast<float>(renderW);
-
-			auto fits = [&](uint32_t quality, uint32_t inW, uint32_t inH, uint32_t& minW, uint32_t& minH,
-							uint32_t& maxW, uint32_t& maxH) {
-				if (!streamline.QueryDLSSRenderRange(quality, guidanceW, guidanceH, minW, minH, maxW, maxH))
-					return std::abs(Upscaling::GetQualityModeRatio(quality) - actualRatio) <= 0.2f;
-				return inW >= minW && inW <= maxW && inH >= minH && inH <= maxH;
-			};
-
-			uint32_t evalW = renderW;
-			uint32_t evalH = renderH;
-			uint32_t minW = 0, minH = 0, maxW = 0, maxH = 0;
-			auto accept = [&](uint32_t quality) {
-				if (fits(quality, evalW, evalH, minW, minH, maxW, maxH))
-					return true;
-				const uint32_t evenW = evalW & ~1u;
-				const uint32_t evenH = evalH & ~1u;
-				if (evenW && evenH && (evenW != evalW || evenH != evalH) &&
-					fits(quality, evenW, evenH, minW, minH, maxW, maxH)) {
-					evalW = evenW;
-					evalH = evenH;
-					return true;
-				}
-				return false;
-			};
-
-			if (!accept(plan.act1Quality)) {
-				uint32_t best = UINT32_MAX;
-				float bestDistance = 1.0e9f;
-				uint32_t bestEvalW = evalW;
-				uint32_t bestEvalH = evalH;
-				for (uint32_t quality = 0; quality <= 4; ++quality) {
-					evalW = renderW;
-					evalH = renderH;
-					if (!accept(quality))
-						continue;
-					const float distance = std::abs(Upscaling::GetQualityModeRatio(quality) - actualRatio);
-					if (distance < bestDistance) {
-						bestDistance = distance;
-						best = quality;
-						bestEvalW = evalW;
-						bestEvalH = evalH;
-					}
-				}
-				if (best != UINT32_MAX) {
-					logger::info("[VrSixPass] ACT1 mode {} -> {} so R={}x{} stays in NGX range for G={}x{} (G/R={:.3f})",
-						plan.act1Quality, best, renderW, renderH, guidanceW, guidanceH, actualRatio);
-					plan.act1Quality = best;
-					evalW = bestEvalW;
-					evalH = bestEvalH;
-				} else {
-					logger::warn("[VrSixPass] ACT1 R={}x{} out of NGX range for G={}x{} mode={}; falling back to DLAA {}x{}",
-						renderW, renderH, guidanceW, guidanceH, plan.act1Quality, plan.displayWidth, plan.displayHeight);
-					plan.srss = false;
-					plan.act1Quality = 0;
-					plan.act1OutputWidth = plan.displayWidth;
-					plan.act1OutputHeight = plan.displayHeight;
-					plan.guidanceG = { plan.displayWidth, plan.displayHeight };
-					plan.nrWidth = std::min(plan.act1OutputWidth, plan.nrWidth);
-					plan.nrHeight = std::min(plan.act1OutputHeight, plan.nrHeight);
-					plan.nrOutputWidth = plan.nrWidth;
-					plan.nrOutputHeight = plan.nrHeight;
-					plan.neuralN = { plan.nrWidth, plan.nrHeight };
-					evalW = renderW;
-					evalH = renderH;
-				}
-			}
-
-			if (evalW != plan.engineWidth || evalH != plan.engineHeight) {
-				static uint32_t lastLoggedW = 0, lastLoggedH = 0, lastEvalW = 0, lastEvalH = 0;
-				if (lastLoggedW != plan.engineWidth || lastLoggedH != plan.engineHeight ||
-					lastEvalW != evalW || lastEvalH != evalH) {
-					logger::info("[VrSixPass] ACT1 evaluate extent {}x{} -> even {}x{} for NGX range",
-						plan.engineWidth, plan.engineHeight, evalW, evalH);
-					lastLoggedW = plan.engineWidth;
-					lastLoggedH = plan.engineHeight;
-					lastEvalW = evalW;
-					lastEvalH = evalH;
-				}
-				plan.engineWidth = evalW;
-				plan.engineHeight = evalH;
-				plan.renderR = { evalW, evalH };
-			}
 		}
 
 		void ReleaseSizeDependentReconstruction(bool releaseVrSubrect)
@@ -2005,7 +1911,7 @@ namespace NeuralRendering
 			context->OMSetRenderTargets(0, nullptr, nullptr);
 
 			FoveatedRenderImpl::Ops::EnsureVRSubrectTextures(subInW, subInH, subOutW, subOutH,
-				postTemp, motionRT.texture, nullptr, nullptr);
+				postTemp, Util::AsReal(motionRT.texture), nullptr, nullptr);
 
 			const Util::Subrect::UVRegion* eyeUVs[2]{ &leftUV, &rightUV };
 			auto& streamline = Upscaling::streamline;
@@ -2035,12 +1941,12 @@ namespace NeuralRendering
 					!dest->srv || !motion || !motion->srv)
 					return false;
 				context->CopySubresourceRegion(colorIn->resource.get(), 0, 0, 0, 0, postTemp, 0, &sbsCrop);
-				if (!FoveatedRenderImpl::Ops::CopyDepthSubrect(depth.depthSRV, depthIn->uav.get(),
+				if (!FoveatedRenderImpl::Ops::CopyDepthSubrect(Util::AsReal(depth.depthSRV), depthIn->uav.get(),
 						sbsX, cropY, 0, 0, subInW, subInH))
 					return false;
-				context->CopySubresourceRegion(motion->resource.get(), 0, 0, 0, 0, motionRT.texture, 0, &sbsCrop);
+				context->CopySubresourceRegion(motion->resource.get(), 0, 0, 0, 0, Util::AsReal(motionRT.texture), 0, &sbsCrop);
 				if (cropY == 0 && subInH == engineH)
-					upscaling.ClearHMDMask(colorIn->uav.get(), depth.depthSRV, subInW, subInH, sbsX, 0);
+					upscaling.ClearHMDMask(colorIn->uav.get(), Util::AsReal(depth.depthSRV), subInW, subInH, sbsX, 0);
 
 				jobs[eye] = SixPassIsolated{
 					colorIn->resource.get(), colorIn->srv.get(),
@@ -2200,9 +2106,9 @@ namespace NeuralRendering
 			winrt::com_ptr<ID3D11Texture2D> framebufferHolder;
 			auto* framebufferTexture = ResolveRenderTargetTexture(framebuffer, framebufferHolder);
 			ID3D11Resource* motionResource = upscaling.motionVectorCopyTexture &&
-				upscaling.motionVectorCopyTexture->resource ? upscaling.motionVectorCopyTexture->resource.get() : rawMotion.texture;
+				upscaling.motionVectorCopyTexture->resource ? upscaling.motionVectorCopyTexture->resource.get() : Util::AsReal(rawMotion.texture);
 			ID3D11ShaderResourceView* motionSRV = upscaling.motionVectorCopyTexture &&
-				upscaling.motionVectorCopyTexture->srv ? upscaling.motionVectorCopyTexture->srv.get() : rawMotion.SRV;
+				upscaling.motionVectorCopyTexture->srv ? upscaling.motionVectorCopyTexture->srv.get() : Util::AsReal(rawMotion.SRV);
 			winrt::com_ptr<ID3D11Texture2D> motionTexture;
 			if (!framebufferTexture || !depth.depthSRV || !motionResource || !motionSRV ||
 				FAILED(motionResource->QueryInterface(IID_PPV_ARGS(motionTexture.put())))) {
@@ -2249,7 +2155,7 @@ namespace NeuralRendering
 				lastModel3Frame = UINT64_MAX;
 			const bool guidesReady = EnsureGuideResources(motionResource,
 				sourceGuideWidth, sourceGuideHeight) &&
-				ResizeGuides(context, depth.depthSRV, motionSRV,
+				ResizeGuides(context, Util::AsReal(depth.depthSRV), motionSRV,
 					sourceGuideWidth, sourceGuideHeight, sourceGuideWidth, sourceGuideHeight, 1.0f,
 					sourceGuideWidth, sourceGuideHeight, 0);
 			if (!guidesReady) {
@@ -2401,9 +2307,9 @@ namespace NeuralRendering
 					return std::pair{ desc.Width, desc.Height };
 				};
 				const auto mainExtent = textureExtent(
-					renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN].texture);
+					Util::AsReal(renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN].texture));
 				const auto totalExtent = textureExtent(
-					renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kTOTAL].texture);
+					Util::AsReal(renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kTOTAL].texture));
 				logger::info("[ARISE DIM] frame={} kMAIN={}x{} kFRAMEBUFFER={}x{} kTOTAL={}x{} frontR={}x{} physicalD={}x{} ACT1={}x{} N={}x{} ACT2={}x{} jitterRaw=({:.4f},{:.4f}) jitterACT1=({:.4f},{:.4f}) jitterACT2=({:.4f},{:.4f})",
 					frameId, mainExtent.first, mainExtent.second, sceneDesc.Width, sceneDesc.Height,
 					totalExtent.first, totalExtent.second, sourceGuideWidth, sourceGuideHeight,
@@ -2565,7 +2471,7 @@ namespace NeuralRendering
 		auto* renderer = globals::game::renderer;
 		if (!renderer)
 			return false;
-		auto* total = static_cast<ID3D11Texture2D*>(
+		auto* total = Util::AsReal(
 			renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kTOTAL].texture);
 		if (!total)
 			return false;
@@ -2589,10 +2495,10 @@ namespace NeuralRendering
 		if (outSrv) {
 			auto& targets = renderer->GetRuntimeData().renderTargets;
 			*outSrv = nullptr;
-			if (tex == static_cast<ID3D11Texture2D*>(targets[RE::RENDER_TARGETS::kIMAGESPACE_TEMP_COPY].texture))
-				*outSrv = targets[RE::RENDER_TARGETS::kIMAGESPACE_TEMP_COPY].SRV;
-			else if (tex == static_cast<ID3D11Texture2D*>(targets[RE::RENDER_TARGETS::kIMAGESPACE_TEMP_COPY2].texture))
-				*outSrv = targets[RE::RENDER_TARGETS::kIMAGESPACE_TEMP_COPY2].SRV;
+			if (tex == Util::AsReal(targets[RE::RENDER_TARGETS::kIMAGESPACE_TEMP_COPY].texture))
+				*outSrv = Util::AsReal(targets[RE::RENDER_TARGETS::kIMAGESPACE_TEMP_COPY].SRV);
+			else if (tex == Util::AsReal(targets[RE::RENDER_TARGETS::kIMAGESPACE_TEMP_COPY2].texture))
+				*outSrv = Util::AsReal(targets[RE::RENDER_TARGETS::kIMAGESPACE_TEMP_COPY2].SRV);
 		}
 		return tex;
 	}

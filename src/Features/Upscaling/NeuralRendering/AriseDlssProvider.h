@@ -63,6 +63,7 @@ namespace NeuralRendering
 		void Shutdown();
 		/** @brief Invalidates both temporal histories after the owning tail has drained. */
 		void Reset();
+		void ReleaseViewport(std::uint32_t viewport);
 		[[nodiscard]] bool IsAvailable() const;
 		/** @brief Records one DLSS evaluation from an immutable main-thread snapshot. */
 		bool Record(ID3D12GraphicsCommandList* commandList, const Dispatch& dispatch);

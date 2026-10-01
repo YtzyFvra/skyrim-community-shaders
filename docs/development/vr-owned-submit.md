@@ -7,10 +7,11 @@ Public contract for the SkyrimVR doorbell. FSR-FG working notes (git-excluded): 
 ```text
 Engine world @ logical R SBS (kTEMP)
   -> UI-composite hook, before kMENUBG blends onto kTOTAL
-  -> copy kTEMP, depth, motion vectors, and kMENUBG into the shared slots
+  -> On the engine: crop each eye, stretch the backdrop, downsample depth and motion for NR
+  -> copy those prepared resources, plus full-frame depth, motion, and kMENUBG, once into the shared slots
   -> ARISE: engine returns once that copy is submitted
   -> Single-thread: engine waits until this frame's OpenVR Submit returns
-  -> DX12 doorbell on one queue: DLSS SR, NR, stretch, center blend, then FSR
+  -> DX12 doorbell on one queue: one copy, then DLSS SR, NR, center blend, then FSR
   -> stamp kMENUBG with 1.0 - alpha onto the real and generated SBS
   -> beat thread Submits interpolated, then real, each with its own pose
   -> OpenComposite plays an interpolated frame only if its real frame is queued behind it
