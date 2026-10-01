@@ -1,6 +1,8 @@
 #include "PCH.h"
 #include "Metronome.h"
 
+#include "Features/Upscaling.h"
+
 #ifdef ENABLE_SKYRIM_VR
 
 #	include "../../../GpuPass.h"
@@ -144,6 +146,20 @@ namespace
 			if (!module)
 				return nullptr;
 			return reinterpret_cast<InterpAllowedFn>(GetProcAddress(module, "OC_L1_InterpAllowed"));
+		}();
+		return fn;
+	}
+
+	using SetTrueSingleFn = void (*)(int);
+	SetTrueSingleFn ResolveSetTrueSingle()
+	{
+		static SetTrueSingleFn fn = []() -> SetTrueSingleFn {
+			HMODULE module = GetModuleHandleW(L"openvr_api.dll");
+			if (!module)
+				module = GetModuleHandleW(L"vrclient_x64.dll");
+			if (!module)
+				return nullptr;
+			return reinterpret_cast<SetTrueSingleFn>(GetProcAddress(module, "OC_L1_SetTrueSingle"));
 		}();
 		return fn;
 	}
@@ -549,6 +565,17 @@ namespace
 		SetThreadDescription(GetCurrentThread(), L"VrBeat");
 		timeBeginPeriod(1);
 		beatThreadId.store(GetCurrentThreadId(), std::memory_order_release);
+
+		// True Single already blocks the engine's own Submit per frame on RDB's real
+		// completion (VrAriseTail::ShouldSwallowEngineSubmit), so OC's own N-based throttle
+		// (tuned for the async case where nothing else bounds the engine) would double-pace
+		// it on top. One-time notice at beat start; vrSingleBlock is restart-gated.
+		{
+			auto& upscaling = globals::features::upscaling;
+			upscaling.bootSnapshot.LatchIfNeeded(upscaling.settings);
+			if (auto fn = ResolveSetTrueSingle())
+				fn(upscaling.bootSnapshot.Boot(&Upscaling::Settings::vrSingleBlock) ? 1 : 0);
+		}
 
 		bool loggedFirstSubmit = false;
 		bool loggedTwP = false;
