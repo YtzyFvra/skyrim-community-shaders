@@ -742,6 +742,14 @@ void Upscaling::DrawFrameGenerationSettings()
 					"From the next launch, Tail owns WaitGetPoses and Submit on its own D3D12\n"
 					"device. Engine Submit is swallowed. HUD is stamped after frame generation.\n"
 					"Do not enable without a restart — the runtime session binds on the first Submit."));
+			ImGui::Checkbox(T(TKEY("vr_arise_single_block"), "True Single (block per frame)"), &settings.vrSingleBlock);
+			Util::UI::RestartGatedAnnotate(bootSnapshot, settings, &Settings::vrSingleBlock,
+				T(TKEY("vr_arise_single_block_tooltip"),
+					"Engine Submit still swallowed by Tail, Wait still proxied by OC either way.\n"
+					"Off (default): Tail/doorbell run fully async; the engine never waits on them.\n"
+					"On: every frame's Submit blocks until that frame's full SR+NR+FG pipeline has\n"
+					"reached the metronome, trading throughput for a synchronous, single-thread-like\n"
+					"pipeline. For comparing against async ARISE, not for normal play."));
 			if (VrAriseTail::IsActive()) {
 				ImGui::Checkbox(T(TKEY("vr_g"), "VR FSR-FG"), &settings.vrG);
 				if (auto _tt = Util::HoverTooltipWrapper()) {

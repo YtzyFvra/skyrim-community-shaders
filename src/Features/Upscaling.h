@@ -96,6 +96,12 @@ public:
 		bool vrArise = false;
 		// VR G master. Hot. On = eOn + G chain. Off = eOff + bridge.
 		bool vrG = false;
+		// "True Single": the engine's Submit blocks every frame until that publish's full
+		// RDB pipeline (SR+NR+FG, through the doorbell's CopySbs/OfferGInterpolated) has
+		// reached VrBeat, instead of only blocking once at session bind. Submit is still
+		// swallowed by RDB and Wait is still proxied by OC either way; this only changes
+		// whether the engine waits out the pipeline every frame. Restart-gated.
+		bool vrSingleBlock = false;
 		uint streamlineLogLevel = 0;  // 0=Off, 1=Default, 2=Verbose
 		// Both default to 0.8, matching AMD's own FSR3 sample default.
 		float sharpnessFSR = 0.8f;
@@ -145,9 +151,10 @@ public:
 	// presetDLSS is deliberately NOT here: Streamline::SetDLSSOptions reads
 	// settings.presetDLSS per-frame and applies it via slDLSSSetOptions, so
 	// it's already runtime-effective.
-	inline static constexpr Util::Settings::RestartTable<Settings, 13> kRestartFields{ {
+	inline static constexpr Util::Settings::RestartTable<Settings, 14> kRestartFields{ {
 		UTIL_RESTART_FIELD(Settings, frameGenerationMode, "Frame Generation"),
 		UTIL_RESTART_FIELD(Settings, vrArise, "VR ARISE"),
+		UTIL_RESTART_FIELD(Settings, vrSingleBlock, "VR ARISE True Single"),
 		UTIL_RESTART_FIELD(Settings, frameGenerationForceEnable, "Force Enable Frame Generation"),
 		UTIL_RESTART_FIELD(Settings, preferFSRFrameGen, "Prefer AMD FSR Frame Generation"),
 		UTIL_RESTART_FIELD(Settings, renderAtUpscaleRes, "Render at Upscaled Resolution"),

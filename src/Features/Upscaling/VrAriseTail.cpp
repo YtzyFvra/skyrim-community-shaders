@@ -626,6 +626,17 @@ namespace
 		return upscaling.bootSnapshot.Boot(&Upscaling::Settings::vrArise);
 	}
 
+	// "True Single": ShouldSwallowEngineSubmit blocks every frame on this instead of only
+	// at session bind. See Upscaling::Settings::vrSingleBlock.
+	bool BootVrSingleBlock()
+	{
+		if (!globals::game::isVR)
+			return false;
+		auto& upscaling = globals::features::upscaling;
+		upscaling.bootSnapshot.LatchIfNeeded(upscaling.settings);
+		return upscaling.bootSnapshot.Boot(&Upscaling::Settings::vrSingleBlock);
+	}
+
 #ifdef ENABLE_SKYRIM_VR
 	void AbandonTakeover()
 	{
@@ -1419,6 +1430,11 @@ namespace
 
 	void NotePresented(std::uint64_t publishFence)
 	{
+		// True Single's wait in ShouldSwallowEngineSubmit checks presentedPublish under this
+		// same lock; without it, a notify racing a waiter's predicate check right before it
+		// starts blocking can be missed (the store itself is still correctly ordered, only
+		// the wakeup can be lost).
+		std::lock_guard lock(presentWaitMutex);
 		presentedPublish.store(publishFence, std::memory_order_release);
 		presentCv.notify_all();
 	}
@@ -2191,6 +2207,10 @@ namespace
 			if (kicks <= 8 || (kicks % 120) == 0)
 				logger::info("[VrAriseTail] {} kick={} slot={} {}x{}",
 					VrSwitch::On() ? "FSR-FG" : "bridge", kicks, slot, colorW, colorH);
+			// Only reader today is True Single's per-frame wait in ShouldSwallowEngineSubmit;
+			// async ARISE never waits on this, so firing it unconditionally on success is a
+			// no-op for the default path.
+			NotePresented(keepPublishFence[slot]);
 			return true;
 		}
 	};
@@ -2418,20 +2438,48 @@ bool VrAriseTail::ShouldSwallowEngineSubmit()
 	if (!BootLatchedArise() || abandoned.load(std::memory_order_acquire))
 		return false;
 	NoteEngineSubmit();
-	if (VrBeat::HasFirstSubmit())
-		return true;
-	while (!VrBeat::HasFirstSubmit() &&
-		!abandoned.load(std::memory_order_acquire)) {
-		if (!running.load(std::memory_order_acquire)) {
-			logger::error("[VrAriseTail] Tail exited before first Submit; abandoning takeover");
-			AbandonTakeover();
-			return false;
+	if (!VrBeat::HasFirstSubmit()) {
+		while (!VrBeat::HasFirstSubmit() &&
+			!abandoned.load(std::memory_order_acquire)) {
+			if (!running.load(std::memory_order_acquire)) {
+				logger::error("[VrAriseTail] Tail exited before first Submit; abandoning takeover");
+				AbandonTakeover();
+				return false;
+			}
+			if (!VrBeat::WaitForFirstSubmitMs(5000) && !VrBeat::HasFirstSubmit())
+				logger::warn("[VrAriseTail] still waiting for metronome first Submit (OC session bind)");
 		}
-		if (!VrBeat::WaitForFirstSubmitMs(5000) && !VrBeat::HasFirstSubmit())
-			logger::warn("[VrAriseTail] still waiting for metronome first Submit (OC session bind)");
+		if (!VrBeat::HasFirstSubmit() || abandoned.load(std::memory_order_acquire))
+			return false;
 	}
-	return VrBeat::HasFirstSubmit() &&
-		!abandoned.load(std::memory_order_acquire);
+	// True Single: wait out this specific publish's full pipeline every frame instead of
+	// only at session bind. enginePublished was just set by this frame's PublishKTemp,
+	// ahead of this Submit call; presentedPublish catches up once Kick (or a failure path)
+	// calls NotePresented for that same fence. Bounded retries, not an unconditional
+	// INFINITE wait: a stuck doorbell must not hang the game forever.
+	if (BootVrSingleBlock()) {
+		const std::uint64_t fence = enginePublished.load(std::memory_order_acquire);
+		std::unique_lock lock(presentWaitMutex);
+		int attempt = 0;
+		while (presentedPublish.load(std::memory_order_acquire) < fence &&
+			!abandoned.load(std::memory_order_acquire) &&
+			running.load(std::memory_order_acquire)) {
+			const bool satisfied = presentCv.wait_for(lock, std::chrono::milliseconds(2000), [&] {
+				return presentedPublish.load(std::memory_order_acquire) >= fence ||
+					abandoned.load(std::memory_order_acquire) ||
+					!running.load(std::memory_order_acquire);
+			});
+			if (!satisfied) {
+				++attempt;
+				logger::warn("[VrAriseTail] True Single: still waiting on publish {} after {} x 2s", fence, attempt);
+				if (attempt >= 5) {
+					logger::error("[VrAriseTail] True Single: giving up waiting on publish {}; releasing engine anyway", fence);
+					break;
+				}
+			}
+		}
+	}
+	return !abandoned.load(std::memory_order_acquire);
 #else
 	return false;
 #endif
