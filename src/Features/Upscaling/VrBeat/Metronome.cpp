@@ -31,18 +31,12 @@ namespace
 
 	std::mutex mailboxMutex;
 	std::mutex statusMutex;
-	std::atomic<bool> ocPeriodOpen{ false };
-	std::mutex periodMutex;
-	std::condition_variable periodCv;
 	std::condition_variable mailCv;
 	std::mutex firstSubmitMutex;
 	std::condition_variable firstSubmitCv;
 
 	VrBeat::Frame mailbox{};
 	std::atomic<bool> haveGpuMail{ false };
-	std::mutex submitPoseMutex;
-	vr::HmdMatrix34_t submitPose{};
-	bool submitPoseValid = false;
 
 	using Microsoft::WRL::ComPtr;
 	ID3D12Device* gpuDevice = nullptr;
@@ -353,8 +347,6 @@ namespace
 		const auto err = origWaitGetPoses(self, render, renderCount, game, gameCount);
 		if (!IsBeatThread() && err == vr::VRCompositorError_None) {
 			SnoopEnginePose(render, renderCount);
-			ocPeriodOpen.store(true, std::memory_order_release);
-			periodCv.notify_all();
 			engineWaitCount.fetch_add(1, std::memory_order_relaxed);
 			const auto now = std::chrono::steady_clock::now();
 			static std::chrono::steady_clock::time_point lastWait{};
@@ -735,7 +727,6 @@ void VrBeat::Stop()
 		return;
 	}
 	firstSubmitCv.notify_all();
-	periodCv.notify_all();
 	mailCv.notify_all();
 	if (worker.joinable())
 		worker.join();
@@ -856,7 +847,6 @@ bool VrBeat::OfferGInterpolated(ID3D12Resource* src, UINT width, UINT height, DX
 	}
 	interpPair.store(pair, std::memory_order_release);
 	gInterpPending.store(true, std::memory_order_release);
-	periodCv.notify_all();
 	mailCv.notify_all();
 	return true;
 }
