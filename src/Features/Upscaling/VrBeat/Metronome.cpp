@@ -78,6 +78,7 @@ namespace
 		std::uint64_t publishFence = 0;
 		bool armed = false;
 		bool releaseAfterSubmit = false;
+		bool useCustomSubmit = false;
 		float drawMs = 0.0f;
 	};
 	PendingSpan pendingSpan;
@@ -449,7 +450,7 @@ namespace
 		const bool poseValid = frame.poseValid;
 		if (!frame.queue12 || !frame.left12 || !frame.right12)
 			return false;
-		if (!poseValid) {
+		if (frame.useCustomSubmit && !poseValid) {
 			static std::atomic<uint32_t> skipped{ 0 };
 			const auto n = ++skipped;
 			if (n <= 8 || (n % 120) == 0)
@@ -461,13 +462,21 @@ namespace
 			vr::D3D12TextureData_t dx12{};
 			dx12.m_pResource = resource;
 			dx12.m_pCommandQueue = frame.queue12;
-			vr::VRTextureWithPose_t tex{};
-			tex.handle = &dx12;
-			tex.eType = vr::TextureType_DirectX12;
-			tex.eColorSpace = vr::ColorSpace_Auto;
-			tex.mDeviceToAbsoluteTracking = pose;
 			VrSharedDevice::WithQueue([&] {
-				err = openvr->Submit(eyeIndex, &tex, &bounds, vr::Submit_TextureWithPose);
+				if (frame.useCustomSubmit) {
+					vr::VRTextureWithPose_t tex{};
+					tex.handle = &dx12;
+					tex.eType = vr::TextureType_DirectX12;
+					tex.eColorSpace = vr::ColorSpace_Auto;
+					tex.mDeviceToAbsoluteTracking = pose;
+					err = openvr->Submit(eyeIndex, &tex, &bounds, vr::Submit_TextureWithPose);
+				} else {
+					vr::Texture_t tex{};
+					tex.handle = &dx12;
+					tex.eType = vr::TextureType_DirectX12;
+					tex.eColorSpace = vr::ColorSpace_Auto;
+					err = openvr->Submit(eyeIndex, &tex, &bounds, vr::Submit_Default);
+				}
 			});
 		};
 		if (frame.sbs) {
@@ -626,13 +635,15 @@ namespace
 			LARGE_INTEGER submitStart{};
 			LARGE_INTEGER submitEnd{};
 			QueryPerformanceCounter(&submitStart);
-			if (hadInterp && interpSbs && OcInterpAllowed()) {
+			if (snap.useCustomSubmit && hadInterp && interpSbs && OcInterpAllowed()) {
 				SetOcEnqueuePair(snap.pair);
 				SetOcEnqueueKind(1);
 				SubmitInterpFrame(openvr, snap.interpPose, interpL, interpR);
 			}
-			SetOcEnqueuePair(snap.pair);
-			SetOcEnqueueKind(0);
+			if (snap.useCustomSubmit) {
+				SetOcEnqueuePair(snap.pair);
+				SetOcEnqueueKind(0);
+			}
 			const bool submitted = SubmitFrame(openvr, snap, errL, errR);
 			QueryPerformanceCounter(&submitEnd);
 			FinishMail();
@@ -644,7 +655,7 @@ namespace
 				// N (see T_rdb in the VR-FSRFG notes). The gate reads GPU-only busy time instead.
 				VrPassTimer::ReportWallClock(totalName, snap.spanStart, false);
 				if (auto* setPipeline = ResolveSetPipelineMs())
-					setPipeline(snap.drawMs, VrPassTimer::RdbGpuMs());
+					setPipeline(snap.drawMs, VrPassTimer::RdbGpuTiming().p95Ms);
 			}
 			if (snap.releaseAfterSubmit && snap.publishFence)
 				VrAriseTail::ReleaseEngine(snap.publishFence);
@@ -807,13 +818,15 @@ std::uint64_t VrBeat::NextPair()
 	return pairSeq.fetch_add(1, std::memory_order_acq_rel) + 1;
 }
 
-void VrBeat::NoteSpan(std::int64_t startQpc, std::uint64_t serial, std::uint64_t publishFence, bool releaseAfterSubmit, float drawMs)
+void VrBeat::NoteSpan(std::int64_t startQpc, std::uint64_t serial, std::uint64_t publishFence, bool releaseAfterSubmit,
+	bool useCustomSubmit, float drawMs)
 {
 	pendingSpan.start = startQpc;
 	pendingSpan.serial = serial;
 	pendingSpan.publishFence = publishFence;
 	pendingSpan.armed = startQpc > 0;
 	pendingSpan.releaseAfterSubmit = releaseAfterSubmit;
+	pendingSpan.useCustomSubmit = useCustomSubmit;
 	pendingSpan.drawMs = drawMs;
 }
 
@@ -848,6 +861,7 @@ bool VrBeat::CopySbs(ID3D12Resource* src, UINT width, UINT height, DXGI_FORMAT f
 		frame.publishFence = pendingSpan.publishFence;
 		frame.spanArmed = pendingSpan.armed;
 		frame.releaseAfterSubmit = pendingSpan.releaseAfterSubmit;
+		frame.useCustomSubmit = pendingSpan.useCustomSubmit;
 		frame.drawMs = pendingSpan.drawMs;
 		pendingSpan = {};
 		mailbox = frame;

@@ -8,6 +8,14 @@ struct ID3D12GraphicsCommandList;
 
 namespace VrPassTimer
 {
+	struct RdbGpuPercentiles
+	{
+		float p50Ms = 0.0f;
+		float p90Ms = 0.0f;
+		float p95Ms = 0.0f;
+		float p99Ms = 0.0f;
+	};
+
 	/** @brief Starts a timestamp range on this command list. `serial` tags the doorbell frame. */
 	void Begin(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12GraphicsCommandList* list, std::uint64_t serial);
 	/** @brief Closes the previous range and starts one named for the overlay. */
@@ -21,6 +29,8 @@ namespace VrPassTimer
 	/** @brief GPU-only sum of the last resolved "VrDb::*" ranges, ms. Excludes mailbox/fence
 		wait; this is what OC's L1 pace gate should read instead of a wait-inclusive wall clock. */
 	float RdbGpuMs();
+	/** @brief Rolling GPU-only RDB duration percentiles for scheduler decisions. */
+	RdbGpuPercentiles RdbGpuTiming();
 	/** @brief Adds a GPU cost measured outside the timestamp-query ranges (e.g. FSR FG's own
 		dispatch+wait) onto the current doorbell frame's RdbGpuMs() total. Same thread as Report(). */
 	void AddRdbGpuMs(float extraMs);

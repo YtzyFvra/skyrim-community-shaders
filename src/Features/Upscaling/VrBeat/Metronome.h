@@ -31,6 +31,7 @@ namespace VrBeat
 		std::uint64_t publishFence = 0;
 		bool spanArmed = false;
 		bool releaseAfterSubmit = false;
+		bool useCustomSubmit = false;
 	};
 
 	struct Status
@@ -66,7 +67,8 @@ namespace VrBeat
 	 * @brief Attach this frame's latency span to the next CopySbs.
 	 * `releaseAfterSubmit` unblocks the engine only after OpenVR Submit returns.
 	 */
-	void NoteSpan(std::int64_t startQpc, std::uint64_t serial, std::uint64_t publishFence, bool releaseAfterSubmit, float drawMs = 0.0f);
+	void NoteSpan(std::int64_t startQpc, std::uint64_t serial, std::uint64_t publishFence, bool releaseAfterSubmit,
+		bool useCustomSubmit, float drawMs = 0.0f);
 	/** @brief Drop a span that never reached CopySbs. */
 	void ClearSpan();
 

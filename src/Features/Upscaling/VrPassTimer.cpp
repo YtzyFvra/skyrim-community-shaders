@@ -8,7 +8,10 @@
 #include <wrl/client.h>
 
 #include <atomic>
+#include <algorithm>
+#include <array>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -18,6 +21,7 @@ namespace
 
 	constexpr uint32_t kMaxStamps = 48;
 	constexpr float kMinReportMs = 0.01f;
+	constexpr uint32_t kRdbHistorySize = 120;
 
 	struct Interval
 	{
@@ -47,6 +51,49 @@ namespace
 	bool bypass = false;
 	KeepSlot keep[2];
 	std::atomic<float> lastRdbGpuMs{ 0.0f };
+	std::atomic<std::uint64_t> lastRdbSerial{ 0 };
+	std::atomic<std::uint64_t> lastGpuTimestamp{ 0 };
+	std::atomic<std::uint64_t> lastCpuQpcTimestamp{ 0 };
+	std::uint64_t sampledRdbSerial = 0;
+	std::array<float, kRdbHistorySize> rdbHistory{};
+	uint32_t rdbHistoryCount = 0;
+	uint32_t rdbHistoryHead = 0;
+	VrPassTimer::RdbGpuPercentiles rdbPercentiles{};
+	std::mutex rdbTimingMutex;
+
+	float Percentile(std::array<float, kRdbHistorySize> values, uint32_t count, float percentile)
+	{
+		if (!count)
+			return 0.0f;
+		std::sort(values.begin(), values.begin() + count);
+		const float index = percentile * static_cast<float>(count - 1);
+		const uint32_t lower = static_cast<uint32_t>(index);
+		const uint32_t upper = (std::min)(lower + 1, count - 1);
+		return values[lower] + (values[upper] - values[lower]) * (index - static_cast<float>(lower));
+	}
+
+	void SampleRdbGpuTiming()
+	{
+		const std::uint64_t serial = lastRdbSerial.load(std::memory_order_acquire);
+		if (!serial || serial == sampledRdbSerial)
+			return;
+		const float sample = lastRdbGpuMs.load(std::memory_order_relaxed);
+		if (sample <= 0.0f)
+			return;
+		std::lock_guard lock(rdbTimingMutex);
+		if (serial == sampledRdbSerial)
+			return;
+		rdbHistory[rdbHistoryHead] = sample;
+		rdbHistoryHead = (rdbHistoryHead + 1) % kRdbHistorySize;
+		rdbHistoryCount = (std::min)(rdbHistoryCount + 1, kRdbHistorySize);
+		sampledRdbSerial = serial;
+		rdbPercentiles = {
+			Percentile(rdbHistory, rdbHistoryCount, 0.50f),
+			Percentile(rdbHistory, rdbHistoryCount, 0.90f),
+			Percentile(rdbHistory, rdbHistoryCount, 0.95f),
+			Percentile(rdbHistory, rdbHistoryCount, 0.99f)
+		};
+	}
 
 	void Stamp(ID3D12GraphicsCommandList* list)
 	{
@@ -163,6 +210,12 @@ namespace VrPassTimer
 		uint64_t frequency = 0;
 		if (FAILED(queue->GetTimestampFrequency(&frequency)) || frequency == 0)
 			return;
+		uint64_t gpuTimestamp = 0;
+		uint64_t cpuTimestamp = 0;
+		if (FAILED(queue->GetClockCalibration(&gpuTimestamp, &cpuTimestamp)))
+			return;
+		lastGpuTimestamp.store(gpuTimestamp, std::memory_order_relaxed);
+		lastCpuQpcTimestamp.store(cpuTimestamp, std::memory_order_relaxed);
 		void* mapped = nullptr;
 		if (FAILED(readback->Map(0, nullptr, &mapped)) || !mapped)
 			return;
@@ -182,6 +235,7 @@ namespace VrPassTimer
 		readback->Unmap(0, nullptr);
 		// GPU-only busy time for this doorbell frame; excludes mailbox/fence wait entirely.
 		lastRdbGpuMs.store(rdbSum, std::memory_order_relaxed);
+		lastRdbSerial.store(querySerial, std::memory_order_release);
 		intervals.clear();
 		holdReport = false;
 		bypass = false;
@@ -195,6 +249,13 @@ namespace VrPassTimer
 	float RdbGpuMs()
 	{
 		return lastRdbGpuMs.load(std::memory_order_relaxed);
+	}
+
+	RdbGpuPercentiles RdbGpuTiming()
+	{
+		SampleRdbGpuTiming();
+		std::lock_guard lock(rdbTimingMutex);
+		return rdbPercentiles;
 	}
 
 	void AddRdbGpuMs(float extraMs)

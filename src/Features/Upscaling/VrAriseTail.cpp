@@ -2120,7 +2120,8 @@ namespace
 			kickSlot.store(slot, std::memory_order_release);
 			NotifyL2("OC_L2_NoteStarted");
 			VrPassTimer::BindReportSerial(keepSerial[slot]);
-			VrBeat::NoteSpan(keepWallStart[slot].QuadPart, keepSerial[slot], keepPublishFence[slot], !keepAsync[slot], keepFrameMs[slot]);
+			VrBeat::NoteSpan(keepWallStart[slot].QuadPart, keepSerial[slot], keepPublishFence[slot], !keepAsync[slot],
+				VrSwitch::On(), keepFrameMs[slot]);
 			if (keepFenceValue[slot] &&
 				!WaitFenceCpu(dx12->fence.Get(), snapshotWaitEvent, keepFenceValue[slot])) {
 				VrBeat::ClearSpan();
