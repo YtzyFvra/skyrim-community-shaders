@@ -1328,29 +1328,38 @@ void FoveatedRender::DrawLogicalPerfModeControls()
 {
 	if (globals::game::isVR) {
 		auto& upscaling = globals::features::upscaling;
-		int mode = settings.ariseModel3 ? 1 : (settings.singleThreadPerfMode ? 0 : -1);
-		if (ImGui::RadioButton(T(TKEY("pipeline_single_thread"), "Single-thread PerfMode"), mode == 0)) {
+		int mode = settings.ariseModel3 ? 2 : (upscaling.settings.vrG ? 0 : 1);
+		if (ImGui::RadioButton("Single-thread RDB + Frame Generation", mode == 0)) {
 			settings.ariseModel3 = false;
 			settings.singleThreadPerfMode = true;
+			upscaling.settings.vrArise = true;
+			upscaling.settings.vrSingleBlock = true;
+			upscaling.settings.vrG = true;
 		}
-		if (ImGui::RadioButton(T(TKEY("pipeline_arise"), "ARISE Async PerfMode"), mode == 1)) {
+		if (ImGui::RadioButton("Single-thread RDB (no Frame Generation)", mode == 1)) {
+			settings.ariseModel3 = false;
+			settings.singleThreadPerfMode = true;
+			upscaling.settings.vrArise = true;
+			upscaling.settings.vrSingleBlock = true;
+			upscaling.settings.vrG = false;
+		}
+		if (ImGui::RadioButton("ARISE async RDB + Frame Generation", mode == 2)) {
 			settings.ariseModel3 = true;
 			settings.singleThreadPerfMode = false;
+			upscaling.settings.vrArise = true;
+			upscaling.settings.vrSingleBlock = false;
+			upscaling.settings.vrG = true;
 		}
-		Util::UI::RestartGatedAnnotate(bootSnapshot, settings, &Settings::singleThreadPerfMode,
-			T(TKEY("pipeline_vr_logical_restart"),
-				"Single-thread: a fence-release bookkeeping mode on the doorbell, not a main-thread wait. Restart required."));
+		Util::UI::RestartGatedAnnotate(upscaling.bootSnapshot, upscaling.settings, &Upscaling::Settings::vrArise,
+			"PerfMode intercepts engine Submit. Restart required.");
+		Util::UI::RestartGatedAnnotate(upscaling.bootSnapshot, upscaling.settings, &Upscaling::Settings::vrSingleBlock,
+			"Single-thread RDB blocks engine progress until VrBeat completes the real OpenVR Submit. Restart required.");
 		Util::UI::RestartGatedAnnotate(bootSnapshot, settings, &Settings::ariseModel3,
-			T(TKEY("pipeline_vr_arise_restart"),
-				"ARISE: the doorbell releases the engine's fence after its own Submit instead of the input copy. Restart required."));
+			"ARISE async releases the engine after the input copy. Restart required.");
 		bootSnapshot.LatchIfNeeded(settings);
-		ImGui::TextDisabled("%s", bootSnapshot.Boot(&Settings::ariseModel3) ?
-			T(TKEY("pipeline_active_arise"), "Active this session: ARISE doorbell fence release") :
-			T(TKEY("pipeline_active_single_thread"), "Active this session: single-thread fence release"));
-		ImGui::TextDisabled("%s", T(TKEY("pipeline_single_thread_disambiguation"),
-			"Neither radio button here blocks the main thread; both still run SR/NR/FG async on\n"
-			"the doorbell. For an engine that actually waits on the pipeline, see 'True Single'\n"
-			"under Frame Generation above."));
+		ImGui::TextDisabled("%s", upscaling.bootSnapshot.Boot(&Upscaling::Settings::vrSingleBlock) ?
+			"Active this session: Tail-synchronous RDB" :
+			"Active this session: ARISE async RDB");
 		if (upscaling.perfMode.IsLogicalEyeActive())
 			ImGui::TextDisabled(T(TKEY("pipeline_vr_logical_active"),
 				"Active: engine R %ux%u per eye, submit TD %ux%u"),

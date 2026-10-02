@@ -736,29 +736,7 @@ void Upscaling::DrawFrameGenerationSettings()
 	if (ImGui::TreeNodeEx(T(TKEY("frame_generation"), "Frame Generation"), ImGuiTreeNodeFlags_DefaultOpen)) {
 		if (globals::game::isVR) {
 			ImGui::TextWrapped("%s", T(TKEY("frame_generation_vr"),
-				"VR FSR frame generation: turn on VR ARISE, restart, then VR FSR-FG. The HUD is composited after interpolation onto the frames sent to the headset."));
-			ImGui::Checkbox(T(TKEY("vr_arise"), "VR ARISE (X2 Tail)"), &settings.vrArise);
-			Util::UI::RestartGatedAnnotate(bootSnapshot, settings, &Settings::vrArise,
-				T(TKEY("vr_arise_tooltip"),
-					"From the next launch, Tail owns WaitGetPoses and Submit on its own D3D12\n"
-					"device. Engine Submit is swallowed. HUD is stamped after frame generation.\n"
-					"Do not enable without a restart — the runtime session binds on the first Submit."));
-			ImGui::Checkbox(T(TKEY("vr_arise_single_block"), "True Single (block per frame)"), &settings.vrSingleBlock);
-			Util::UI::RestartGatedAnnotate(bootSnapshot, settings, &Settings::vrSingleBlock,
-				T(TKEY("vr_arise_single_block_tooltip"),
-					"Engine Submit still swallowed by Tail, Wait still proxied by OC either way.\n"
-					"Off (default): Tail/doorbell run fully async; the engine never waits on them.\n"
-					"On: every frame's Submit blocks until that frame's full SR+NR+FG pipeline has\n"
-					"reached the metronome, trading throughput for a synchronous, single-thread-like\n"
-					"pipeline. For comparing against async ARISE, not for normal play."));
-			if (VrAriseTail::IsActive()) {
-				ImGui::Checkbox(T(TKEY("vr_g"), "VR FSR-FG"), &settings.vrG);
-				if (auto _tt = Util::HoverTooltipWrapper()) {
-					ImGui::Text("%s", T(TKEY("vr_g_tooltip"),
-						"Hot master. On: FSR-FG operator + metronome interp/real.\n"
-						"Off: bridge. Absolute pose and metronome stay on either path."));
-				}
-			}
+				"VR RDB execution profiles are configured with the PerfMode controls. The HUD is composited after reconstruction onto the frames sent to the headset."));
 		}
 		// This whole flat D3D11-to-D3D12 proxy path (frameGenerationMode and friends below)
 		// never engages in VR: DX12SwapChain::CreateSwapChainArise only runs from

@@ -2019,9 +2019,17 @@ namespace
 			keepCamValid[publishedKeep] = camValid;
 			keepFrameMs[publishedKeep] = frameMs;
 			inputGen.fetch_add(1, std::memory_order_release);
+			if (!asyncTail) {
+				if (!ready.load(std::memory_order_acquire) && !Ensure(reqW, reqH, reqFmt))
+					return false;
+				VrSwitch::Tick();
+				if (ready.load(std::memory_order_acquire) && VrSwitch::On())
+					EnsureGPath();
+				return Kick();
+			}
 			if (!worker.joinable()) {
 				worker = std::thread([this] { WorkerLoop(); });
-				logger::info("[VrAriseTail] Snapshot+Kick; G or bridge at Kick");
+				logger::info("[VrAriseTail] async Snapshot+Kick; G or bridge at Kick");
 			}
 			kickCv.notify_one();
 			return true;
@@ -2116,8 +2124,6 @@ namespace
 			if (keepFenceValue[slot] &&
 				!WaitFenceCpu(dx12->fence.Get(), snapshotWaitEvent, keepFenceValue[slot])) {
 				VrBeat::ClearSpan();
-				if (!keepAsync[slot])
-					NotePresented(keepPublishFence[slot]);
 				return false;
 			}
 			VrPassTimer::ReportKeep(dx12->queue.Get(), slot);
@@ -2199,18 +2205,12 @@ namespace
 				ran = VrBridge::OnDbFinalColor(hudlessKeep[slot].Get(), colorW, colorH, format);
 			if (!ran) {
 				VrBeat::ClearSpan();
-				if (!keepAsync[slot])
-					NotePresented(keepPublishFence[slot]);
 				return false;
 			}
 			++kicks;
 			if (kicks <= 8 || (kicks % 120) == 0)
 				logger::info("[VrAriseTail] {} kick={} slot={} {}x{}",
 					VrSwitch::On() ? "FSR-FG" : "bridge", kicks, slot, colorW, colorH);
-			// Only reader today is True Single's per-frame wait in ShouldSwallowEngineSubmit;
-			// async ARISE never waits on this, so firing it unconditionally on success is a
-			// no-op for the default path.
-			NotePresented(keepPublishFence[slot]);
 			return true;
 		}
 	};
@@ -2247,7 +2247,7 @@ namespace
 						foveated.bootSnapshot.LatchIfNeeded(foveated.settings);
 						asyncDoorbell = foveated.bootSnapshot.Boot(&FoveatedRender::Settings::ariseModel3);
 						modeLatched = true;
-						logger::info("[VrAriseTail] doorbell {}", asyncDoorbell ? "ARISE async" : "single-thread");
+						logger::info("[VrAriseTail] doorbell {}", asyncDoorbell ? "ARISE async" : "Tail-synchronous");
 					}
 				} else {
 					Sleep(50);
@@ -2317,7 +2317,7 @@ namespace
 								loggedKeep = true;
 								logger::info("[VrAriseTail] keep TD {}x{}; ignoring {}x{}", tdW, tdH, outW, outH);
 							}
-						} else if (VrSwitch::On()) {
+						} else {
 							kicked = doorbell.OfferKick(finalColor, outW, outH, outFormat, published.pose,
 								published.fenceValue, published.colorOnly, dx12.spanStart, dx12.passSerial,
 								asyncDoorbell, published.constants[0], published.constantsValid, published.frameMs);
@@ -2326,11 +2326,8 @@ namespace
 					if (!kicked) {
 						VrPassTimer::BindReportSerial(dx12.passSerial);
 						VrPassTimer::ReportWallClock(TotalName(asyncDoorbell), dx12.spanStart.QuadPart, false);
-						if (!asyncDoorbell)
-							NotePresented(published.fenceValue);
 					}
 				} else {
-					NotePresented(published.fenceValue);
 					if (dx12.failCount <= 8 || (dx12.failCount % 60) == 0)
 						logger::error("[VrAriseTail] X2 CopyImports failed #{}: {}",
 							dx12.failCount, dx12.lastFailReason);
