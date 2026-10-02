@@ -102,11 +102,6 @@ public:
 		// swallowed by RDB and Wait is still proxied by OC either way; this only changes
 		// whether the engine waits out the pipeline every frame. Restart-gated.
 		bool vrSingleBlock = false;
-		// True Single's bounded-backlog admission gate: how many pairs (interp+real) may
-		// sit in OC's presenter ring waiting to be displayed before the engine's next frame
-		// is held back. Larger absorbs more transient slowdown without throttling, at the
-		// cost of more worst-case latency (each pair of slack is ~2 display periods). Hot.
-		uint vrPhaseSlipPairs = 2;
 		uint streamlineLogLevel = 0;  // 0=Off, 1=Default, 2=Verbose
 		// Both default to 0.8, matching AMD's own FSR3 sample default.
 		float sharpnessFSR = 0.8f;
