@@ -49,6 +49,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	vrArise,
 	vrG,
 	vrSingleBlock,
+	vrPhaseSlipPairs,
 	streamlineLogLevel,
 	sharpnessFSR,
 	sharpnessEnabledDLSS,
@@ -751,6 +752,18 @@ void Upscaling::DrawFrameGenerationSettings()
 					"On: every frame's Submit blocks until that frame's full SR+NR+FG pipeline has\n"
 					"reached the metronome, trading throughput for a synchronous, single-thread-like\n"
 					"pipeline. For comparing against async ARISE, not for normal play."));
+			if (settings.vrSingleBlock) {
+				int phaseSlipPairs = static_cast<int>(settings.vrPhaseSlipPairs);
+				if (ImGui::SliderInt(T(TKEY("vr_phase_slip_pairs"), "True Single Phase Slip (pairs)"), &phaseSlipPairs, 1, 6))
+					settings.vrPhaseSlipPairs = static_cast<uint>((std::max)(phaseSlipPairs, 1));
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::Text("%s", T(TKEY("vr_phase_slip_pairs_tooltip"),
+						"How many interp+real pairs may sit in OC's ring waiting to be displayed\n"
+						"before the engine's next frame is held back. Higher absorbs more transient\n"
+						"slowdown without throttling, at the cost of more worst-case latency (each\n"
+						"pair of slack is roughly 2 display periods). Hot, no restart needed."));
+				}
+			}
 			if (VrAriseTail::IsActive()) {
 				ImGui::Checkbox(T(TKEY("vr_g"), "VR FSR-FG"), &settings.vrG);
 				if (auto _tt = Util::HoverTooltipWrapper()) {

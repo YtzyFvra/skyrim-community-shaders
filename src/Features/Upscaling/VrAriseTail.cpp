@@ -637,6 +637,23 @@ namespace
 		return upscaling.bootSnapshot.Boot(&Upscaling::Settings::vrSingleBlock);
 	}
 
+	// Bounded-backlog admission gate for True Single: how many items (not pairs) OC's
+	// presenter ring may hold before the engine's next frame is held back. See
+	// Upscaling::Settings::vrPhaseSlipPairs.
+	using GetReadyDepthFn = int (*)();
+	GetReadyDepthFn ResolveGetReadyDepth()
+	{
+		static GetReadyDepthFn fn = []() -> GetReadyDepthFn {
+			HMODULE module = GetModuleHandleW(L"openvr_api.dll");
+			if (!module)
+				module = GetModuleHandleW(L"vrclient_x64.dll");
+			if (!module)
+				return nullptr;
+			return reinterpret_cast<GetReadyDepthFn>(GetProcAddress(module, "OC_L1_GetReadyDepth"));
+		}();
+		return fn;
+	}
+
 #ifdef ENABLE_SKYRIM_VR
 	void AbandonTakeover()
 	{
@@ -2476,6 +2493,24 @@ bool VrAriseTail::ShouldSwallowEngineSubmit()
 					logger::error("[VrAriseTail] True Single: giving up waiting on publish {}; releasing engine anyway", fence);
 					break;
 				}
+			}
+		}
+		// Bounded-backlog admission gate: this frame's own pipeline is done (the wait
+		// above), but OC's presenter ring may still be holding a backlog from frames that
+		// finished fast back-to-back. Absorb up to vrPhaseSlipPairs pairs of slack before
+		// holding the engine's next frame back; past that, latency would otherwise grow
+		// without bound instead of the engine's own pace converging on what the display
+		// can actually consume. Bounded poll, not INFINITE: never hang the game over this.
+		if (auto getDepth = ResolveGetReadyDepth()) {
+			const int maxItems = 2 * static_cast<int>(
+				(std::max)(globals::features::upscaling.settings.vrPhaseSlipPairs, 1u));
+			int waited = 0;
+			while (getDepth() >= maxItems &&
+				!abandoned.load(std::memory_order_acquire) &&
+				running.load(std::memory_order_acquire)) {
+				if (++waited > 50) // ~50ms; OC isn't draining, don't make it worse by piling on
+					break;
+				Sleep(1);
 			}
 		}
 	}
